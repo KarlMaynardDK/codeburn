@@ -276,6 +276,7 @@ export function collectUnsentCalls(projects: ProjectSummary[], now: number = Dat
             sessionId: session.sessionId,
             project: project.project,
             workingDirectory: session.workingDirectory,
+            category: turn.category,
             session: covered !== undefined ? { ...sessionContext, subscriptionCovered: covered } : sessionContext,
           })
         }
@@ -362,6 +363,8 @@ export interface SendBatchesOptions {
     perCall: Map<string, import('./otlp.js').OtlpAttribute[]>
     extraSpans: import('./otlp.js').OtlpSpan[]
   }
+  /** Wire detail level stamped on every batch (codeburn.detail_level). Omit for the legacy full span set. */
+  detailLevel?: 'summary' | 'sessions'
   /** Injectable sleep for tests. Defaults to real setTimeout. */
   sleep?: (ms: number) => Promise<void>
   /** Max wait per 429 (caps Retry-After). Default 120s. */
@@ -396,6 +399,7 @@ export async function sendBatches(opts: SendBatchesOptions): Promise<PushResult>
   return sendBatchesCore({
     ...opts,
     buildPayload: batch => buildOtlpPayload(batch, {
+      ...(opts.detailLevel ? { detailLevel: opts.detailLevel } : {}),
       ...(opts.coverageThrough ? { coverageThrough: opts.coverageThrough } : {}),
       ...(opts.pluginAttributes
         ? { pluginAttributes: opts.pluginAttributes.values, pluginAttributeKeys: opts.pluginAttributes.keys }

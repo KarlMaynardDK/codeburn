@@ -26,6 +26,8 @@ export const CORE_SYNC_FIELD_MEANINGS: ReadonlyMap<string, string> = new Map([
   ['ai.cache_write_tokens', 'tokens written to cache'],
   ['ai.call_count', 'how many API requests in the session'],
   ['ai.session_duration_ms', 'how long the session lasted in milliseconds'],
+  ['ai.category', 'the kind of task (coding, debugging, testing, ...)'],
+  ['codeburn.detail_level', 'whether per-session detail (summary or sessions) is sent'],
   ['ai.subscription_covered', 'whether usage is covered by subscription'],
   ['codeburn.device_id', 'a stable random identifier for this device'],
   ['codeburn.coverage_through', 'date through which usage has been analyzed'],
@@ -45,6 +47,10 @@ export interface FingerprintInput {
   workMatching: boolean
   scopeSinceDays: number | null
   cadence: 'daily' | 'hourly'
+  /** Effective wire detail level (client setting clamped to the server). Default summary. */
+  detailLevel?: 'summary' | 'sessions'
+  /** Whether optimize findings are uploaded after a push. Default false. */
+  shareFindings?: boolean
 }
 
 export function computeAcceptanceFingerprint(input: FingerprintInput): string {
@@ -56,6 +62,8 @@ export function computeAcceptanceFingerprint(input: FingerprintInput): string {
     workMatching: input.workMatching,
     scopeSinceDays: input.scopeSinceDays,
     cadence: input.cadence,
+    detailLevel: input.detailLevel ?? 'summary',
+    shareFindings: input.shareFindings ?? false,
   }
   const json = JSON.stringify(canonical)
   return createHash('sha256').update(json).digest('hex')
@@ -68,6 +76,8 @@ export interface DisclosureInput {
   outboundFields: Array<{ key: string; disclosure: string }>
   workMatching: boolean
   scopeSinceDays: number | null
+  detailLevel?: 'summary' | 'sessions'
+  shareFindings?: boolean
 }
 
 export function buildDisclosure(input: DisclosureInput): string {
@@ -79,6 +89,13 @@ export function buildDisclosure(input: DisclosureInput): string {
       : `last ${input.scopeSinceDays} days`
   const workMatchingText = input.workMatching
     ? 'on - session-to-commit links are sent'
+    : 'off'
+
+  const detailText = (input.detailLevel ?? 'summary') === 'sessions'
+    ? 'sessions - calls carry session ids, durations, call counts and tools, exact timestamps'
+    : 'summary - usage totals only: per-day buckets, hour-rounded times, no session grouping'
+  const findingsText = input.shareFindings
+    ? 'on - a daily snapshot of `codeburn optimize` findings is uploaded: finding id, title, severity, trend, estimated savings (tokens and USD) and period totals only; never file paths, file names, commands, snippets or explanations'
     : 'off'
 
   const fieldsList = input.outboundFields.length > 0
@@ -93,6 +110,8 @@ export function buildDisclosure(input: DisclosureInput): string {
     `Cadence: ${cadenceText}`,
     `Scope: ${scopeText}`,
     `Work matching: ${workMatchingText}`,
+    `Detail level: ${detailText}`,
+    `Share findings: ${findingsText}`,
     '',
     'Data sent to the endpoint:',
     fieldsList,
@@ -168,6 +187,14 @@ export function detectFingerprintChanges(stored: FingerprintInput | undefined, c
     changes.push('work matching')
   }
 
+  if ((stored.detailLevel ?? 'summary') !== (current.detailLevel ?? 'summary')) {
+    changes.push('detail level')
+  }
+
+  if ((stored.shareFindings ?? false) !== (current.shareFindings ?? false)) {
+    changes.push('findings sharing')
+  }
+
   const storedFields = new Set(stored.outboundFields)
   const currentFields = new Set(current.outboundFields)
   const added = Array.from(currentFields).filter(f => !storedFields.has(f)).sort()
@@ -181,4 +208,21 @@ export function detectFingerprintChanges(stored: FingerprintInput | undefined, c
   }
 
   return changes.length > 0 ? changes : ['unknown']
+}
+
+/**
+ * True when `current` differs from `stored` only by sending LESS: a lower
+ * detail level and/or findings turned off. Such a change needs no new consent.
+ */
+export function isReductionOnly(stored: FingerprintInput | undefined, current: FingerprintInput): boolean {
+  if (!stored) return false
+  const rank = (l: 'summary' | 'sessions' | undefined): number => (l === 'sessions' ? 1 : 0)
+  if (rank(current.detailLevel) > rank(stored.detailLevel)) return false
+  if ((current.shareFindings ?? false) && !(stored.shareFindings ?? false)) return false
+  const same: FingerprintInput = {
+    ...current,
+    detailLevel: stored.detailLevel,
+    shareFindings: stored.shareFindings,
+  }
+  return computeAcceptanceFingerprint(same) === computeAcceptanceFingerprint(stored)
 }

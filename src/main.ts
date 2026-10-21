@@ -44,6 +44,7 @@ import { runOptimize } from './optimize.js'
 import { registerActCommands } from './act/cli.js'
 import { registerGuardCommands } from './guard/cli.js'
 import { registerSyncCommands } from './sync/cli.js'
+import { registerTeamCommands } from './team-server/cli.js'
 import { registerPluginCommands, registerLoadedPluginCommands } from './plugins/cli.js'
 import { runContextCommand } from './context-tree.js'
 import { renderCompare } from './compare.js'
@@ -60,7 +61,7 @@ import { getPresetPlan, isPlanId, isPlanProvider, PLAN_IDS, PLAN_PROVIDERS, plan
 import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
-const { version } = require('../package.json')
+const { version, name: packageName } = require('../package.json') as { version: string; name?: string }
 // The snapshot semantic revision + key live in their own module so the CLI's
 // snapshot read/write path and its regression tests agree on the same value
 // without importing the CLI entry point (which parses argv as a side effect).
@@ -1642,7 +1643,7 @@ program
       check: opts.check,
       local: opts.local,
       json: opts.json,
-    }, defaultUpdateDeps(version))
+    }, defaultUpdateDeps(version, packageName))
   })
 
 program
@@ -3358,6 +3359,7 @@ program
 registerActCommands(program)
 registerGuardCommands(program)
 registerSyncCommands(program)
+registerTeamCommands(program)
 registerPluginCommands(program)
 
 program

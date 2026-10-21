@@ -9,5 +9,5 @@ export default defineConfig({
   splitting: false,
   sourcemap: true,
   dts: false,
-  external: ['@modelcontextprotocol/sdk', 'zod'],
+  external: ['@modelcontextprotocol/sdk', 'zod', 'pg'],
 })

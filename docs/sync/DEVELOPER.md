@@ -269,3 +269,58 @@ Deploy: `npx cdk deploy --profile andklee-dev`
 Cost: ~$0/mo idle (pay-per-request)
 
 This is a **test fixture**, not a production reference. Any OIDC provider + OTLP-accepting endpoint satisfies the server contract.
+
+## Enrollment auth (team server)
+
+A discovery doc with `"auth": "enrollment"` selects the self-hosted team server flow instead of OIDC.
+`issuer` / `client_id` / `scopes` are then absent; `enroll_path` is required. Optional fields (all additive, version stays 1):
+`detail_levels` (`["summary"]` or `["summary","sessions"]`, default `["summary"]` for enrollment servers),
+`findings_path` (present only when the server accepts findings), `org_name`.
+Legacy OIDC docs that omit `detail_levels` are treated as `["summary","sessions"]`, so existing deployments keep receiving the full span set.
+
+`codeburn sync setup <url> --token <enrollment> [--detail summary|sessions] [--share-findings]`:
+
+1. Fetch discovery. If `auth !== "enrollment"` the OIDC browser flow runs unchanged (`--token` is ignored).
+2. `POST {enroll_path}` with `{ token, label: <hostname>, device_id: <codeburn device id> }`.
+   200 returns `{ credential, device_id, person }`; 401 means the token is invalid, expired or used.
+3. The `cbd_...` credential is stored through `credentials.ts` (OS credential storage) and the discovery fields
+   (`authMode`, `enrollPath`, `detailLevels`, `findingsPath`, `orgName`) are persisted in `sync.json`.
+
+`sync push` / `sync auto run` use the stored credential directly as `Authorization: Bearer`. There is no refresh grant.
+A 401 means the device or person was revoked: the CLI tells the user to run `codeburn sync setup <url> --token <new token>`.
+
+## Detail levels
+
+Client settings (in `sync.json`): `detailLevel` (`summary` | `sessions`) and `shareFindings`. Change them with
+`codeburn sync config detail <summary|sessions>` and `codeburn sync config findings <on|off>`.
+The effective level is the client setting clamped to the server's `detail_levels` (`effectiveDetailLevel` in `discovery.ts`).
+Enrollment configs default to `summary`; legacy OIDC configs with no explicit choice keep `sessions`.
+`sync status` prints the client setting, server-allowed levels, effective level and findings flag.
+
+Every batch carries the resource attribute `codeburn.detail_level` and every usage span carries `ai.category`
+(the `ClassifiedTurn.category` of the turn the call belongs to).
+
+| | `summary` | `sessions` |
+|---|---|---|
+| `traceId` | first 32 hex of `sha256("<deviceId>:<YYYY-MM-DD>")` (UTC day of the call) | `sha256(sessionId)` as before |
+| span start / end | rounded down to the hour | exact (end = start + 1 ms) |
+| `ai.work_unit_id`, `ai.session_role`, `ai.lineage_evidence`, `ai.session_duration_ms`, `ai.call_count`, `ai.tools` | omitted | sent when proven |
+| plugin attributes / extra spans, attribution spans (`--attribution`) | not sent | sent |
+| provider, model, tokens, cost, project basename, `ai.category` | sent | sent |
+
+`spanId` is unchanged (still derived from the deduplication key), so the sent-ledger and server upserts behave identically at both levels.
+Prompts, file paths and turn content are never sent at any level. Strings still go through `sanitizeModelIdentifier`,
+`sanitizeProviderIdentifier` and `projectBasenameFromWorkingDirectory`.
+
+## Findings upload
+
+When `shareFindings` is on and discovery advertises `findings_path`, after a successful usage push the client
+POSTs `{ captured_at, findings }` (`findings` is the same object as `codeburn optimize --format json`, built in-process
+by `buildFindingsReport` in `findings.ts`) with the same Bearer. At most once per UTC day (`lastFindingsSent` in `sync.json`).
+A failed upload is non-fatal and retried on the next push.
+
+## Consent
+
+The acceptance fingerprint and the disclosure text (`consent.ts`) include the effective detail level and the findings flag.
+Raising the level or turning findings on changes the fingerprint, so `sync auto run` records `acceptance-required` until
+the user re-runs `codeburn sync auto enable --accept`.

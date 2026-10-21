@@ -9,6 +9,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 
 import type { AutoSyncConfig } from './consent.js'
+import { parseClientPackage, type ClientPackageInfo, type DetailLevel } from './discovery.js'
 
 export interface SyncConfig {
   baseUrl: string
@@ -16,6 +17,21 @@ export interface SyncConfig {
   tracesPath: string
   issuer: string
   lastSync?: string
+  /** 'enrollment' = team server device credential; absent/'oidc' = OIDC refresh token. */
+  authMode?: 'enrollment' | 'oidc'
+  enrollPath?: string
+  /** Detail levels the server advertised at setup/last discovery. */
+  detailLevels?: DetailLevel[]
+  findingsPath?: string
+  orgName?: string
+  /** CLI build advertised by the team server at last discovery; `codeburn update` installs it. */
+  clientPackage?: ClientPackageInfo
+  /** Client-chosen detail level (clamped to detailLevels). Default summary. */
+  detailLevel?: DetailLevel
+  /** Whether to share optimize findings (needs findingsPath). Default off. */
+  shareFindings?: boolean
+  /** YYYY-MM-DD (UTC) of the last successful findings upload. */
+  lastFindingsSent?: string
   auto?: AutoSyncConfig
 }
 
@@ -49,6 +65,17 @@ export function readSyncConfig(): SyncConfig | null {
       tracesPath: typeof data.tracesPath === 'string' ? data.tracesPath : '/v1/traces',
       issuer: typeof data.issuer === 'string' ? data.issuer : '',
       lastSync: typeof data.lastSync === 'string' ? data.lastSync : undefined,
+      ...(data.authMode === 'enrollment' || data.authMode === 'oidc' ? { authMode: data.authMode } : {}),
+      ...(typeof data.enrollPath === 'string' ? { enrollPath: data.enrollPath } : {}),
+      ...(Array.isArray(data.detailLevels)
+        ? { detailLevels: data.detailLevels.filter((l): l is DetailLevel => l === 'summary' || l === 'sessions') }
+        : {}),
+      ...(typeof data.findingsPath === 'string' ? { findingsPath: data.findingsPath } : {}),
+      ...(typeof data.orgName === 'string' ? { orgName: data.orgName } : {}),
+      ...(parseClientPackage(data.clientPackage) ? { clientPackage: parseClientPackage(data.clientPackage)! } : {}),
+      ...(data.detailLevel === 'summary' || data.detailLevel === 'sessions' ? { detailLevel: data.detailLevel } : {}),
+      ...(typeof data.shareFindings === 'boolean' ? { shareFindings: data.shareFindings } : {}),
+      ...(typeof data.lastFindingsSent === 'string' ? { lastFindingsSent: data.lastFindingsSent } : {}),
       auto: typeof data.auto === 'object' && data.auto ? (data.auto as AutoSyncConfig) : undefined,
     }
   } catch {

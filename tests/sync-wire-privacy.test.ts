@@ -1,8 +1,10 @@
+import { createHash } from 'crypto'
 import { describe, expect, it } from 'vitest'
 
 import {
   buildAttributionOtlpPayload,
   buildOtlpPayload,
+  getDeviceId,
   flattenAttributionRecords,
   projectBasenameFromWorkingDirectory,
   type CallWithSession,
@@ -185,5 +187,72 @@ describe('sync attribution project privacy boundary', () => {
     const credentialAttributes = Object.fromEntries(spans[1]!.attributes
       .map(attribute => [attribute.key, attribute.value]))
     expect(credentialAttributes['ai.project']).toBeUndefined()
+  })
+})
+
+
+describe('summary detail level wire shape', () => {
+  const withSession = (): CallWithSession => ({
+    call: call({ timestamp: '2026-08-24T10:47:31.123Z' }),
+    sessionId: 'privacy-session-1',
+    workingDirectory: '/Users/alice/work/widget',
+    category: 'debugging',
+    session: { callCount: 7, durationMs: 4000, workUnitId: 'wu1', sessionRole: 'root' },
+  })
+  const spanOf = (level: 'summary' | 'sessions') =>
+    buildOtlpPayload([withSession()], { detailLevel: level }).resourceSpans[0]!.scopeSpans[0]!.spans[0]!
+  const keys = (span: { attributes: Array<{ key: string }> }) => span.attributes.map(a => a.key)
+
+  it('omits session attributes and tools at summary, keeps core + category + project', () => {
+    const k = keys(spanOf('summary'))
+    for (const gone of ['ai.work_unit_id', 'ai.session_role', 'ai.lineage_evidence', 'ai.session_duration_ms', 'ai.call_count', 'ai.tools']) {
+      expect(k).not.toContain(gone)
+    }
+    for (const kept of ['ai.provider', 'ai.model', 'ai.input_tokens', 'ai.output_tokens', 'ai.cost_usd', 'ai.project', 'ai.category']) {
+      expect(k).toContain(kept)
+    }
+  })
+
+  it('sessions level keeps the full span set and adds ai.category', () => {
+    const k = keys(spanOf('sessions'))
+    for (const present of ['ai.work_unit_id', 'ai.session_role', 'ai.call_count', 'ai.session_duration_ms', 'ai.tools', 'ai.category']) {
+      expect(k).toContain(present)
+    }
+    expect(spanOf('sessions').traceId).toBe(createHash('sha256').update('privacy-session-1').digest('hex').slice(0, 32))
+  })
+
+  it('stamps codeburn.detail_level as a resource attribute', () => {
+    for (const level of ['summary', 'sessions'] as const) {
+      const attrs = buildOtlpPayload([withSession()], { detailLevel: level }).resourceSpans[0]!.resource.attributes
+      expect(attrs).toContainEqual({ key: 'codeburn.detail_level', value: { stringValue: level } })
+    }
+  })
+
+  it('uses a per-device per-day traceId, identical across sessions of the same day', () => {
+    const a = buildOtlpPayload([withSession()], { detailLevel: 'summary' }).resourceSpans[0]!.scopeSpans[0]!.spans[0]!
+    const other = { ...withSession(), sessionId: 'another-session', call: call({ timestamp: '2026-08-24T23:59:00.000Z', deduplicationKey: 'k2' }) }
+    const b = buildOtlpPayload([other], { detailLevel: 'summary' }).resourceSpans[0]!.scopeSpans[0]!.spans[0]!
+    const expected = createHash('sha256').update(`${getDeviceId()}:2026-08-24`).digest('hex').slice(0, 32)
+    expect(a.traceId).toBe(expected)
+    expect(b.traceId).toBe(expected)
+    const nextDay = { ...withSession(), call: call({ timestamp: '2026-08-25T00:01:00.000Z', deduplicationKey: 'k3' }) }
+    const c = buildOtlpPayload([nextDay], { detailLevel: 'summary' }).resourceSpans[0]!.scopeSpans[0]!.spans[0]!
+    expect(c.traceId).not.toBe(expected)
+  })
+
+  it('rounds start/end down to the hour at summary only; spanId unchanged', () => {
+    const s = spanOf('summary')
+    const full = spanOf('sessions')
+    const hour = BigInt(Date.parse('2026-08-24T10:00:00.000Z')) * 1_000_000n
+    expect(s.startTimeUnixNano).toBe(hour.toString())
+    expect(s.endTimeUnixNano).toBe(hour.toString())
+    expect(full.startTimeUnixNano).toBe((BigInt(Date.parse('2026-08-24T10:47:31.123Z')) * 1_000_000n).toString())
+    expect(s.spanId).toBe(full.spanId)
+  })
+
+  it('never serializes cwd or session id at summary', () => {
+    const wire = JSON.stringify(buildOtlpPayload([withSession()], { detailLevel: 'summary' }))
+    expect(wire).not.toContain('/Users/alice')
+    expect(wire).not.toContain('privacy-session-1')
   })
 })

@@ -1,12 +1,18 @@
+import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import {
   acquireUpdateLock,
+  ChecksumMismatchError,
   classifyCommandFailure,
   cmdShimArgs,
+  defaultUpdateDeps,
   detectCliMethod,
   packageRootOf,
   parseFeedVersion,
@@ -31,6 +37,7 @@ describe('detectCliMethod', () => {
     ['/opt/homebrew/Cellar/codeburn/0.9.26/libexec/lib/node_modules/codeburn/dist/cli.js', 'brew'],
     ['/home/linuxbrew/.linuxbrew/Cellar/codeburn/0.9.26/libexec/lib/node_modules/codeburn/dist/cli.js', 'brew'],
     ['/opt/homebrew/lib/node_modules/codeburn/dist/cli.js', 'npm'],
+    ['/opt/homebrew/lib/node_modules/codeburn-team/dist/cli.js', 'npm'],
     ['/Users/a/.nvm/versions/node/v22.13.0/lib/node_modules/codeburn/dist/cli.js', 'npm'],
     ['C:\\Users\\a\\AppData\\Roaming\\npm\\node_modules\\codeburn\\dist\\cli.js', 'npm'],
     ['/Users/a/.npm/_npx/1a2b/node_modules/codeburn/dist/cli.js', 'managed'],
@@ -185,6 +192,7 @@ function fake(overrides: Partial<UpdateDeps> & {
     },
     write: line => { lines.push(line) },
     lockDir: () => dir,
+    downloadTeamPackage: async () => ({ path: '/tmp/verified/codeburn-team.tgz', cleanup: async () => {} }),
     ...overrides,
   }
   return {
@@ -449,5 +457,186 @@ describe('runUpdate --json contract', () => {
     expect(await runUpdate({ components: ['desktop', 'menubar'], json: true }, f.deps)).toBe(0)
     expect(f.events()[0]).toMatchObject({ component: 'menubar', state: 'skipped', code: 'not_installed' })
     expect(f.events()[1]).toMatchObject({ component: 'desktop', state: 'skipped', code: 'managed' })
+  })
+})
+
+describe('downloadTeamPackage', () => {
+  const body = Buffer.from('pretend tarball bytes')
+  const good = createHash('sha256').update(body).digest('hex')
+  const serve = async (bytes: Buffer) => {
+    const server = createServer((_req, res) => { res.writeHead(200, { 'Content-Type': 'application/gzip' }); res.end(bytes) })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/install/codeburn-team-1.tgz`, close: () => server.close() }
+  }
+  const download = defaultUpdateDeps('0.9.26', 'codeburn-team').downloadTeamPackage!
+
+  it('writes the verified bytes to a temp file and cleanup removes it', async () => {
+    const s = await serve(body)
+    try {
+      const pkg = await download(s.url, good.toUpperCase())
+      expect(await readFile(pkg.path)).toEqual(body)
+      await pkg.cleanup()
+      expect(existsSync(dirname(pkg.path))).toBe(false)
+    } finally { s.close() }
+  })
+
+  it('throws ChecksumMismatchError and writes nothing when the bytes were tampered with', async () => {
+    const s = await serve(Buffer.from('tampered tarball bytes'))
+    try {
+      await expect(download(s.url, good)).rejects.toBeInstanceOf(ChecksumMismatchError)
+    } finally { s.close() }
+  })
+})
+
+describe('runUpdate with a team-server build', () => {
+  const sha = 'b'.repeat(64)
+  const teamDoc = (version: string) => JSON.stringify({
+    version: 1, auth: 'enrollment', enroll_path: '/v1/enroll',
+    client_package: { version, sha256: sha, path: `/install/codeburn-team-${version}.tgz` },
+  })
+  const enrolled = { baseUrl: 'https://cb.example.com/', authMode: 'enrollment' }
+  /// Reports `before` until an install ran, then `after`.
+  const upgrading = (f: () => Fake, before: string, after: string) => {
+    let installed = false
+    const wrap = (inner: UpdateDeps['run']): UpdateDeps['run'] => async (c, a, o) => { if (a[0] === 'install') installed = true; return inner(c, a, o) }
+    return { findGlobalCli: async () => npmCli(installed ? after : before), wrap }
+  }
+
+  it('installs the verified server package instead of codeburn@latest, without asking npm view', async () => {
+    const urls: string[] = []
+    const downloads: string[][] = []
+    let cleaned = false
+    const u = upgrading(() => f, '0.9.26', '0.9.28')
+    const f = fake({
+      npmLatest: '9.9.9',
+      teamSync: () => enrolled,
+      fetchText: async url => { urls.push(url); return teamDoc('0.9.28') },
+      findGlobalCli: u.findGlobalCli,
+      downloadTeamPackage: async (url, sha256) => {
+        downloads.push([url, sha256])
+        return { path: '/tmp/verified/codeburn-team.tgz', cleanup: async () => { cleaned = true } }
+      },
+    })
+    f.deps.run = u.wrap(f.deps.run)
+    expect(await runUpdate({ components: ['cli'], json: true }, f.deps)).toBe(0)
+    expect(urls).toEqual(['https://cb.example.com/.well-known/codeburn-export.json'])
+    expect(downloads).toEqual([['https://cb.example.com/install/codeburn-team-0.9.28.tgz', sha]])
+    expect(f.runs.some(r => r[1] === 'view')).toBe(false)
+    const install = f.runs.find(r => r[1] === 'install')!
+    expect(install[3]).toBe('/tmp/verified/codeburn-team.tgz')
+    expect(install.join(' ')).not.toContain('codeburn@')
+    expect(cleaned).toBe(true)
+  })
+
+  it('refuses to install when the downloaded package does not match the advertised checksum', async () => {
+    const f = fake({
+      npmLatest: '9.9.9',
+      teamSync: () => enrolled,
+      fetchText: async () => teamDoc('0.9.28'),
+      downloadTeamPackage: async () => { throw new ChecksumMismatchError(sha, 'c'.repeat(64)) },
+    })
+    expect(await runUpdate({ components: ['cli'], json: true }, f.deps)).toBe(1)
+    const failed = f.events().find(e => e.state === 'error')
+    expect(failed).toMatchObject({ component: 'cli', state: 'error', code: 'verify_fail' })
+    expect(String(failed!.message)).toContain('nothing was installed')
+    expect(f.runs.some(r => r[1] === 'install')).toBe(false)
+  })
+
+  it('reports a failed team package download without installing anything', async () => {
+    const f = fake({
+      teamSync: () => enrolled,
+      fetchText: async () => teamDoc('0.9.28'),
+      downloadTeamPackage: async () => { throw new Error('HTTP 502') },
+    })
+    expect(await runUpdate({ components: ['cli'], json: true }, f.deps)).toBe(1)
+    expect(f.events().find(e => e.state === 'error')).toMatchObject({ state: 'error', code: 'download_fail' })
+    expect(f.runs.some(r => r[1] === 'install')).toBe(false)
+  })
+
+  it('--check reports the team version and the team install command is used on failure', async () => {
+    const f = fake({ teamSync: () => enrolled, fetchText: async () => teamDoc('0.9.28') })
+    expect(await runUpdate({ components: ['cli'], check: true, json: true }, f.deps)).toBe(0)
+    expect(f.events()[0]).toMatchObject({ component: 'cli', state: 'skipped', code: 'ok', from: '0.9.26', to: '0.9.28' })
+    expect(f.runs.some(r => r[1] === 'install')).toBe(false)
+  })
+
+  it('is up to date when the server build equals the installed version', async () => {
+    const f = fake({ npmLatest: '9.9.9', teamSync: () => enrolled, fetchText: async () => teamDoc('0.9.26') })
+    expect(await runUpdate({ components: ['cli'], json: true }, f.deps)).toBe(0)
+    expect(f.events()[0]).toMatchObject({ state: 'skipped', code: 'up_to_date' })
+  })
+
+  it('errors instead of installing upstream when the team server is unreachable', async () => {
+    const f = fake({
+      npmLatest: '9.9.9',
+      teamSync: () => enrolled,
+      fetchText: async () => { throw new Error('connect ECONNREFUSED') },
+    })
+    expect(await runUpdate({ components: ['cli'], json: true }, f.deps)).toBe(1)
+    expect(f.events()[0]).toMatchObject({ component: 'cli', state: 'error', code: 'download_fail' })
+    expect(String(f.events()[0]!.message)).toContain('Not falling back')
+    expect(f.runs.some(r => r[1] === 'install' || r[1] === 'view')).toBe(false)
+  })
+
+  it('does not touch the public release path for non-npm installs of a team build', async () => {
+    const f = fake({
+      teamSync: () => enrolled,
+      fetchText: async () => teamDoc('0.9.28'),
+      findGlobalCli: async () => ({ launcher: '/opt/homebrew/bin/codeburn', method: 'brew', root: '/x', version: '0.9.26' }),
+    })
+    expect(await runUpdate({ components: ['cli'], json: true }, f.deps)).toBe(0)
+    expect(f.events()[0]).toMatchObject({ state: 'skipped', code: 'managed' })
+    expect(f.runs).toEqual([])
+  })
+
+  it('falls through to the normal npm flow when not enrolled or the server advertises no package', async () => {
+    const up1 = upgrading(() => plain, '0.9.26', '0.9.27')
+    const plain = fake({ npmLatest: '0.9.27', teamSync: () => ({ baseUrl: 'https://x.example.com', authMode: 'oidc' }), findGlobalCli: up1.findGlobalCli })
+    plain.deps.run = up1.wrap(plain.deps.run)
+    expect(await runUpdate({ components: ['cli'], json: true }, plain.deps)).toBe(0)
+    expect(plain.runs.find(r => r[1] === 'install')![3]).toBe('codeburn@0.9.27')
+    const up2 = upgrading(() => none, '0.9.26', '0.9.27')
+    const none = fake({
+      npmLatest: '0.9.27', teamSync: () => enrolled,
+      fetchText: async () => JSON.stringify({ version: 1, auth: 'enrollment', enroll_path: '/v1/enroll' }),
+      findGlobalCli: up2.findGlobalCli,
+    })
+    none.deps.run = up2.wrap(none.deps.run)
+    expect(await runUpdate({ components: ['cli'], json: true }, none.deps)).toBe(0)
+    expect(none.runs.find(r => r[1] === 'install')![3]).toBe('codeburn@0.9.27')
+  })
+
+  it('installs a differing lower server version (rollback) and verifies the exact version', async () => {
+    const u = upgrading(() => f, '0.9.26-team.202601010000', '0.9.26-team.202512010000')
+    const f = fake({ teamSync: () => enrolled, fetchText: async () => teamDoc('0.9.26-team.202512010000'), findGlobalCli: u.findGlobalCli })
+    f.deps.run = u.wrap(f.deps.run)
+    f.deps.packageName = 'codeburn-team'
+    expect(await runUpdate({ components: ['cli'], json: true }, f.deps)).toBe(0)
+    expect(f.runs.find(r => r[1] === 'install')![3]).toBe('/tmp/verified/codeburn-team.tgz')
+    expect(f.events()[1]).toMatchObject({ state: 'done', code: 'ok' })
+  })
+
+  it('is up to date for an identical stamped version', async () => {
+    const f = fake({ teamSync: () => enrolled, fetchText: async () => teamDoc('0.9.26-team.1'), findGlobalCli: async () => npmCli('0.9.26-team.1') })
+    expect(await runUpdate({ components: ['cli'], json: true }, f.deps)).toBe(0)
+    expect(f.events()[0]).toMatchObject({ state: 'skipped', code: 'up_to_date' })
+    expect(f.runs.some(r => r[1] === 'install')).toBe(false)
+  })
+
+  it('never installs upstream codeburn@latest for a codeburn-team build that is not enrolled or has no package', async () => {
+    const msg = 'This is a team build of CodeBurn; updates come from your team server (codeburn sync setup <url> --token …).'
+    const notEnrolled = fake({ npmLatest: '9.9.9', findGlobalCli: async () => npmCli('0.9.26-team.1') })
+    notEnrolled.deps.packageName = 'codeburn-team'
+    expect(await runUpdate({ components: ['cli'], json: true }, notEnrolled.deps)).toBe(0)
+    expect(notEnrolled.events()[0]).toMatchObject({ state: 'skipped', message: msg })
+    expect(notEnrolled.runs).toEqual([])
+    const noPkg = fake({
+      npmLatest: '9.9.9', teamSync: () => enrolled, findGlobalCli: async () => npmCli('0.9.26-team.1'),
+      fetchText: async () => JSON.stringify({ version: 1, auth: 'enrollment', enroll_path: '/v1/enroll' }),
+    })
+    noPkg.deps.packageName = 'codeburn-team'
+    expect(await runUpdate({ components: ['cli'], json: true }, noPkg.deps)).toBe(0)
+    expect(noPkg.events()[0]).toMatchObject({ state: 'skipped', message: msg })
+    expect(noPkg.runs.some(r => r.join(' ').includes('codeburn@'))).toBe(false)
   })
 })

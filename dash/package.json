@@ -5,9 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "vite build && vite build --config vite.team.config.ts",
     "typecheck": "tsc --noEmit",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "build:team": "vite build --config vite.team.config.ts",
+    "dev:team": "vite --config vite.team.config.ts",
+    "test": "vitest run --root .. dash/src/team"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.104.0",

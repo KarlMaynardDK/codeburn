@@ -78,6 +78,18 @@ export function wireProjectName(projectPath: string, fallback: string): string {
   return normalized.split('/').filter(Boolean).pop() ?? fallback
 }
 
+/**
+ * Summary-level trace id: one bucket per device per UTC day, so a receiver can
+ * never reconstruct individual sessions from it.
+ */
+export function deriveDayBucketTraceId(deviceId: string, isoTimestamp: string): string {
+  const ms = new Date(isoTimestamp).getTime()
+  const day = isNaN(ms) ? 'unknown' : new Date(ms).toISOString().slice(0, 10)
+  return createHash('sha256').update(`${deviceId}:${day}`).digest('hex').slice(0, 32)
+}
+
+const HOUR_MS = 3_600_000
+
 // --- Timestamp conversion ---
 
 function toUnixNano(isoTimestamp: string): string {
@@ -97,6 +109,8 @@ export interface CallWithSession {
   workingDirectory?: string
   /** Session-level wire context (CB-3). Absent on callers that predate it. */
   session?: SessionWireContext
+  /** Task category of the turn this call belongs to (ClassifiedTurn.category). Sent as ai.category. */
+  category?: string
 }
 
 /**
@@ -198,7 +212,22 @@ function safeProjectAttribute(project: string | undefined): OtlpAttribute | null
   return { key: 'ai.project', value: { stringValue: project } }
 }
 
+export type WireDetailLevel = 'summary' | 'sessions'
+
+/** Task categories are a closed vocabulary; anything else ships as nothing. */
+function safeCategory(category: string | undefined): string | undefined {
+  if (!category) return undefined
+  if (!/^[a-z][a-z/_-]{0,31}$/.test(category)) return undefined
+  return category
+}
+
 export interface BuildOtlpOptions {
+  /**
+   * Detail level stamped as the codeburn.detail_level resource attribute.
+   * 'summary' drops every session-correlating field (see buildOtlpPayload).
+   * When omitted the legacy full span set is built and no attribute is stamped.
+   */
+  detailLevel?: WireDetailLevel
   /**
    * ISO date the local corpus is complete through (daily-cache watermark),
    * stamped on the export batch as a resource attribute. Omit when the
@@ -234,7 +263,7 @@ export const CORE_SYNC_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
   'ai.provider', 'ai.model', 'ai.input_tokens', 'ai.output_tokens', 'ai.cost_usd', 'ai.speed',
   'ai.project', 'ai.tools', 'ai.cost_estimated', 'ai.work_unit_id', 'ai.session_role',
   'ai.lineage_evidence', 'ai.cache_read_tokens', 'ai.cache_write_tokens', 'ai.call_count',
-  'ai.session_duration_ms', 'ai.subscription_covered', 'codeburn.device_id',
+  'ai.session_duration_ms', 'ai.subscription_covered', 'ai.category', 'codeburn.device_id', 'codeburn.detail_level',
   'codeburn.coverage_through', 'codeburn.attribution_methodology',
   'git.repo', 'git.sha', 'git.commit_count', 'git.in_main', 'git.was_reverted', 'git.pr_links',
 ])
@@ -264,16 +293,26 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
     ? filterPluginAttributes(opts.pluginAttributes, opts.pluginAttributeKeys)
     : []
 
-  const spans: OtlpSpan[] = calls.map(({ call, sessionId, workingDirectory, session }) => {
-    const perCallEnrichment = opts?.pluginEnrichment?.perCall.get(call.deduplicationKey) ?? []
-    const startNano = toUnixNano(call.timestamp)
+  const summary = opts?.detailLevel === 'summary'
+
+  const spans: OtlpSpan[] = calls.map(({ call, sessionId, workingDirectory, session: fullSession, category }) => {
+    // Summary level never sees session context at all.
+    const session = summary ? undefined : fullSession
+    const perCallEnrichment = summary ? [] : opts?.pluginEnrichment?.perCall.get(call.deduplicationKey) ?? []
+    let startNano = toUnixNano(call.timestamp)
     // End time = start + 1ms (we don't have real duration, but OTLP requires both)
-    const endNano = (BigInt(startNano) + 1_000_000n).toString()
+    let endNano = (BigInt(startNano) + 1_000_000n).toString()
+    if (summary && startNano !== '0') {
+      // Round down to the hour: exact timing would let a receiver re-order calls into sessions.
+      const rounded = (BigInt(startNano) / (BigInt(HOUR_MS) * 1_000_000n)) * (BigInt(HOUR_MS) * 1_000_000n)
+      startNano = rounded.toString()
+      endNano = startNano
+    }
 
     const provider = sanitizeProviderIdentifier(call.provider)
     const model = sanitizeModelIdentifier(call.model)
     const project = projectBasenameFromWorkingDirectory(workingDirectory)
-    const tools = sanitizeToolIdentifiers(call.tools)
+    const tools = summary ? [] : sanitizeToolIdentifiers(call.tools)
     const attributes: OtlpAttribute[] = [
       { key: 'ai.provider', value: { stringValue: provider } },
       { key: 'ai.model', value: { stringValue: model } },
@@ -287,6 +326,9 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
     ]
     const projectAttribute = safeProjectAttribute(project)
     if (projectAttribute) attributes.push(projectAttribute)
+
+    const categoryValue = safeCategory(category)
+    if (categoryValue) attributes.push({ key: 'ai.category', value: { stringValue: categoryValue } })
 
     if (tools.length > 0) {
       attributes.push({
@@ -340,13 +382,13 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
 
     // Plugin socket: declared-and-guarded plugin fields only (see
     // filterPluginAttributes). No plugins => no change to any byte.
-    attributes.push(...guardedPluginAttributes)
+    if (!summary) attributes.push(...guardedPluginAttributes)
 
     // Per-call enrichment from sync exporters
     attributes.push(...perCallEnrichment)
 
     return {
-      traceId: deriveTraceId(sessionId),
+      traceId: summary ? deriveDayBucketTraceId(deviceId, call.timestamp) : deriveTraceId(sessionId),
       spanId: deriveSpanId(call.deduplicationKey),
       name: `${provider}/${model}`,
       startTimeUnixNano: startNano,
@@ -358,13 +400,16 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
   const resourceAttributes: OtlpAttribute[] = [
     { key: 'codeburn.device_id', value: { stringValue: deviceId } },
   ]
+  if (opts?.detailLevel) {
+    resourceAttributes.push({ key: 'codeburn.detail_level', value: { stringValue: opts.detailLevel } })
+  }
   const coverageThrough = opts?.coverageThrough ? sanitizeIdentifier(opts.coverageThrough, 32) : undefined
   if (coverageThrough) {
     resourceAttributes.push({ key: 'codeburn.coverage_through', value: { stringValue: coverageThrough } })
   }
 
   // Append extra spans from plugin exporters
-  if (opts?.pluginEnrichment?.extraSpans) {
+  if (!summary && opts?.pluginEnrichment?.extraSpans) {
     spans.push(...opts.pluginEnrichment.extraSpans)
   }
 

@@ -1,5 +1,5 @@
 {
-  "name": "codeburn",
+  "name": "codeburn-team",
   "version": "0.9.27",
   "description": "See where your AI spend goes - by task, tool, model, and project",
   "mcpName": "io.github.getagentseal/codeburn",
@@ -67,6 +67,7 @@
     "chalk": "^5.4.1",
     "commander": "^13.1.0",
     "ink": "^7.0.0",
+    "pg": "^8.23.1",
     "react": "^19.2.5",
     "selfsigned": "^5.5.0",
     "strip-ansi": "^7.2.0",
@@ -75,6 +76,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.19.17",
+    "@types/pg": "^8.23.1",
     "@types/react": "^19.2.14",
     "@types/selfsigned": "^2.0.4",
     "playwright": "^1.61.1",
