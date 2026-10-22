@@ -37,6 +37,7 @@ export function schemaStatements(real: string, int: string): string[] {
     `CREATE TABLE IF NOT EXISTS enrollments (token_hash TEXT PRIMARY KEY, person_id TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT)`,
     `CREATE TABLE IF NOT EXISTS viewers (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, revoked_at TEXT)`,
     `CREATE TABLE IF NOT EXISTS viewer_sessions (token_hash TEXT PRIMARY KEY, viewer_id TEXT NOT NULL, expires_at TEXT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS sso_sessions (token_hash TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, person_id TEXT, subject TEXT NOT NULL, email TEXT, expires_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS spans (span_id TEXT PRIMARY KEY, person_id TEXT NOT NULL, device_id TEXT NOT NULL, trace_id TEXT NOT NULL, ts TEXT NOT NULL, day TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, project TEXT NOT NULL, category TEXT NOT NULL, input ${int} NOT NULL, output ${int} NOT NULL, cache_read ${int} NOT NULL, cache_write ${int} NOT NULL, cost_usd ${real} NOT NULL, detail_level TEXT NOT NULL, work_unit_id TEXT, session_role TEXT, call_count ${int}, session_duration_ms ${int})`,
     `CREATE INDEX IF NOT EXISTS spans_person_day ON spans (person_id, day)`,
     `CREATE INDEX IF NOT EXISTS spans_trace ON spans (person_id, trace_id)`,
@@ -60,6 +61,26 @@ export async function migrate(db: Db): Promise<void> {
 
 export interface Person { id: string; name: string; email: string; team: string; revoked_at: string | null }
 
+/** A signed-in viewer. Viewer keys and GitLab admins see everything; members see only their own person. */
+export type Viewer =
+  | { name: string; role: 'admin' }
+  | { name: string; role: 'member'; personId: string }
+  | { name: string; role: 'registrant'; email: string }
+
+export const TEAM_MAX_LENGTH = 64
+
+/**
+ * Validates a self-registered team name and reuses an existing team's spelling when the input differs only in
+ * letter case or surrounding spaces. Null when the name is empty, too long or has control characters.
+ */
+export function canonicalTeam(input: string, existing: string[]): string | null {
+  const team = input.trim()
+  // eslint-disable-next-line no-control-regex
+  if (!team || team.length > TEAM_MAX_LENGTH || /[\u0000-\u001f\u007f]/.test(team)) return null
+  const key = team.toLowerCase()
+  return existing.find(t => t.trim().toLowerCase() === key) ?? team
+}
+
 export interface SpanRecord {
   span_id: string
   trace_id: string
@@ -82,6 +103,12 @@ export interface SpanRecord {
 
 const nowIso = () => new Date().toISOString()
 const WEEK_MS = 7 * 86_400_000
+const SESSION_TTL_MS = 12 * 3600_000
+
+type RegisterError = 'not_registrant' | 'invalid_team' | 'email_taken'
+class RegisterFailure extends Error {
+  constructor(readonly code: RegisterError) { super(code) }
+}
 
 /**
  * All persistence operations. One implementation over the portable `Db` adapter;
@@ -115,6 +142,57 @@ export class Store {
     if (rows.length === 0) return null
     await this.all('DELETE FROM enrollments WHERE person_id = ? AND used_at IS NULL', [personId])
     return this.createEnrollment(personId, ttlMs)
+  }
+
+  async peopleByEmail(email: string): Promise<Array<{ id: string; revoked_at: string | null }>> {
+    const rows = await this.all('SELECT id, revoked_at FROM people WHERE lower(email) = ?', [email.trim().toLowerCase()])
+    return rows.map(r => ({ id: r.id as string, revoked_at: r.revoked_at ?? null }))
+  }
+
+  /** Team names in use by active people, sorted. */
+  async distinctTeams(): Promise<string[]> {
+    const rows = await this.all(`SELECT DISTINCT team FROM people WHERE revoked_at IS NULL AND team <> '' ORDER BY team`)
+    return rows.map(r => r.team as string)
+  }
+
+  async getPerson(id: string): Promise<Person | null> {
+    const r = (await this.all('SELECT id, name, email, team, revoked_at FROM people WHERE id = ?', [id]))[0]
+    return r ? { id: r.id, name: r.name, email: r.email, team: r.team, revoked_at: r.revoked_at ?? null } : null
+  }
+
+  /**
+   * Turns a registrant session into a person with a fresh enrollment token, and upgrades the session to member.
+   * Atomic: a double submit or a concurrent registration for the same email cannot create two people.
+   */
+  async registerSelf(sessionToken: string, teamInput: string, ttlMs = WEEK_MS):
+    Promise<{ person: Person; enrollmentToken: string; expiresAt: string } | { error: RegisterError }> {
+    const now = nowIso()
+    try {
+      return await this.db.tx(async q => {
+        if (this.db.kind === 'postgres') await q.all('SELECT pg_advisory_xact_lock(7204)')
+        const id = newId('p_')
+        // Claiming the session first serialises a double submit on the same session.
+        const claimed = await q.all(
+          `UPDATE sso_sessions SET role = 'member', person_id = ?
+           WHERE token_hash = ? AND role = 'registrant' AND expires_at > ? RETURNING name, email`, [id, sha256hex(sessionToken), now])
+        if (claimed.length === 0) throw new RegisterFailure('not_registrant')
+        const name = claimed[0]!.name as string
+        const email = claimed[0]!.email as string
+        const teams = (await q.all(`SELECT DISTINCT team FROM people WHERE revoked_at IS NULL AND team <> ''`)).map(r => r.team as string)
+        const team = canonicalTeam(teamInput, teams)
+        if (!team) throw new RegisterFailure('invalid_team')
+        if ((await q.all('SELECT id FROM people WHERE lower(email) = ?', [email.toLowerCase()])).length > 0) throw new RegisterFailure('email_taken')
+        await q.all('INSERT INTO people (id, name, email, team, created_at) VALUES (?, ?, ?, ?, ?)', [id, name, email, team, now])
+        const enrollmentToken = newSecret('cbe_')
+        const expiresAt = new Date(Date.now() + ttlMs).toISOString()
+        await q.all('INSERT INTO enrollments (token_hash, person_id, expires_at) VALUES (?, ?, ?)', [sha256hex(enrollmentToken), id, expiresAt])
+        await q.all('UPDATE sso_sessions SET email = NULL WHERE token_hash = ?', [sha256hex(sessionToken)])
+        return { person: { id, name, email, team, revoked_at: null }, enrollmentToken, expiresAt }
+      })
+    } catch (err) {
+      if (err instanceof RegisterFailure) return { error: err.code }
+      throw err
+    }
   }
 
   /** Atomically consumes a one-time token and mints a device credential. */
@@ -181,19 +259,42 @@ export class Store {
     if (rows.length === 0) return null
     const token = newSecret('cbs_')
     await this.all('INSERT INTO viewer_sessions (token_hash, viewer_id, expires_at) VALUES (?, ?, ?)',
-      [sha256hex(token), rows[0]!.id, new Date(Date.now() + 12 * 3600_000).toISOString()])
+      [sha256hex(token), rows[0]!.id, new Date(Date.now() + SESSION_TTL_MS).toISOString()])
     return { token, name: rows[0]!.name as string }
   }
 
-  async viewerForSession(token: string): Promise<{ name: string } | null> {
+  /** Starts a GitLab sign-in session; `subject` is the GitLab user id, kept for auditing. */
+  async loginSso(s: Viewer & { subject: string }): Promise<string> {
+    const token = newSecret('cbs_')
+    await this.all('INSERT INTO sso_sessions (token_hash, name, role, person_id, subject, email, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [sha256hex(token), s.name, s.role, s.role === 'member' ? s.personId : null, s.subject, s.role === 'registrant' ? s.email : null,
+        new Date(Date.now() + SESSION_TTL_MS).toISOString()])
+    return token
+  }
+
+  async viewerForSession(token: string): Promise<Viewer | null> {
+    const hash = sha256hex(token)
+    const now = nowIso()
     const rows = await this.all(
       `SELECT v.name AS name FROM viewer_sessions s JOIN viewers v ON v.id = s.viewer_id
-       WHERE s.token_hash = ? AND s.expires_at > ? AND v.revoked_at IS NULL`, [sha256hex(token), nowIso()])
-    return rows.length > 0 ? { name: rows[0]!.name as string } : null
+       WHERE s.token_hash = ? AND s.expires_at > ? AND v.revoked_at IS NULL`, [hash, now])
+    if (rows.length > 0) return { name: rows[0]!.name as string, role: 'admin' }
+    // Member sessions end as soon as their person is revoked.
+    const sso = await this.all(
+      `SELECT s.name AS name, s.role AS role, s.person_id AS person_id, s.email AS email FROM sso_sessions s
+       LEFT JOIN people p ON p.id = s.person_id
+       WHERE s.token_hash = ? AND s.expires_at > ? AND (s.role <> 'member' OR (p.id IS NOT NULL AND p.revoked_at IS NULL))`, [hash, now])
+    const r = sso[0]
+    if (!r) return null
+    if (r.role === 'admin') return { name: r.name, role: 'admin' }
+    if (r.role === 'member') return { name: r.name, role: 'member', personId: r.person_id }
+    if (r.role === 'registrant') return { name: r.name, role: 'registrant', email: r.email }
+    return null
   }
 
   async logoutViewer(token: string): Promise<void> {
     await this.all('DELETE FROM viewer_sessions WHERE token_hash = ?', [sha256hex(token)])
+    await this.all('DELETE FROM sso_sessions WHERE token_hash = ?', [sha256hex(token)])
   }
 
   // ---- ingest ----
@@ -273,6 +374,7 @@ export class Store {
       await q.all('DELETE FROM daily_usage WHERE day < ?', [cutoffDay])
       await q.all('DELETE FROM sessions WHERE started < ?', [cutoff])
       await q.all('DELETE FROM viewer_sessions WHERE expires_at < ?', [now.toISOString()])
+      await q.all('DELETE FROM sso_sessions WHERE expires_at < ?', [now.toISOString()])
       await q.all('DELETE FROM enrollments WHERE expires_at < ? AND used_at IS NULL', [cutoff])
       return { spans: del.length }
     })

@@ -69,9 +69,158 @@ UTC build time); see the install page.
 Each setting except `database_url` can also be set by an environment variable, which wins over the file:
 `CODEBURN_TEAM_ACCEPT_SESSION_DETAIL`, `CODEBURN_TEAM_ACCEPT_FINDINGS` (`true`/`false`, `1`/`0`, `on`/`off`),
 `CODEBURN_TEAM_RETENTION_DAYS`, `CODEBURN_TEAM_ORG_NAME` and `CODEBURN_TEAM_PUBLIC_URL`. This is the easiest way to configure a container.
+The optional `gitlab` block has its own variables; see [GitLab sign-in](#gitlab-sign-in).
 
 Identity always comes from the device credential, never from the payload. Credentials, enrollment tokens and viewer
 keys are stored only as SHA-256 hashes. Spans older than 183 days (or more than a day in the future) are rejected.
+
+## GitLab sign-in
+
+The viewer can optionally offer **Sign in with GitLab** (OAuth2 with PKCE, OIDC userinfo) next to viewer keys.
+Viewer-key login keeps working unchanged. The design notes are in [gitlab-sso.md](gitlab-sso.md).
+
+### Before you start
+
+- **A fixed public URL.** GitLab redirects the browser back to `<public_url>/auth/gitlab/callback`, so the server
+  needs `public_url` and the server refuses to start without it. In production this is your https address behind the
+  reverse proxy (see [TLS and reverse proxy](#tls-and-reverse-proxy)); the proxy needs no extra routes, since
+  `/auth/gitlab/*` is served by the same server. For a local trial, `http://localhost:8787` works.
+- **Outbound access to GitLab.** The server itself calls GitLab's `/oauth/token` and `/oauth/userinfo` (10 second
+  timeout), so the host or container must reach the GitLab URL. If a self-managed GitLab uses a private CA, give Node
+  the CA with `NODE_EXTRA_CA_CERTS=/path/to/ca.pem`.
+- **The group paths you'll use.** A group's full path is what appears in its URL: for
+  `https://gitlab.example.com/acme/platform-leads` it is `acme/platform-leads`. Membership inherited from a parent
+  group counts.
+- **Matching emails for existing people.** People an admin already added are recognised by email: their enrolled
+  email must equal the email GitLab reports for them (their primary email, which must be verified). Matching ignores
+  letter case. Check `codeburn team admin list` (or the People page) and fix any that differ before people sign in.
+  Otherwise they'll be refused, or offered registration and create a duplicate person.
+- **Optional: the client package.** With a client package configured, the registration page shows the full
+  one-line installers; without one it only shows `codeburn sync setup <url> --token <token>`, which needs
+  CodeBurn already installed. See [Installing the client from your server](install.md).
+
+### 1. Create the OAuth application in GitLab
+
+Create it at whichever level you administer. All three work the same way:
+
+- **Your user:** avatar > **Edit profile** > **Access** > **Applications** > **Add new application**.
+- **A group:** the group > **Settings** > **Applications** (needs the Owner role).
+- **The whole instance** (self-managed, administrators only): **Admin** > **Applications** > **New application**.
+  You can mark it **Trusted** to skip GitLab's "Authorize" screen.
+
+Fill in:
+
+- **Name:** for example `CodeBurn team`. Users see it on GitLab's consent screen.
+- **Redirect URI:** exactly `<public_url>/auth/gitlab/callback`, for example
+  `https://codeburn.example.com/auth/gitlab/callback`. The scheme, host and port must match `public_url`
+  character for character, with no trailing slash.
+- **Confidential:** leave it checked. The server keeps the secret.
+- **Scopes:** `openid`, `profile` and `email`. Nothing else is needed.
+
+Save, then copy the **Application ID** and the **Secret**. GitLab shows the secret only once; if you lose it, use
+**Renew secret** and update the server.
+
+### 2. Configure the server
+
+Set `public_url` and the application's ID and secret. Keep the secret in an environment variable rather than in the
+file:
+
+```json
+{
+  "public_url": "https://codeburn.example.com",
+  "gitlab": {
+    "url": "https://gitlab.example.com",
+    "admin_groups": ["acme/platform-leads"],
+    "register_groups": ["acme"],
+    "register_note": "Questions? Ask in #codeburn on Slack."
+  }
+}
+```
+
+```bash
+CODEBURN_TEAM_GITLAB_CLIENT_ID=...
+CODEBURN_TEAM_GITLAB_CLIENT_SECRET=...
+```
+
+- `url`: the GitLab instance, default `https://gitlab.com`. A subpath install (`https://example.com/gitlab`) works.
+- `client_id`, `client_secret`: sign-in is enabled only when both are set.
+- `admin_groups`: group full paths whose members (subgroups included) see everything, like a viewer key.
+- `register_groups`: group full paths whose members may register themselves (see below). Empty, the default, turns
+  self-registration off. `"*"` allows any user of the GitLab instance; **on gitlab.com that means anyone with an
+  account**, so only use it on a private instance.
+- `register_note`: optional plain text shown on the registration page below the install instructions. Blank lines
+  start new paragraphs and `http(s)://` URLs become links. HTML is shown as text, never rendered.
+
+Each key has an environment variable that wins over the file: `CODEBURN_TEAM_GITLAB_URL`,
+`CODEBURN_TEAM_GITLAB_CLIENT_ID`, `CODEBURN_TEAM_GITLAB_CLIENT_SECRET`, `CODEBURN_TEAM_GITLAB_ADMIN_GROUPS`,
+`CODEBURN_TEAM_GITLAB_REGISTER_GROUPS` (both comma-separated) and `CODEBURN_TEAM_GITLAB_REGISTER_NOTE`. A note with
+several paragraphs is easier to write in `team-server.json` (use `\n\n` between paragraphs) than in an environment
+variable. With Docker Compose, put these in `.env`; see [Docker](#docker).
+
+### 3. Restart and check
+
+Restart the server (`codeburn team serve`, or `docker compose ... up -d`). The startup log confirms the settings:
+
+```text
+  GitLab sign-in: https://gitlab.example.com, self-registration on
+```
+
+Open `public_url` in a browser. The login card now has a **Sign in with GitLab** button above the viewer-key form.
+Try three accounts: one in an `admin_groups` group (should see everything), one already enrolled as a person
+(should see only their own usage), and one in a `register_groups` group who isn't enrolled (should land on the
+registration page).
+
+### Who gets in
+
+Rules are checked in this order:
+
+- **Admin**: a member of an `admin_groups` group. Sees everything.
+- **Member**: a user whose **verified** GitLab email matches exactly one active person's enrolled email
+  (case-insensitive). Sees only their own data: no team or person pickers, and the People tab shows just them.
+  Revoking the person ends their GitLab session immediately.
+- **Registrant**: a user with a verified email that no person has (active **or** revoked), who is in a
+  `register_groups` group. See below.
+- Anyone else is told their account isn't authorised.
+
+### Self-registration
+
+A registrant lands on `/register`. The page shows their GitLab name and email (they can't change these) and asks
+for their **team**. The team box suggests the teams already in use, but any name is accepted, so the first person
+from a new team simply types it. A name that differs from an existing team only in letter case or surrounding
+spaces is saved with the existing spelling (`" platform"` becomes `Platform`).
+
+Submitting creates the person exactly as `codeburn team admin add-person --name <GitLab name> --email <GitLab email>
+--team <team>` would, and shows a one-time enrollment token (valid 7 days, one machine) with the same install
+commands the CLI prints, then the `register_note`. The session becomes a member session.
+
+Members (self-registered or added by an admin) get a **Set up another machine** link, which issues a fresh install
+token and invalidates any unused one. Each session can create at most 10 tokens an hour. Registrations are logged to
+stderr. A revoked person can't register again with the same email.
+
+GitLab sign-in sessions last 12 hours, the same as viewer-key sessions; after that, users sign in again.
+
+### Troubleshooting
+
+The server logs the reason for every failed GitLab sign-in to stderr. The browser only sees one of two messages:
+
+- **"Your GitLab account isn't authorised"** (`?login_error=denied`): sign-in worked, but the rules above gave no
+  access. The log shows `GitLab sign-in denied for <email>`. Common causes:
+  - the email isn't verified in GitLab;
+  - the enrolled email differs from the GitLab one;
+  - the email belongs to a revoked person;
+  - two active people share the email;
+  - the user isn't in any `admin_groups` or `register_groups` group (check the spelling of the full path).
+- **"GitLab sign-in failed"** (`?login_error=failed`): the round trip broke. The log shows
+  `GitLab sign-in failed: <reason>`. Common causes:
+  - a wrong client ID or secret, or a renewed secret not yet copied to the server (token endpoint returns 401);
+  - a redirect URI in GitLab that doesn't match `public_url` (GitLab shows its own error page before coming back);
+  - the server can't reach GitLab, or doesn't trust its certificate;
+  - the sign-in took longer than 10 minutes, or was started in another browser.
+- **GitLab says "The redirect URI included is not valid"**: the application's Redirect URI must be exactly
+  `<public_url>/auth/gitlab/callback`.
+- **No GitLab button:** both `client_id` and `client_secret` must be set; check the startup log line.
+- **Too many failures:** after 10 failed sign-ins (GitLab or viewer key) in a minute, an IP address is paused for
+  the rest of that minute.
 
 ## Storage: SQLite or PostgreSQL
 
@@ -146,6 +295,13 @@ CODEBURN_TEAM_PUBLIC_URL=https://codeburn.example.com   # used in /install.sh an
 CODEBURN_TEAM_ACCEPT_SESSION_DETAIL=false
 CODEBURN_TEAM_ACCEPT_FINDINGS=false
 CODEBURN_TEAM_RETENTION_DAYS=400
+# Optional GitLab sign-in; see "GitLab sign-in" above.
+CODEBURN_TEAM_GITLAB_URL=https://gitlab.example.com
+CODEBURN_TEAM_GITLAB_CLIENT_ID=
+CODEBURN_TEAM_GITLAB_CLIENT_SECRET=
+CODEBURN_TEAM_GITLAB_ADMIN_GROUPS=acme/platform-leads
+CODEBURN_TEAM_GITLAB_REGISTER_GROUPS=acme
+CODEBURN_TEAM_GITLAB_REGISTER_NOTE="Questions? Ask in #codeburn on Slack."   # quoted: an unquoted " #" starts a comment
 ```
 
 Change a setting by editing `.env` and running `up -d` again; the server container is recreated and the data stays in
@@ -173,7 +329,10 @@ docker exec codeburn-team node dist/cli.js team admin add-viewer --name "Manager
   Re-sending a span id overwrites it, so pushes are idempotent. A span id owned by another person is never
   reassigned.
 - `POST /v1/findings`: `{captured_at, findings}`, only when `accept_findings` is on.
-- `/api/team/*`: viewer API (login, meta, overview, people, models, projects, sessions, insights). "Tokens" in these
+- `GET /auth/gitlab/login`, `GET /auth/gitlab/callback`: GitLab sign-in, only when it is configured (404 otherwise).
+- `/register`: the self-registration page (part of the viewer).
+- `/api/team/*`: viewer API (auth-methods, login, logout, meta, overview, people, models, projects, sessions,
+  insights, and `registration` / `registration/token` for self-registration). "Tokens" in these
   responses are input + output + cache read + cache write; `cache_read_ratio` is cache reads / (input + cache reads).
 
 ## Insights rules

@@ -1,7 +1,9 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { TeamServerConfig } from './config.js'
-import type { Store } from './store.js'
+import type { Person, Store, Viewer } from './store.js'
 import { FailureLimiter, SESSION_COOKIE, clearedSessionCookie, isSameOriginRequest, readCookie, sessionCookie } from './auth.js'
+import { installerLines, setupCommand } from './client-package.js'
+import { registrationEnabled } from './gitlab.js'
 import { computeInsights } from './insights.js'
 import * as rollup from './rollup.js'
 
@@ -26,6 +28,75 @@ export interface ApiContext {
   config: TeamServerConfig
   tls: boolean
   limiter: FailureLimiter
+  /** Caps install tokens minted per session from the registration page. */
+  tokenLimiter: FailureLimiter
+  /** True when /install.sh and /install.ps1 are served. */
+  installers: boolean
+}
+
+/** What the registration page shows once a token exists. */
+function installResponse(ctx: ApiContext, person: Pick<Person, 'name' | 'email' | 'team'>, token: string, expiresAt: string) {
+  const url = ctx.config.public_url ?? ''
+  return {
+    token,
+    expires_at: expiresAt,
+    url,
+    install: ctx.installers ? installerLines(url, token) : null,
+    setup: setupCommand(url, token),
+    person: { name: person.name, email: person.email, team: person.team },
+  }
+}
+
+async function readTeam(req: IncomingMessage): Promise<string | null> {
+  const raw = await readBody(req, 4096)
+  if (raw === 'too_large') return null
+  try {
+    const team = (JSON.parse(raw.toString('utf-8')) as { team?: unknown }).team
+    return typeof team === 'string' ? team : null
+  } catch {
+    return null
+  }
+}
+
+async function handleRegistration(ctx: ApiContext, req: IncomingMessage, res: ServerResponse, path: string, viewer: Viewer, token: string): Promise<void> {
+  const { store, config } = ctx
+  if (!registrationEnabled(config.gitlab) || viewer.role === 'admin') return sendJson(res, 404, { error: 'not_found' })
+  const note = config.gitlab?.register_note ?? ''
+
+  if (path === '/api/team/registration') {
+    if (req.method === 'GET') {
+      if (viewer.role === 'registrant') {
+        return sendJson(res, 200, { state: 'new', name: viewer.name, email: viewer.email, teams: await store.distinctTeams(), note })
+      }
+      const person = await store.getPerson(viewer.personId)
+      if (!person) return sendJson(res, 404, { error: 'not_found' })
+      return sendJson(res, 200, { state: 'member', name: person.name, email: person.email, team: person.team, note })
+    }
+    if (req.method !== 'POST') return sendJson(res, 405, { error: 'method_not_allowed' })
+    if (viewer.role !== 'registrant') return sendJson(res, 409, { error: 'already_registered' })
+    if (ctx.tokenLimiter.blocked(token)) return sendJson(res, 429, { error: 'too_many_attempts' })
+    ctx.tokenLimiter.fail(token)
+    const r = await store.registerSelf(token, (await readTeam(req)) ?? '')
+    if ('error' in r) {
+      const status = r.error === 'invalid_team' ? 400 : r.error === 'email_taken' ? 409 : 403
+      return sendJson(res, status, { error: r.error })
+    }
+    process.stderr.write(`team-server: registered ${r.person.name} <${r.person.email}> team=${r.person.team} (${r.person.id})\n`)
+    return sendJson(res, 200, installResponse(ctx, r.person, r.enrollmentToken, r.expiresAt))
+  }
+
+  if (path === '/api/team/registration/token') {
+    if (req.method !== 'POST') return sendJson(res, 405, { error: 'method_not_allowed' })
+    if (viewer.role !== 'member') return sendJson(res, 403, { error: 'registration_required' })
+    if (ctx.tokenLimiter.blocked(token)) return sendJson(res, 429, { error: 'too_many_attempts' })
+    ctx.tokenLimiter.fail(token)
+    const person = await store.getPerson(viewer.personId)
+    const fresh = person ? await store.rotateEnrollment(person.id) : null
+    if (!person || !fresh) return sendJson(res, 404, { error: 'not_found' })
+    process.stderr.write(`team-server: new install token for ${person.name} <${person.email}> (${person.id})\n`)
+    return sendJson(res, 200, installResponse(ctx, person, fresh, new Date(Date.now() + 7 * 86_400_000).toISOString()))
+  }
+  return sendJson(res, 404, { error: 'not_found' })
 }
 
 function parseFilters(url: URL, now = new Date()): rollup.Filters | { error: string } {
@@ -52,6 +123,11 @@ export async function handleApi(ctx: ApiContext, req: IncomingMessage, res: Serv
   // Behind a TLS-terminating proxy the cookie is still Secure when the proxy says the client used https.
   const secure = ctx.tls || req.headers['x-forwarded-proto'] === 'https'
 
+  if (path === '/api/team/auth-methods') {
+    if (req.method !== 'GET') return sendJson(res, 405, { error: 'method_not_allowed' })
+    return sendJson(res, 200, { key: true, gitlab: !!config.gitlab, registration: registrationEnabled(config.gitlab) })
+  }
+
   if (path === '/api/team/login') {
     if (req.method !== 'POST') return sendJson(res, 405, { error: 'method_not_allowed' })
     const ip = req.socket.remoteAddress ?? 'unknown'
@@ -76,18 +152,39 @@ export async function handleApi(ctx: ApiContext, req: IncomingMessage, res: Serv
     await store.logoutViewer(token!)
     return sendJson(res, 200, { ok: true }, { 'set-cookie': clearedSessionCookie(secure) })
   }
+  if (path === '/api/team/registration' || path.startsWith('/api/team/registration/')) {
+    return handleRegistration(ctx, req, res, path, viewer, token!)
+  }
   if (req.method !== 'GET') return sendJson(res, 405, { error: 'method_not_allowed' })
+
+  const base = {
+    org_name: config.org_name,
+    detail_levels: config.accept_session_detail ? ['summary', 'sessions'] : ['summary'],
+    accept_findings: config.accept_findings,
+    viewer: { name: viewer.name, role: viewer.role },
+    registration: registrationEnabled(config.gitlab),
+  }
+  if (viewer.role === 'registrant') {
+    if (path === '/api/team/meta') return sendJson(res, 200, { ...base, teams: [], people: [] })
+    return sendJson(res, 403, { error: 'registration_required' })
+  }
 
   const filters = parseFilters(url)
   if ('error' in filters) return sendJson(res, 400, { error: filters.error })
+  // Members see only their own data: one override scopes every rollup and insight query.
+  if (viewer.role === 'member') {
+    filters.person = viewer.personId
+    delete filters.team
+  }
 
   if (path === '/api/team/meta') {
+    if (viewer.role === 'member') {
+      const me = await store.getPerson(viewer.personId)
+      return sendJson(res, 200, { ...base, person_id: viewer.personId, teams: [], people: me ? [{ id: me.id, name: me.name, team: me.team }] : [] })
+    }
     const roster = await store.all('SELECT id, name, team FROM people WHERE revoked_at IS NULL ORDER BY name, id')
     return sendJson(res, 200, {
-      org_name: config.org_name,
-      detail_levels: config.accept_session_detail ? ['summary', 'sessions'] : ['summary'],
-      accept_findings: config.accept_findings,
-      viewer: { name: viewer.name },
+      ...base,
       teams: [...new Set(roster.map(p => String(p.team)).filter(Boolean))].sort(),
       people: roster.map(p => ({ id: p.id, name: p.name, team: p.team })),
     })
@@ -100,6 +197,7 @@ export async function handleApi(ctx: ApiContext, req: IncomingMessage, res: Serv
   }
   const personMatch = /^\/api\/team\/people\/([^/]+)$/.exec(path)
   if (personMatch) {
+    if (viewer.role === 'member' && decodeURIComponent(personMatch[1]!) !== viewer.personId) return sendJson(res, 404, { error: 'not_found' })
     const detail = await rollup.personDetail(store, decodeURIComponent(personMatch[1]!), filters)
     return detail ? sendJson(res, 200, detail) : sendJson(res, 404, { error: 'not_found' })
   }

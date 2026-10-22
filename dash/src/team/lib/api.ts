@@ -48,13 +48,39 @@ export const login = (key: string) =>
   request<{ viewer: { name: string } }>('POST', '/api/team/login', undefined, { key }, true)
 export const logout = () => request<unknown>('POST', '/api/team/logout', undefined, {}, true).catch(() => undefined)
 
+export type AuthMethods = { key: boolean; gitlab: boolean; registration: boolean }
+export const getAuthMethods = () =>
+  request<AuthMethods>('GET', '/api/team/auth-methods', undefined, undefined, true).catch(
+    (): AuthMethods => ({ key: true, gitlab: false, registration: false }),
+  )
+
+// ---- Self-registration -----------------------------------------------------
+export type Registration =
+  | { state: 'new'; name: string; email: string; teams: string[]; note: string }
+  | { state: 'member'; name: string; email: string; team: string; note: string }
+export type InstallInfo = {
+  token: string
+  expires_at: string
+  url: string
+  install: { unix: string; windows: string } | null
+  setup: string
+  person: { name: string; email: string; team: string }
+}
+export const getRegistration = () => request<Registration>('GET', '/api/team/registration')
+export const register = (team: string) => request<InstallInfo>('POST', '/api/team/registration', undefined, { team })
+export const newInstallToken = () => request<InstallInfo>('POST', '/api/team/registration/token', undefined, {})
+
 // ---- Types -----------------------------------------------------------------
+export type Role = 'admin' | 'member' | 'registrant'
 export type Breakdown = { name: string; cost: number; tokens: number; calls?: number }
 export type Meta = {
   org_name?: string
   detail_levels?: string[]
   accept_findings?: boolean
-  viewer?: { name: string }
+  viewer?: { name: string; role?: Role }
+  /** Set for members: the only person they can see. */
+  person_id?: string
+  registration?: boolean
   teams?: string[]
   people?: Array<{ id: string; name: string; team?: string | null }>
 }

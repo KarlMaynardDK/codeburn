@@ -3,7 +3,7 @@ import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { loadConfig } from '../../src/team-server/config.js'
+import { assertServeConfig, loadConfig, normalizeGitlabUrl } from '../../src/team-server/config.js'
 
 describe('team server config env overrides', () => {
   afterEach(() => {
@@ -33,5 +33,65 @@ describe('team server config env overrides', () => {
     expect(loadConfig(dir)).toEqual({
       accept_session_detail: true, accept_findings: false, retention_days: 400, org_name: '',
     })
+  })
+})
+
+describe('team server GitLab config', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  const withFile = async (cfg: unknown) => {
+    const dir = await mkdtemp(join(tmpdir(), 'cb-team-cfg-'))
+    await writeFile(join(dir, 'team-server.json'), JSON.stringify(cfg))
+    return dir
+  }
+
+  it('is off unless both client_id and client_secret are set', async () => {
+    expect(loadConfig(await withFile({ gitlab: { client_id: 'cid' } })).gitlab).toBeUndefined()
+    expect(loadConfig(await withFile({ gitlab: 'nonsense' })).gitlab).toBeUndefined()
+  })
+
+  it('parses the gitlab block with defaults', async () => {
+    const dir = await withFile({
+      public_url: 'https://cb.example.com',
+      gitlab: { client_id: 'cid', client_secret: 'sec', admin_groups: ['/acme/admins/', 7], register_groups: ['acme'], register_note: '  Ask in #codeburn  ' },
+    })
+    expect(loadConfig(dir).gitlab).toEqual({
+      url: 'https://gitlab.com', client_id: 'cid', client_secret: 'sec', admin_groups: ['acme/admins'], register_groups: ['acme'], register_note: 'Ask in #codeburn',
+    })
+  })
+
+  it('env vars win over the file', async () => {
+    const dir = await withFile({ gitlab: { url: 'https://file.example', client_id: 'file', client_secret: 'file', admin_groups: ['a'], register_groups: ['b'] } })
+    vi.stubEnv('CODEBURN_TEAM_GITLAB_URL', 'https://git.example.com/gitlab/')
+    vi.stubEnv('CODEBURN_TEAM_GITLAB_CLIENT_ID', 'env-id')
+    vi.stubEnv('CODEBURN_TEAM_GITLAB_CLIENT_SECRET', 'env-secret')
+    vi.stubEnv('CODEBURN_TEAM_GITLAB_ADMIN_GROUPS', 'ops, acme/admins')
+    vi.stubEnv('CODEBURN_TEAM_GITLAB_REGISTER_GROUPS', '*')
+    vi.stubEnv('CODEBURN_TEAM_GITLAB_REGISTER_NOTE', 'Env note')
+    expect(loadConfig(dir).gitlab).toEqual({
+      url: 'https://git.example.com/gitlab', client_id: 'env-id', client_secret: 'env-secret',
+      admin_groups: ['ops', 'acme/admins'], register_groups: ['*'], register_note: 'Env note',
+    })
+  })
+
+  it('can be enabled from env alone', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cb-team-cfg-'))
+    vi.stubEnv('CODEBURN_TEAM_GITLAB_CLIENT_ID', 'id')
+    vi.stubEnv('CODEBURN_TEAM_GITLAB_CLIENT_SECRET', 'secret')
+    expect(loadConfig(dir).gitlab).toMatchObject({ url: 'https://gitlab.com', admin_groups: [], register_groups: [] })
+  })
+
+  it('normalizes the GitLab URL and rejects bad ones', () => {
+    expect(normalizeGitlabUrl('https://gitlab.example.com/')).toBe('https://gitlab.example.com')
+    expect(() => normalizeGitlabUrl('ftp://gitlab.example.com')).toThrow()
+    expect(() => normalizeGitlabUrl('https://u:p@gitlab.example.com')).toThrow()
+  })
+
+  it('serving with GitLab sign-in needs public_url', async () => {
+    const cfg = loadConfig(await withFile({ gitlab: { client_id: 'cid', client_secret: 'sec' } }))
+    expect(() => assertServeConfig(cfg)).toThrow(/public_url/)
+    expect(() => assertServeConfig({ ...cfg, public_url: 'https://cb.example.com' })).not.toThrow()
   })
 })

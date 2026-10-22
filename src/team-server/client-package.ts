@@ -215,6 +215,11 @@ if ($Token -ne '') {
 `
 }
 
+/** Connects an already-installed client; the same line the installers print. */
+export function setupCommand(url: string, token: string): string {
+  return `codeburn sync setup ${url.replace(/\/$/, '')} --token ${token}`
+}
+
 export function installerLines(url: string, token: string): { unix: string; windows: string } {
   const u = url.replace(/\/$/, '')
   return {

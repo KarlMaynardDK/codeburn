@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { cn } from '@/lib/utils'
 import { Card } from '@/components/ui/card'
-import { ApiError, getMeta, login, logout, setUnauthorizedHandler, type Filters, type Meta } from './lib/api'
+import { ApiError, getAuthMethods, getMeta, login, logout, setUnauthorizedHandler, type Filters, type Meta } from './lib/api'
 import { computeRange, isValidDay, PERIOD_OPTIONS, type PeriodKey } from './lib/period'
 import { Button, Loading, selectCls } from './ui'
 import { Overview } from './pages/Overview'
@@ -12,6 +12,7 @@ import { Models } from './pages/Models'
 import { Projects } from './pages/Projects'
 import { Sessions } from './pages/Sessions'
 import { Insights } from './pages/Insights'
+import { Register } from './Register'
 
 type Page = 'overview' | 'people' | 'models' | 'projects' | 'sessions' | 'insights'
 const PAGES: Array<{ key: Page; label: string }> = [
@@ -43,10 +44,27 @@ function useRoute() {
   return { route, go }
 }
 
+const LOGIN_ERRORS: Record<string, string> = {
+  denied: "Your GitLab account isn't authorised for this team server.",
+  failed: 'GitLab sign-in failed. Try again.',
+}
+
+/** Reads ?login_error= once from the GitLab callback redirect and strips it from the address bar. */
+function takeLoginError(): string {
+  const params = new URLSearchParams(location.search)
+  const code = params.get('login_error')
+  if (!code) return ''
+  params.delete('login_error')
+  const rest = params.toString()
+  history.replaceState(null, '', location.pathname + (rest ? '?' + rest : '') + location.hash)
+  return LOGIN_ERRORS[code] ?? LOGIN_ERRORS.failed!
+}
+
 function Login({ onDone, expired }: { onDone: () => void; expired: boolean }) {
   const [key, setKey] = useState('')
-  const [err, setErr] = useState('')
+  const [err, setErr] = useState(takeLoginError)
   const [busy, setBusy] = useState(false)
+  const methods = useQuery({ queryKey: ['auth-methods'], queryFn: getAuthMethods, staleTime: Infinity })
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
     setBusy(true)
@@ -66,8 +84,24 @@ function Login({ onDone, expired }: { onDone: () => void; expired: boolean }) {
       <Card className="w-full max-w-sm px-6 py-6">
         <h1 className="text-lg font-semibold">CodeBurn Team</h1>
         <p className="mt-1 text-xs text-tertiary-foreground">
-          {expired ? 'Your session ended. ' : ''}Enter your viewer key to continue.
+          {expired ? 'Your session ended. ' : ''}
+          {methods.data?.gitlab ? 'Sign in with GitLab, or enter a viewer key.' : 'Enter your viewer key to continue.'}
         </p>
+        {methods.data?.gitlab ? (
+          <>
+            <a
+              href="/auth/gitlab/login"
+              className="mt-4 flex justify-center rounded-md border border-border bg-card px-2.5 py-2 text-sm text-foreground hover:bg-interactive-secondary"
+            >
+              Sign in with GitLab
+            </a>
+            <div className="mt-4 flex items-center gap-3 text-xs text-tertiary-foreground">
+              <div className="h-px flex-1 bg-border" />
+              or
+              <div className="h-px flex-1 bg-border" />
+            </div>
+          </>
+        ) : null}
         <form onSubmit={submit} className="mt-4 flex flex-col gap-3">
           <input
             type="password"
@@ -129,7 +163,17 @@ export function App() {
     return <div className="p-10 text-center text-sm text-red-500">Cannot reach the team server ({String((meta.error as Error).message)}).</div>
   }
   if (!meta.data) return <Loading />
-  return <Shell meta={meta.data} onLogout={async () => { await logout(); qc.clear(); setAuthed('out'); setExpired(false) }} />
+  const onLogout = async () => {
+    await logout()
+    qc.clear()
+    setAuthed('out')
+    setExpired(false)
+  }
+  const role = meta.data.viewer?.role ?? 'admin'
+  if (role === 'registrant' || (role === 'member' && meta.data.registration && location.pathname === '/register')) {
+    return <Register meta={meta.data} onLogout={onLogout} />
+  }
+  return <Shell meta={meta.data} onLogout={onLogout} />
 }
 
 function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
@@ -145,6 +189,7 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
   const hasSessions = meta.detail_levels?.includes('sessions') ?? false
   const pages = PAGES.filter((p) => p.key !== 'sessions' || hasSessions)
   const page = pages.some((p) => p.key === route.page) ? route.page : 'overview'
+  const member = meta.viewer?.role === 'member'
   const people = (meta.people ?? []).filter((p) => !team || p.team === team)
 
   return (
@@ -155,6 +200,11 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
           {meta.org_name ? <span className="text-sm text-tertiary-foreground">{meta.org_name}</span> : null}
         </div>
         <div className="flex items-center gap-3 text-xs text-tertiary-foreground">
+          {member && meta.registration ? (
+            <a href="/register" className="text-primary hover:underline">
+              Set up another machine
+            </a>
+          ) : null}
           {meta.viewer?.name ? <span>{meta.viewer.name}</span> : null}
           <Button onClick={onLogout}>Log out</Button>
         </div>
@@ -170,7 +220,7 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
               page === p.key ? 'bg-interactive-secondary font-medium' : 'font-light text-muted-foreground hover:text-foreground',
             )}
           >
-            {p.label}
+            {member && p.key === 'people' ? 'My usage' : p.label}
           </button>
         ))}
       </nav>
@@ -189,7 +239,7 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
         ) : (
           <span className="text-tertiary-foreground">{range.from} to {range.to}</span>
         )}
-        {(meta.teams?.length ?? 0) > 0 ? (
+        {!member && (meta.teams?.length ?? 0) > 0 ? (
           <select className={selectCls} value={team} onChange={(e) => { setTeam(e.target.value); setPerson('') }} aria-label="Team">
             <option value="">All teams</option>
             {meta.teams!.map((t) => (
@@ -197,7 +247,7 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
             ))}
           </select>
         ) : null}
-        {people.length > 0 && page !== 'people' ? (
+        {!member && people.length > 0 && page !== 'people' ? (
           <select className={selectCls} value={person} onChange={(e) => setPerson(e.target.value)} aria-label="Person">
             <option value="">Everyone</option>
             {people.map((p) => (
@@ -215,7 +265,9 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
       <main className="px-5 pb-10">
         {page === 'overview' && <Overview filters={filters} compare={compare} />}
         {page === 'people' &&
-          (route.id ? (
+          (member && meta.person_id ? (
+            <PersonDetail id={meta.person_id} filters={{ ...filters, person: undefined }} />
+          ) : route.id ? (
             <PersonDetail id={route.id} filters={{ ...filters, person: undefined }} onBack={() => go('people')} />
           ) : (
             <People filters={{ ...filters, person: undefined }} onOpen={(id) => go('people', id)} />

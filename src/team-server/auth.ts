@@ -25,6 +25,18 @@ export function sessionCookie(token: string, secure: boolean): string {
   return `${SESSION_COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MAX_AGE_S}${secure ? '; Secure' : ''}`
 }
 
+export const OAUTH_COOKIE = 'cb_team_oauth'
+export const OAUTH_COOKIE_PATH = '/auth/gitlab'
+
+/** Holds the OAuth state and PKCE verifier between login and callback. Lax: the callback is a cross-site navigation. */
+export function oauthCookie(value: string, secure: boolean): string {
+  return `${OAUTH_COOKIE}=${value}; HttpOnly; SameSite=Lax; Path=${OAUTH_COOKIE_PATH}; Max-Age=600${secure ? '; Secure' : ''}`
+}
+
+export function clearedOauthCookie(secure: boolean): string {
+  return `${OAUTH_COOKIE}=; HttpOnly; SameSite=Lax; Path=${OAUTH_COOKIE_PATH}; Max-Age=0${secure ? '; Secure' : ''}`
+}
+
 export function clearedSessionCookie(secure: boolean): string {
   return `${SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure ? '; Secure' : ''}`
 }

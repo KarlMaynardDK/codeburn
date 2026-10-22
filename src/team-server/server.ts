@@ -4,9 +4,10 @@ import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import { dirname, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { handleApi, readBody, sendJson } from './api.js'
-import { FailureLimiter, bearer } from './auth.js'
+import { FailureLimiter, OAUTH_COOKIE, bearer, clearedOauthCookie, oauthCookie, readCookie, sessionCookie } from './auth.js'
 import { installPs1Script, installShScript, originFromRequest, type ClientPackage } from './client-package.js'
-import type { TeamServerConfig } from './config.js'
+import { assertServeConfig, type TeamServerConfig } from './config.js'
+import { checkState, completeLogin, decideAccess, startLogin } from './gitlab.js'
 import { ingestOtlp } from './ingest.js'
 import type { Store } from './store.js'
 
@@ -107,10 +108,12 @@ async function readJson(req: IncomingMessage, res: ServerResponse): Promise<Reco
 
 export function createTeamServer(opts: TeamServerOptions): Server {
   const { store, config } = opts
+  assertServeConfig(config)
   const staticDir = opts.staticDir ?? defaultStaticDir()
   const tls = !!opts.tls
   const limiter = new FailureLimiter()
   const enrollLimiter = new FailureLimiter(20, 60_000)
+  const tokenLimiter = new FailureLimiter(10, 3600_000)
 
   const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const url = new URL(req.url ?? '/', 'http://localhost')
@@ -191,11 +194,55 @@ export function createTeamServer(opts: TeamServerOptions): Server {
     }
 
     if (path.startsWith('/api/team/') || path === '/api/team') {
-      return handleApi({ store, config, tls, limiter }, req, res, url)
+      return handleApi({ store, config, tls, limiter, tokenLimiter, installers: !!opts.clientPackage }, req, res, url)
+    }
+
+    if ((path === '/auth/gitlab/login' || path === '/auth/gitlab/callback') && config.gitlab && config.public_url) {
+      if (method !== 'GET') return sendJson(res, 405, { error: 'method_not_allowed' })
+      const gitlab = config.gitlab
+      const publicUrl = config.public_url
+      const secure = tls || req.headers['x-forwarded-proto'] === 'https' || publicUrl.startsWith('https:')
+      const redirect = (location: string, cookies: string[]) => {
+        res.writeHead(302, { location, 'cache-control': 'no-store', 'set-cookie': cookies })
+        res.end()
+      }
+      if (path === '/auth/gitlab/login') {
+        const start = startLogin(gitlab, publicUrl)
+        return redirect(start.location, [oauthCookie(start.cookie, secure)])
+      }
+      const ip = req.socket.remoteAddress ?? 'unknown'
+      const cleared = clearedOauthCookie(secure)
+      if (limiter.blocked(ip)) return redirect('/?login_error=failed', [cleared])
+      const verifier = checkState(readCookie(req, OAUTH_COOKIE), url.searchParams.get('state'))
+      const code = url.searchParams.get('code')
+      if (!verifier || !code) {
+        limiter.fail(ip)
+        return redirect('/?login_error=failed', [cleared])
+      }
+      let access
+      let subject: string
+      try {
+        const info = await completeLogin(gitlab, publicUrl, code, verifier)
+        subject = info.sub
+        access = await decideAccess(store, gitlab, info)
+        if (!access) process.stderr.write(`team-server: GitLab sign-in denied for ${info.email || info.sub}
+`)
+      } catch (err) {
+        process.stderr.write(`team-server: GitLab sign-in failed: ${(err as Error).message}
+`)
+        limiter.fail(ip)
+        return redirect('/?login_error=failed', [cleared])
+      }
+      if (!access) {
+        limiter.fail(ip)
+        return redirect('/?login_error=denied', [cleared])
+      }
+      const token = await store.loginSso({ ...access, subject })
+      return redirect(access.role === 'registrant' ? '/register' : '/', [cleared, sessionCookie(token, secure)])
     }
 
     if (method === 'GET' || method === 'HEAD') {
-      if (path.startsWith('/v1/') || path.startsWith('/api/') || path.startsWith('/install/') || path === '/install.sh' || path === '/install.ps1') return sendJson(res, 404, { error: 'not_found' })
+      if (path.startsWith('/v1/') || path.startsWith('/api/') || path.startsWith('/auth/') || path.startsWith('/install/') || path === '/install.sh' || path === '/install.ps1') return sendJson(res, 404, { error: 'not_found' })
       return serveStatic(staticDir, path, res, method === 'HEAD')
     }
     return sendJson(res, 404, { error: 'not_found' })

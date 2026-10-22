@@ -11,7 +11,24 @@ export interface TeamServerConfig {
   database_url?: string
   /** Externally reachable base URL (https://codeburn.example.com), used in generated install scripts. */
   public_url?: string
+  /** GitLab sign-in for the viewer; present only when client_id and client_secret are both set. */
+  gitlab?: GitlabConfig
 }
+
+export interface GitlabConfig {
+  /** GitLab instance base URL, default https://gitlab.com; may carry a subpath. */
+  url: string
+  client_id: string
+  client_secret: string
+  /** Group full paths (subgroups included) whose members sign in as admins. */
+  admin_groups: string[]
+  /** Group full paths whose members may self-register; empty disables registration, ['*'] allows any instance user. */
+  register_groups: string[]
+  /** Free text shown on the registration page after the install instructions. */
+  register_note?: string
+}
+
+export const DEFAULT_GITLAB_URL = 'https://gitlab.com'
 
 /** Normalizes a configured public URL to scheme://host[:port] with no path; throws when it is not http(s). */
 export function normalizePublicUrl(raw: string): string {
@@ -22,6 +39,46 @@ export function normalizePublicUrl(raw: string): string {
     throw new Error(`Public URL must be just scheme://host[:port]: ${raw}`)
   }
   return u.origin
+}
+
+/** Normalizes a GitLab base URL: http(s), no credentials, query or fragment, no trailing slash. A subpath is kept. */
+export function normalizeGitlabUrl(raw: string): string {
+  let u: URL
+  try { u = new URL(raw.trim()) } catch { throw new Error(`Invalid GitLab URL: ${raw}`) }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error(`GitLab URL must be http(s): ${raw}`)
+  if (u.username || u.password || u.search || u.hash) throw new Error(`GitLab URL must not carry credentials, a query or a fragment: ${raw}`)
+  return (u.origin + u.pathname).replace(/\/+$/, '')
+}
+
+function groupList(v: unknown): string[] | undefined {
+  const items = typeof v === 'string' ? v.split(',') : Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : undefined
+  return items?.map(g => g.trim().replace(/^\/+|\/+$/g, '')).filter(Boolean)
+}
+
+/** Merges the file's gitlab block with CODEBURN_TEAM_GITLAB_* env vars; undefined unless client_id and client_secret are set. */
+function gitlabConfig(raw: unknown): GitlabConfig | undefined {
+  const file = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {}
+  const env = process.env
+  const pick = (envName: string, key: string): string | undefined => {
+    const e = env[envName]
+    if (e !== undefined && e.trim() !== '') return e.trim()
+    return typeof file[key] === 'string' && (file[key] as string).trim() ? (file[key] as string).trim() : undefined
+  }
+  const clientId = pick('CODEBURN_TEAM_GITLAB_CLIENT_ID', 'client_id')
+  const clientSecret = pick('CODEBURN_TEAM_GITLAB_CLIENT_SECRET', 'client_secret')
+  if (!clientId || !clientSecret) return undefined
+  const envGroups = (name: string) => env[name] !== undefined && env[name]!.trim() !== '' ? groupList(env[name]) : undefined
+  const note = env.CODEBURN_TEAM_GITLAB_REGISTER_NOTE !== undefined && env.CODEBURN_TEAM_GITLAB_REGISTER_NOTE.trim() !== ''
+    ? env.CODEBURN_TEAM_GITLAB_REGISTER_NOTE
+    : typeof file.register_note === 'string' ? file.register_note : ''
+  return {
+    url: normalizeGitlabUrl(pick('CODEBURN_TEAM_GITLAB_URL', 'url') ?? DEFAULT_GITLAB_URL),
+    client_id: clientId,
+    client_secret: clientSecret,
+    admin_groups: envGroups('CODEBURN_TEAM_GITLAB_ADMIN_GROUPS') ?? groupList(file.admin_groups) ?? [],
+    register_groups: envGroups('CODEBURN_TEAM_GITLAB_REGISTER_GROUPS') ?? groupList(file.register_groups) ?? [],
+    ...(note.trim() ? { register_note: note.trim() } : {}),
+  }
 }
 
 export const DEFAULT_CONFIG: TeamServerConfig = {
@@ -46,10 +103,10 @@ function envBool(name: string): boolean | undefined {
 
 /**
  * Environment overrides (CODEBURN_TEAM_ACCEPT_SESSION_DETAIL, CODEBURN_TEAM_ACCEPT_FINDINGS,
- * CODEBURN_TEAM_RETENTION_DAYS, CODEBURN_TEAM_ORG_NAME, CODEBURN_TEAM_PUBLIC_URL) win over team-server.json, so container
- * deployments can be configured without editing a file inside the data volume.
+ * CODEBURN_TEAM_RETENTION_DAYS, CODEBURN_TEAM_ORG_NAME, CODEBURN_TEAM_PUBLIC_URL, CODEBURN_TEAM_GITLAB_*) win over
+ * team-server.json, so container deployments can be configured without editing a file inside the data volume.
  */
-function applyEnv(cfg: TeamServerConfig): TeamServerConfig {
+function applyEnv(cfg: TeamServerConfig, rawGitlab?: unknown): TeamServerConfig {
   const session = envBool('CODEBURN_TEAM_ACCEPT_SESSION_DETAIL')
   if (session !== undefined) cfg.accept_session_detail = session
   const findings = envBool('CODEBURN_TEAM_ACCEPT_FINDINGS')
@@ -60,6 +117,8 @@ function applyEnv(cfg: TeamServerConfig): TeamServerConfig {
   if (org !== undefined && org !== '') cfg.org_name = org
   const publicUrl = process.env.CODEBURN_TEAM_PUBLIC_URL
   if (publicUrl !== undefined && publicUrl.trim() !== '') cfg.public_url = normalizePublicUrl(publicUrl)
+  const gitlab = gitlabConfig(rawGitlab)
+  if (gitlab) cfg.gitlab = gitlab
   return cfg
 }
 
@@ -83,7 +142,14 @@ export function loadConfig(dataDir: string): TeamServerConfig {
   if (typeof raw.org_name === 'string') cfg.org_name = raw.org_name
   if (typeof raw.database_url === 'string' && raw.database_url) cfg.database_url = raw.database_url
   if (typeof raw.public_url === 'string' && raw.public_url.trim()) cfg.public_url = normalizePublicUrl(raw.public_url)
-  return applyEnv(cfg)
+  return applyEnv(cfg, raw.gitlab)
+}
+
+/** GitLab sign-in redirects back to public_url, never to a Host-derived URL, so it needs one. */
+export function assertServeConfig(cfg: TeamServerConfig): void {
+  if (cfg.gitlab && !cfg.public_url) {
+    throw new Error('GitLab sign-in needs public_url (team-server.json, CODEBURN_TEAM_PUBLIC_URL or --public-url) for its redirect URI')
+  }
 }
 
 export function resolveDatabaseUrl(flag: string | undefined, cfg: TeamServerConfig): string | undefined {

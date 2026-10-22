@@ -67,13 +67,15 @@ function Split({ title, items, useLabel }: { title: string; items: Breakdown[]; 
   )
 }
 
-export function PersonDetail({ id, filters, onBack }: { id: string; filters: Filters; onBack: () => void }) {
+export function PersonDetail({ id, filters, onBack }: { id: string; filters: Filters; onBack?: () => void }) {
   const q = useQuery({ queryKey: ['person', id, filters], queryFn: () => getPerson(id, filters) })
   return (
     <div className="flex flex-col gap-4">
-      <div>
-        <Button onClick={onBack}>Back to people</Button>
-      </div>
+      {onBack ? (
+        <div>
+          <Button onClick={onBack}>Back to people</Button>
+        </div>
+      ) : null}
       {q.isLoading ? <Loading /> : q.error ? <ErrorNote error={q.error} /> : <Detail d={q.data!} />}
     </div>
   )

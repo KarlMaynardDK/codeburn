@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { computeRange, dayCount, pctChange, previousRange } from './period'
 import { csvField, toCsv } from './csv'
+import { noteToParagraphs } from './note'
 
 describe('csv', () => {
   it('quotes commas, quotes and newlines', () => {
@@ -40,5 +41,19 @@ describe('period', () => {
   it('pctChange', () => {
     expect(pctChange(150, 100)).toBe(50)
     expect(pctChange(1, 0)).toBeNull()
+  })
+})
+
+describe('noteToParagraphs', () => {
+  it('splits on blank lines and links URLs without trailing punctuation', () => {
+    expect(noteToParagraphs('Questions? Ask in #codeburn.\r\n\r\nDocs: https://wiki.example.com/cb. Thanks')).toEqual([
+      [{ text: 'Questions? Ask in #codeburn.' }],
+      [{ text: 'Docs: ' }, { href: 'https://wiki.example.com/cb' }, { text: '. Thanks' }],
+    ])
+  })
+
+  it('keeps markup as plain text and ignores non-http schemes', () => {
+    expect(noteToParagraphs('<b>hi</b> javascript:alert(1)')).toEqual([[{ text: '<b>hi</b> javascript:alert(1)' }]])
+    expect(noteToParagraphs('  \n\n ')).toEqual([])
   })
 })
