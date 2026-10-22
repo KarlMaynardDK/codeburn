@@ -101,6 +101,9 @@ describe('client package distribution', () => {
     expect(ps1).toContain("$ErrorActionPreference = 'Stop'")
     expect(ps1).toContain('npm uninstall -g codeburn')
     expect(ps1.indexOf('npm uninstall -g codeburn')).toBeLessThan(ps1.indexOf('npm install -g'))
+    // Windows PowerShell 5.1 strips embedded double quotes from native args, so no node -e.
+    expect(ps1).not.toContain('node -e')
+    expect(ps1).toContain("-lt [version]'22.13'")
     const fwd = await rawGet(t, '/install.sh', { host: 'codeburn.example.com', 'x-forwarded-proto': 'https' })
     expect(fwd.body).toContain("BASE_URL='https://codeburn.example.com'")
   })

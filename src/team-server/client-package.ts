@@ -167,8 +167,9 @@ function Fail([string]$Message) { throw "codeburn install: $Message" }
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Fail 'Node.js ${MIN_NODE}+ is required but node was not found. Install it from https://nodejs.org/ and re-run.' }
 if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { Fail 'npm is required but was not found. Install Node.js from https://nodejs.org/ and re-run.' }
-& node -e 'var v=process.versions.node.split(".").map(Number);process.exit(v[0]>22||(v[0]===22&&v[1]>=13)?0:1)'
-if ($LASTEXITCODE -ne 0) { Fail "Node.js ${MIN_NODE}+ is required (found $(& node -v)). Update it from https://nodejs.org/ and re-run." }
+# Compared in PowerShell rather than in an inline node script: Windows PowerShell 5.1 strips embedded double quotes from native arguments.
+$NodeVersion = (& node -v).Trim()
+if ($LASTEXITCODE -ne 0 -or [version]$NodeVersion.TrimStart('v') -lt [version]'${MIN_NODE}') { Fail "Node.js ${MIN_NODE}+ is required (found $NodeVersion). Update it from https://nodejs.org/ and re-run." }
 
 $ErrorActionPreference = 'Continue'
 & npm ls -g codeburn --depth=0 *> $null
