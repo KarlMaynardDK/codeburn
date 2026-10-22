@@ -67,6 +67,26 @@ describe.each(BACKENDS)('team server (%s)', backend => {
       expect((await post(t.base, '/v1/enroll', { token: c.enrollmentToken })).status).toBe(401)
       expect(await t.store.revoke('nope')).toBeNull()
     })
+
+    it('a device can revoke its own credential and nothing else', async () => {
+      t = await startServer(backend)
+      const doc = await (await fetch(`${t.base}/.well-known/codeburn-export.json`)).json() as any
+      expect(doc.revoke_path).toBe('/v1/revoke')
+      const a = await enrollPerson(t, 'Ann')
+      const b = await enrollPerson(t, 'Bob')
+      expect((await post(t.base, '/v1/revoke', {})).status).toBe(401)
+      expect((await post(t.base, '/v1/revoke', {}, { authorization: 'Bearer cbd_bogus' })).status).toBe(401)
+      const r = await post(t.base, '/v1/revoke', {}, { authorization: `Bearer ${a.cred}` })
+      expect(r.status).toBe(200)
+      expect(r.json).toEqual({ ok: true })
+      expect((await send(t, a.cred, [span({ id: 'a1' })])).status).toBe(401)
+      expect((await post(t.base, '/v1/revoke', {}, { authorization: `Bearer ${a.cred}` })).status).toBe(401)
+      expect((await send(t, b.cred, [span({ id: 'b1' })])).status).toBe(200)
+      const people = await t.store.listPeople()
+      expect(people.find(p => p.name === 'Ann')!.revoked_at).toBeNull()
+      expect(people.find(p => p.name === 'Ann')!.devices[0]!.revoked_at).not.toBeNull()
+      expect(people.find(p => p.name === 'Bob')!.devices[0]!.revoked_at).toBeNull()
+    })
   })
 
   describe('traces ingest', () => {

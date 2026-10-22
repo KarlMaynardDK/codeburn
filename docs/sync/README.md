@@ -35,6 +35,18 @@ What happens:
 
 You only need to do this once. The token refreshes silently on every push.
 
+**Team servers** (`codeburn team serve`) don't use an identity provider. Your admin gives you a one-time enrollment
+token instead:
+
+```bash
+codeburn sync setup https://codeburn.example.com --token cbe_...
+```
+
+Setup exchanges the token for a device credential and saves it like a refresh token. Do this once per device.
+On a device that's already enrolled, don't run setup again: it needs a new token, and it drops your automatic sync
+acceptance. `--detail sessions` asks for per-session detail if the server allows it (the default is `summary`).
+See [the team server guide](../team/server.md#client-devices-and-automatic-sync).
+
 ### `codeburn sync push`
 
 Sends unsent AI usage data to the configured endpoint.
@@ -68,7 +80,9 @@ Last sync: 2h ago
 
 ### `codeburn sync logout`
 
-Removes stored credentials and revokes the token at the identity provider.
+Removes stored credentials and revokes the token at the identity provider. On a team server it revokes this
+device on the server instead, so it no longer shows as active; if the server can't be reached (or predates this),
+it still logs out locally and tells you to ask your admin to revoke the device.
 
 ```bash
 codeburn sync logout
@@ -105,6 +119,12 @@ Each AI interaction becomes one OTLP span with these attributes:
 | `ai.work_unit_id` | `9f2c…` | Pseudonymous work-unit id (the root session's trace id), grouping a session with its delegated children |
 | `ai.session_role` | `root`, `child` | The session's relationship to its work unit |
 | `ai.lineage_evidence` | `provider-recorded` | The evidence class behind the grouping |
+
+**Detail levels.** A team server, or an endpoint you've chosen a level for with
+`codeburn sync config detail <summary|sessions>`, also gets `ai.category` (the kind of task: coding, debugging,
+testing, ...) on every span and a `codeburn.detail_level` resource attribute on every batch. At `summary`, the session
+fields, `ai.tools` and exact times are left out; see [Detail levels](DEVELOPER.md#detail-levels).
+OIDC endpoints set up before detail levels existed keep receiving the table above unchanged, with neither attribute.
 
 A pseudonymous `device_id` distinguishes your machines without revealing hostnames. Each export batch also carries a `codeburn.coverage_through` resource attribute: the ISO date your local history is complete through, stamped only when a complete local parse finalized that watermark.
 
@@ -158,6 +178,26 @@ line, including Windows paths, may still supply a local grouping label. Prompt
 text never becomes trusted `projectPath`/`workingDirectory` provenance and can
 never produce outbound `ai.project`.
 
+## Automatic sync
+
+```bash
+codeburn sync auto enable            # prints exactly what would be sent, changes nothing
+codeburn sync auto enable --accept   # accept it and install a daily schedule (--cadence hourly also works)
+codeburn sync auto status            # schedule, recent runs, and whether your acceptance still matches
+codeburn sync auto disable
+```
+
+Your acceptance is a fingerprint of what will be sent and where. A scheduled run pushes only while that still
+matches. A change that would send **more** pauses automatic sync until you run `codeburn sync auto enable --accept`
+again. That includes a new destination, a higher detail level, findings sharing turned on, work matching, or new
+fields. Sending less (a lower detail level, findings off) needs no new acceptance. While paused,
+`codeburn sync push` and `codeburn sync status` say so, and `sync auto status` lists what changed. Manual
+`codeburn sync push` is never blocked.
+
+- Running `codeburn sync setup` replaces your configuration and drops the acceptance; setup reminds you when it does.
+- Upgrading codeburn doesn't, as long as what you send is unchanged. OIDC setups from before team servers keep their
+  acceptance.
+
 ## Authentication
 
 Sync uses standard OIDC (the same protocol as "Sign in with Google"). Your team's admin sets up the identity provider — you just click through the browser login once.
@@ -165,11 +205,15 @@ Sync uses standard OIDC (the same protocol as "Sign in with Google"). Your team'
 - **Token storage**: macOS Keychain, Windows Credential Manager, or Linux libsecret. Falls back to a `0600` file if no keychain is available.
 - **Token lifetime**: typically 30–90 days (set by your admin). You'll be prompted to re-login when it expires.
 - **Re-login**: run `codeburn sync setup <url>` again.
+- **Team servers** use a device credential from a one-time enrollment token instead of OIDC. It doesn't expire;
+  your admin can revoke it, and then pushes fail with a message to re-enroll with a new token.
+  `codeburn sync logout` revokes it from the device itself. When the server offers a newer team build,
+  `sync push` and `sync status` say so; install it with `codeburn update` (no new token needed).
 
 ## FAQ
 
 **Q: Does sync run automatically?**
-A: No. You run `codeburn sync push` when you want. A future version may offer opportunistic push (after each `codeburn report`), but it's always explicit.
+A: Only if you turn it on with `codeburn sync auto enable --accept`; see [Automatic sync](#automatic-sync). Otherwise you run `codeburn sync push` when you want.
 
 **Q: What if I push the same data twice?**
 A: Safe. A local sent-ledger tracks what's been sent. Re-pushing the same window doesn't create duplicates.

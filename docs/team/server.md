@@ -64,7 +64,7 @@ Created in the data dir with these defaults on first start (restart after editin
 
 The server can also distribute the exact CLI build it ships with; see [Installing the client from your server](install.md).
 `CODEBURN_TEAM_CLIENT_PACKAGE` (or `--client-package <path>`) points at the `npm pack` tarball; the Docker image sets it. The image stamps the package version as `<base>-team.<stamp>` (`TEAM_BUILD` build arg, default the
-UTC build time); see the install page.
+UTC build time); see the install page. Rolling out a new build is covered in [Client updates](#client-updates).
 
 Each setting except `database_url` can also be set by an environment variable, which wins over the file:
 `CODEBURN_TEAM_ACCEPT_SESSION_DETAIL`, `CODEBURN_TEAM_ACCEPT_FINDINGS` (`true`/`false`, `1`/`0`, `on`/`off`),
@@ -73,6 +73,117 @@ The optional `gitlab` block has its own variables; see [GitLab sign-in](#gitlab-
 
 Identity always comes from the device credential, never from the payload. Credentials, enrollment tokens and viewer
 keys are stored only as SHA-256 hashes. Spans older than 183 days (or more than a day in the future) are rejected.
+
+## Client devices and automatic sync
+
+### What each device needs
+
+A device pushes with a device credential (`cbd_...`). The server issues it once, when the device enrolls with a
+one-time enrollment token (`cbe_...`). The credential is saved on the device: in the OS keychain, or in a `0600` file
+when there is no keychain.
+
+| The device is... | What the person runs |
+| --- | --- |
+| New to codeburn sync | `codeburn sync setup <url> --token cbe_...`, then `codeburn sync auto enable --accept` for automatic sync |
+| Already enrolled with this server | Nothing. No token and no setup. If automatic sync isn't on yet, only `codeburn sync auto enable --accept` |
+| Set up against an OIDC endpoint (the sync that predates team servers) | Same as a new device: a token, then `auto enable --accept` |
+| A second (or further) machine for the same person | Same as a new device, with a new token. Each machine gets its own credential |
+| Enrolled, but its credential was revoked or lost (an admin revoked it, `codeburn sync logout`, a wiped home directory) | Same as a new device, with a new token |
+
+- **A new client build doesn't need a token.** `codeburn update` replaces the CLI and keeps the saved credential,
+  configuration and acceptance; see [Client updates](#client-updates).
+- **Don't re-run setup on an enrolled device.** It enrolls the device again, which needs a fresh token, and drops the
+  device's automatic sync acceptance. The server then lists a second device for that person. Usage isn't counted
+  twice, since the server stores each span once by its id. But the old device record stays active until an admin
+  runs `codeburn team admin revoke <device-id>`.
+- **Getting a token.** An admin runs `codeburn team admin add-person` (new person) or
+  `codeburn team admin rotate-enrollment <person-id>`. With [GitLab sign-in](#gitlab-sign-in) and self-registration
+  on, members can create their own from the viewer's **Set up another machine** link; see
+  [Self-registration](#self-registration). A token works once, on one machine, for 7 days. Issuing a new one cancels
+  any earlier token the person hasn't used yet, so set up machines one at a time.
+- **An OIDC refresh token doesn't carry over.** The server only accepts device credentials it issued itself.
+  [GitLab sign-in](#gitlab-sign-in) is for the report viewer only; the sync client doesn't use it.
+- `codeburn sync status` shows which kind of setup a device has: `Auth: enrollment (team server: ...)` or an `Issuer:`
+  line for OIDC.
+
+### Automatic sync acceptance
+
+`codeburn sync auto enable` prints exactly what will be sent and stores a fingerprint of it. It only stores that once
+the person runs it with `--accept`. A scheduled `codeburn sync auto run` pushes only while what it would send still
+matches that fingerprint. Otherwise it records `acceptance-required`, sends nothing, and waits for
+`codeburn sync auto enable --accept` again.
+
+- **Moving to this server always needs a new acceptance.** The destination is part of the fingerprint, and
+  `sync setup` replaces the old configuration. Setup prints a reminder when it drops an acceptance.
+- **Everything a team server device sends is covered**, including `ai.category` (task category) on every span and
+  `codeburn.detail_level` on every batch.
+- **While a device is waiting for acceptance**, `codeburn sync push` and `codeburn sync status` print
+  "Automatic sync is paused" with the command to run. `codeburn sync auto status` lists what changed. Manual
+  `codeburn sync push` keeps working throughout.
+
+### Changing server settings
+
+Devices read the discovery document before every automatic run, so a change takes effect at the next run:
+
+| Change | Effect on devices with automatic sync on |
+| --- | --- |
+| `accept_session_detail` off → on | Devices that asked for `sessions` (`--detail sessions` or `codeburn sync config detail sessions`) would send more, so they pause until the person accepts again. Other devices are unaffected. |
+| `accept_session_detail` on → off | Devices drop to `summary` and keep pushing; sending less needs no new acceptance. |
+| `accept_findings` off → on | Devices with findings sharing turned on pause until the person accepts again. Other devices are unaffected. |
+| `accept_findings` on → off | Devices stop uploading findings and keep pushing. |
+| `org_name`, `retention_days`, `public_url`, `gitlab` | No effect on acceptance. |
+
+## Client updates
+
+With a client package configured (the Docker image always has one), the server is the source of the CLI build for
+every enrolled device. Members never take the public `codeburn` release. Installing that build in the first place is
+covered in [Installing the client from your server](install.md).
+
+**Rolling out a new build (admin)**
+
+1. Rebuild the image with a new `TEAM_BUILD`, so the build gets a new version:
+   `TEAM_BUILD=$(date -u +%Y%m%d%H%M) docker compose -f docker-compose.team.yml up -d --build`.
+   Outside Docker, point `CODEBURN_TEAM_CLIENT_PACKAGE` at the new `npm pack` tarball and restart.
+2. Check the startup log line `client package: codeburn <version> (sha256 ...)`, or the `client_package` field of
+   `/.well-known/codeburn-export.json`.
+3. Optionally tell members. Each device learns the new version at its next push (manual or automatic), and from
+   then on `codeburn sync push` and `codeburn sync status` print
+   `Your team server has CodeBurn <version> (this is <installed>). Install it with: codeburn update`.
+   Devices never update themselves; the member runs the command.
+
+**Updating a device (member)**
+
+```sh
+codeburn update --check   # reports the server's build version; changes nothing
+codeburn update           # installs it
+```
+
+What `codeburn update` does on a device enrolled with a team server:
+
+- It reads `client_package` (version and sha256) from the server's discovery document.
+- If the installed version differs, it installs the server's build. **Any difference counts**, so rolling the server
+  back to an older build also rolls devices back. An equal version is reported as up to date.
+- It downloads `/install/codeburn-team-<version>.tgz`, checks the sha256 the server advertised, and only then runs
+  `npm install -g` on the verified file. On a mismatch it reports `verify_fail` and installs nothing.
+- The device credential, `sync.json`, the automatic sync schedule and its acceptance all stay as they are. No token,
+  setup or re-enrollment is needed.
+
+When it can't update:
+
+| Situation | Result |
+| --- | --- |
+| The server can't be reached, or isn't https (plain http only works on loopback) | An error. It never falls back to the public release |
+| The server advertises no client package | Skipped. A `codeburn-team` build never installs the public `codeburn@latest` |
+| A `codeburn-team` build on a device that isn't enrolled | Skipped. Enroll it first (`codeburn sync setup <url> --token ...`) |
+| The CLI was installed with Homebrew, pnpm, bun or volta | Reported as managed. Reinstall with the server's `install.sh` / `install.ps1` (no token needed for that) to switch it to npm |
+
+**Updates and automatic sync**
+
+A new build usually sends exactly the same fields, and automatic sync carries on. When a build changes what is
+sent (new span attributes, or a new wire contract version), the acceptance fingerprint no longer matches. Automatic
+sync on that device then pauses until the person runs `codeburn sync auto enable --accept` again; see
+[Automatic sync acceptance](#automatic-sync-acceptance). Mention it in the rollout note when a release changes what
+sync sends.
 
 ## GitLab sign-in
 
@@ -193,9 +304,29 @@ Submitting creates the person exactly as `codeburn team admin add-person --name 
 --team <team>` would, and shows a one-time enrollment token (valid 7 days, one machine) with the same install
 commands the CLI prints, then the `register_note`. The session becomes a member session.
 
-Members (self-registered or added by an admin) get a **Set up another machine** link, which issues a fresh install
-token and invalidates any unused one. Each session can create at most 10 tokens an hour. Registrations are logged to
-stderr. A revoked person can't register again with the same email.
+Members (self-registered or added by an admin) get a **Set up another machine** link in the viewer's header. It
+opens `/register`, which skips the team form and offers **Create a new install token**. The page then shows the
+token with the same install commands. Use it for:
+
+- **A second machine.** Each machine enrolls with its own token and gets its own device credential.
+- **A machine whose credential was revoked or lost.**
+- **A registrant who reloaded the page** before copying their first token.
+
+It isn't needed to update a machine that already syncs: `codeburn update` installs the server's current build and
+keeps the device's credential (see [Client updates](#client-updates)).
+
+Details:
+
+- The link appears only while self-registration is on (`register_groups` is not empty). With GitLab sign-in but no
+  self-registration, members ask an admin for `codeburn team admin rotate-enrollment <person-id>`.
+- A new token cancels any earlier token the person hasn't used yet. Set up one machine before creating the next
+  token.
+- Each session can create at most 10 tokens an hour, and each one is logged to stderr.
+- Members can't see other devices in the viewer. A member retires a machine by running `codeburn sync logout` on
+  it, which revokes that device on the server. For a machine they no longer have, an admin uses
+  `codeburn team admin list` and `codeburn team admin revoke <device-id>`.
+
+Registrations are logged to stderr. A revoked person can't register again with the same email.
 
 GitLab sign-in sessions last 12 hours, the same as viewer-key sessions; after that, users sign in again.
 
@@ -319,12 +450,14 @@ docker exec codeburn-team node dist/cli.js team admin add-viewer --name "Manager
 
 ## Endpoints
 
-- `GET /.well-known/codeburn-export.json`: discovery (`auth: "enrollment"`, `enroll_path`, `traces_path`,
+- `GET /.well-known/codeburn-export.json`: discovery (`auth: "enrollment"`, `enroll_path`, `revoke_path`, `traces_path`,
   `detail_levels`, `findings_path` when enabled, `client_package` when a client package is configured).
 - `GET /install.sh`, `GET /install.ps1`, `GET /install/codeburn-team.tgz` (alias `/install/codeburn.tgz`), `GET /install/codeburn-team-<version>.tgz`: client
   distribution, only when a client package is configured (404 otherwise). No authentication.
 - `POST /v1/enroll`: `{token, label?, device_id?}` returns `{credential, device_id, person}`; 401 for unknown, used,
   expired or revoked tokens.
+- `POST /v1/revoke`: `Authorization: Bearer cbd_...`. Revokes the calling device only (used by `codeburn sync logout`);
+  200 `{ok: true}`, 401 when the credential is unknown or already revoked.
 - `POST /v1/traces`: OTLP/HTTP JSON, `Authorization: Bearer cbd_...`. Max 1000 spans and 10 MB per request.
   Re-sending a span id overwrites it, so pushes are idempotent. A span id owned by another person is never
   reassigned.

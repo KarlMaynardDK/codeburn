@@ -8,7 +8,7 @@ import type { Command } from 'commander'
 import { randomBytes } from 'crypto'
 
 import { fetchDiscoveryDoc, DiscoveryError, effectiveDetailLevel, type CodeburnDiscoveryDoc, type DetailLevel } from './discovery.js'
-import { enrollDevice, EnrollError } from './enroll.js'
+import { enrollDevice, EnrollError, revokeDevice } from './enroll.js'
 import { maybeSendFindings } from './findings.js'
 import {
   AuthError,
@@ -25,8 +25,8 @@ import {
 import { createCredentialStore } from './credentials.js'
 import { readSyncConfig, type SyncConfig, writeSyncConfig, deleteSyncConfig, updateLastSync, receiptsPath, readReceipts, appendReceipt } from './config.js'
 import { collectUnsentCalls, collectUnsentAttribution, sendBatches, sendAttributionBatches, batchCalls, MAX_PER_PUSH, MAX_ATTRIBUTION_PER_PUSH, type PushResult } from './push.js'
-import { batchAttributionItems, wireProjectName, CORE_SYNC_ATTRIBUTE_KEYS } from './otlp.js'
-import { loadPlugins, declaredSyncAttributes, type PluginLoad } from '../plugins/loader.js'
+import { batchAttributionItems, wireProjectName, coreSyncAttributeKeys } from './otlp.js'
+import { loadPlugins, declaredSyncAttributes, currentCliVersion, type PluginLoad } from '../plugins/loader.js'
 import { collectPluginEnrichment } from '../plugins/exporter.js'
 import {
   computeAcceptanceFingerprint,
@@ -50,6 +50,25 @@ function effectiveLevelFor(config: Config, serverLevels: readonly DetailLevel[] 
   const legacyDefault: DetailLevel = config.authMode === 'enrollment' ? 'summary' : 'sessions'
   const allowed = serverLevels ?? (config.authMode === 'enrollment' ? ['summary'] : ['summary', 'sessions'])
   return effectiveDetailLevel(config.detailLevel ?? legacyDefault, allowed)
+}
+
+/**
+ * Detail level to stamp on the wire, or undefined for the legacy wire. An OIDC
+ * config with no explicit level that resolves to sessions sends exactly what it
+ * sent before detail levels existed (no codeburn.detail_level, no ai.category),
+ * so its receiver and its stored auto-sync acceptance are unaffected.
+ */
+function wireDetailLevelFor(config: Config, serverLevels: readonly DetailLevel[] | undefined = config.detailLevels): DetailLevel | undefined {
+  const level = effectiveLevelFor(config, serverLevels)
+  const legacy = config.authMode !== 'enrollment' && config.detailLevel === undefined && level === 'sessions'
+  return legacy ? undefined : level
+}
+
+/** Every key an automatic push would send for this config, core and plugin, sorted. */
+function outboundKeysFor(config: Config, pluginKeys: ReadonlyMap<string, unknown>): string[] {
+  return coreSyncAttributeKeys(wireDetailLevelFor(config) !== undefined)
+    .concat(Array.from(pluginKeys.keys()))
+    .sort()
 }
 
 function manualScheduleHint(): string {
@@ -110,6 +129,7 @@ async function executePush(input: ExecutePushInput): Promise<{ result: PushResul
   refreshServerCapabilities(config, discoveryDoc)
   const endpoint = `${config.baseUrl}${config.tracesPath}`
   const detailLevel = effectiveLevelFor(config, discoveryDoc.detail_levels)
+  const wireDetailLevel = wireDetailLevelFor(config, discoveryDoc.detail_levels)
 
   let result: PushResult = { outcome: 'complete', totalSent: 0, totalRejected: 0, totalCostSent: 0 }
   if (unsent.length > 0) {
@@ -119,7 +139,7 @@ async function executePush(input: ExecutePushInput): Promise<{ result: PushResul
       endpoint,
       accessToken: tokens.access_token,
       batches,
-      detailLevel,
+      ...(wireDetailLevel ? { detailLevel: wireDetailLevel } : {}),
       ...(coverageThrough ? { coverageThrough } : {}),
       pluginAttributes: { keys: pluginAttributeKeys, values: [] },
       log,
@@ -157,6 +177,7 @@ function buildAcceptanceFingerprintInput(
   workMatching: boolean,
   cadence: 'daily' | 'hourly',
 ): FingerprintInput {
+  const detailLevel = wireDetailLevelFor(config)
   return {
     org: config.clientId,
     destination: config.baseUrl,
@@ -164,9 +185,38 @@ function buildAcceptanceFingerprintInput(
     workMatching,
     scopeSinceDays: 7,
     cadence,
-    detailLevel: effectiveLevelFor(config),
+    ...(detailLevel ? { detailLevel } : {}),
     shareFindings: config.shareFindings === true && !!config.findingsPath,
   }
+}
+
+/**
+ * What changed since the user accepted automatic sync, when that change means
+ * `sync auto run` is skipping pushes until they accept again. Null when auto
+ * sync is off or still matches.
+ */
+function pendingAutoAcceptance(config: Config, pluginKeys: ReadonlyMap<string, unknown>): string[] | null {
+  const accepted = config.auto?.accepted
+  if (!accepted || config.auto?.killed) return null
+  const current = buildAcceptanceFingerprintInput(config, outboundKeysFor(config, pluginKeys), accepted.attribution, accepted.cadence)
+  if (computeAcceptanceFingerprint(current) === accepted.fingerprint) return null
+  if (isReductionOnly(accepted.input, current)) return null
+  return detectFingerprintChanges(accepted.input, current)
+}
+
+function autoAcceptanceNotice(changed: string[]): string {
+  return `Automatic sync is paused: what it would send changed (${changed.join(', ')}). Review and accept with: codeburn sync auto enable --accept\n`
+}
+
+/**
+ * Points at `codeburn update` when the team server's advertised CLI build
+ * differs from this one (as of the last discovery). Any difference counts,
+ * matching update's rollback rule. Null otherwise.
+ */
+export function teamBuildNotice(config: Pick<Config, 'authMode' | 'clientPackage'>, installed = currentCliVersion()): string | null {
+  const pkg = config.authMode === 'enrollment' ? config.clientPackage : undefined
+  if (!pkg || pkg.version === installed) return null
+  return `Your team server has CodeBurn ${pkg.version} (this is ${installed}). Install it with: codeburn update\n`
 }
 
 export function registerSyncCommands(program: Command): void {
@@ -192,6 +242,10 @@ export function registerSyncCommands(program: Command): void {
           ...(opts.detail ? { detailLevel: opts.detail as DetailLevel } : {}),
           shareFindings: opts.shareFindings === true,
         }
+        // Setup writes a fresh config, which drops any auto-sync acceptance.
+        const previous = readSyncConfig()
+        const hadAutoSync = !!previous?.auto?.accepted && !previous.auto.killed
+        const autoSyncReminder = 'Automatic sync was on and needs your acceptance again for this endpoint. Until then scheduled runs push nothing: codeburn sync auto enable --accept\n'
         process.stderr.write(`Fetching discovery doc from ${baseUrl}...\n`)
 
         // 1. Fetch codeburn discovery doc
@@ -229,6 +283,7 @@ export function registerSyncCommands(program: Command): void {
               : `  Findings sharing: requested, but this server does not accept findings\n`)
           }
           process.stderr.write(`\nRun \`codeburn sync push\` to send telemetry data.\n`)
+          if (hadAutoSync) process.stderr.write(autoSyncReminder)
           return
         }
         if (opts.token) {
@@ -336,6 +391,7 @@ export function registerSyncCommands(program: Command): void {
         process.stderr.write(`  Endpoint: ${baseUrl}\n`)
         process.stderr.write(`  Token stored in: ${store.method()}\n`)
         process.stderr.write(`\nRun \`codeburn sync push\` to send telemetry data.\n`)
+        if (hadAutoSync) process.stderr.write(autoSyncReminder)
       } catch (err) {
         // Known errors (login timeout, port exhaustion, discovery failures)
         // get a clean one-line message instead of a raw Node crash dump.
@@ -376,6 +432,12 @@ export function registerSyncCommands(program: Command): void {
       process.stdout.write(`Share findings: ${config.shareFindings ? 'on' : 'off'}${config.shareFindings && !config.findingsPath ? ' (server does not accept findings)' : ''}${config.lastFindingsSent ? `, last sent ${config.lastFindingsSent}` : ''}\n`)
       process.stdout.write(`Token storage: ${store.method()}\n`)
       process.stdout.write(`Last sync: ${config.lastSync ?? 'never'}\n`)
+      const buildNotice = teamBuildNotice(config)
+      if (buildNotice) process.stderr.write(buildNotice)
+      try {
+        const pendingAcceptance = pendingAutoAcceptance(config, declaredSyncAttributes(await loadPlugins()))
+        if (pendingAcceptance) process.stderr.write(autoAcceptanceNotice(pendingAcceptance))
+      } catch { /* plugin load failures are reported by push */ }
     })
 
   // --- config ---
@@ -442,6 +504,21 @@ export function registerSyncCommands(program: Command): void {
       const config = readSyncConfig()
       const store = createCredentialStore()
       const token = store.retrieve()
+
+      // A team server device revokes its own credential, so it stops being listed as active.
+      if (token && config?.authMode === 'enrollment') {
+        const askAdmin = 'Ask your admin to revoke it (`codeburn team admin list` shows it by hostname).'
+        try {
+          const outcome = await revokeDevice(config.baseUrl, token)
+          process.stderr.write(outcome === 'revoked'
+            ? 'Device revoked on the team server.\n'
+            : outcome === 'unknown'
+              ? 'The team server no longer accepts this device; it was already revoked.\n'
+              : `This team server can't revoke devices from the client. ${askAdmin}\n`)
+        } catch (err) {
+          process.stderr.write(`Could not revoke this device on the team server (${(err as Error).message}). ${askAdmin}\n`)
+        }
+      }
 
       // Revoke if we have a token and know the revocation endpoint
       if (token && config && config.authMode !== 'enrollment') {
@@ -517,6 +594,7 @@ export function registerSyncCommands(program: Command): void {
           refreshServerCapabilities(config, discoveryDoc)
         } catch { /* handled at send time */ }
         const detailLevel = effectiveLevelFor(config, discoveryDoc?.detail_levels ?? config.detailLevels)
+        const wireDetailLevel = wireDetailLevelFor(config, discoveryDoc?.detail_levels ?? config.detailLevels)
 
         if (opts.dryRun) {
           process.stderr.write(`[dry-run] Auth: valid (Bearer token obtained)\n`)
@@ -669,6 +747,8 @@ export function registerSyncCommands(program: Command): void {
             : `Nothing to push (${allCalls.length} calls already synced).\n`)
           updateLastSync()
           await maybeSendFindings({ config, findingsPath: discoveryDoc?.findings_path, bearer: tokens.access_token, log: msg => process.stderr.write(`${msg}\n`) })
+          const buildNotice = teamBuildNotice(config)
+          if (buildNotice) process.stderr.write(buildNotice)
           return
         }
 
@@ -693,7 +773,7 @@ export function registerSyncCommands(program: Command): void {
             endpoint,
             accessToken: tokens.access_token,
             batches,
-            detailLevel,
+            ...(wireDetailLevel ? { detailLevel: wireDetailLevel } : {}),
             ...(coverageThrough ? { coverageThrough } : {}),
             // Empty values array is the no-plugin-runtime case: the wire guard
             // in otlp.ts drops everything when `values` is empty, so the wire
@@ -770,6 +850,10 @@ export function registerSyncCommands(program: Command): void {
         if (unsent.length > MAX_PER_PUSH) {
           process.stderr.write(`  ${unsent.length - MAX_PER_PUSH} calls remaining (safety limit). Run \`codeburn sync push\` again.\n`)
         }
+        const pendingAcceptance = pendingAutoAcceptance(config, pluginKeys)
+        if (pendingAcceptance) process.stderr.write(autoAcceptanceNotice(pendingAcceptance))
+        const buildNotice = teamBuildNotice(config)
+        if (buildNotice) process.stderr.write(buildNotice)
 
         // Non-zero exit when the push did not complete, so cron/scripts can
         // detect it. Ledgered progress is kept; next push resumes.
@@ -810,9 +894,7 @@ export function registerSyncCommands(program: Command): void {
       try {
         const pluginLoads: PluginLoad[] = await loadPlugins()
         const pluginKeys = declaredSyncAttributes(pluginLoads)
-        const allKeys = Array.from(CORE_SYNC_ATTRIBUTE_KEYS)
-          .concat(Array.from(pluginKeys.keys()))
-          .sort()
+        const allKeys = outboundKeysFor(config, pluginKeys)
 
         const fieldList = allKeys.map(key => {
           const plugin = pluginKeys.get(key)
@@ -918,9 +1000,7 @@ export function registerSyncCommands(program: Command): void {
         try {
           const pluginLoads: PluginLoad[] = await loadPlugins()
           const pluginKeys = declaredSyncAttributes(pluginLoads)
-          const allKeys = Array.from(CORE_SYNC_ATTRIBUTE_KEYS)
-            .concat(Array.from(pluginKeys.keys()))
-            .sort()
+          const allKeys = outboundKeysFor(config, pluginKeys)
 
           const fingerprintInput = buildAcceptanceFingerprintInput(config, allKeys, accepted.attribution, accepted.cadence)
           const currentFingerprint = computeAcceptanceFingerprint(fingerprintInput)
@@ -1022,12 +1102,15 @@ export function registerSyncCommands(program: Command): void {
       const accepted = config.auto.accepted
 
       try {
+        // Refresh server capabilities first: the fingerprint must describe what
+        // this run will actually send, and the server may now allow more.
+        const discoveryDoc = await fetchDiscoveryDoc(config.baseUrl)
+        refreshServerCapabilities(config, discoveryDoc)
+
         // Recompute fingerprint
         const pluginLoads: PluginLoad[] = await loadPlugins()
         const pluginKeys = declaredSyncAttributes(pluginLoads)
-        const allKeys = Array.from(CORE_SYNC_ATTRIBUTE_KEYS)
-          .concat(Array.from(pluginKeys.keys()))
-          .sort()
+        const allKeys = outboundKeysFor(config, pluginKeys)
 
         const fingerprintInput = buildAcceptanceFingerprintInput(config, allKeys, accepted.attribution, accepted.cadence)
         const currentFingerprint = computeAcceptanceFingerprint(fingerprintInput)
@@ -1106,6 +1189,7 @@ export function registerSyncCommands(program: Command): void {
           coverageThrough,
           tokens,
           silent: true,
+          discoveryDoc,
         })
 
         if (result.outcome === 'complete') {

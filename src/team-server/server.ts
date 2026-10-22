@@ -86,6 +86,7 @@ export function discoveryDoc(config: TeamServerConfig, pkg?: ClientPackage) {
     version: 1,
     auth: 'enrollment',
     enroll_path: '/v1/enroll',
+    revoke_path: '/v1/revoke',
     traces_path: '/v1/traces',
     max_batch_size: MAX_BATCH_SIZE,
     detail_levels: config.accept_session_detail ? ['summary', 'sessions'] : ['summary'],
@@ -164,6 +165,17 @@ export function createTeamServer(opts: TeamServerOptions): Server {
         return sendJson(res, 401, { error: 'invalid_or_expired_token' })
       }
       return sendJson(res, 200, result)
+    }
+
+    // A device revokes its own credential (`codeburn sync logout`); it cannot touch any other device.
+    if (path === '/v1/revoke') {
+      if (method !== 'POST') return sendJson(res, 405, { error: 'method_not_allowed' })
+      const cred = bearer(req)
+      const identity = cred ? await store.authenticateDevice(cred) : null
+      if (!identity) return sendJson(res, 401, { error: 'unauthorized' })
+      await store.revoke(identity.deviceId)
+      process.stderr.write(`team-server: device ${identity.deviceId} revoked itself\n`)
+      return sendJson(res, 200, { ok: true })
     }
 
     if (path === '/v1/traces' || path === '/v1/findings') {

@@ -47,7 +47,12 @@ export interface FingerprintInput {
   workMatching: boolean
   scopeSinceDays: number | null
   cadence: 'daily' | 'hourly'
-  /** Effective wire detail level (client setting clamped to the server). Default summary. */
+  /**
+   * Effective wire detail level (client setting clamped to the server).
+   * Absent means the legacy wire from before detail levels existed: the full
+   * span set with no codeburn.detail_level stamp. Acceptances stored before
+   * this field existed have it absent for that reason.
+   */
   detailLevel?: 'summary' | 'sessions'
   /** Whether optimize findings are uploaded after a push. Default false. */
   shareFindings?: boolean
@@ -62,8 +67,14 @@ export function computeAcceptanceFingerprint(input: FingerprintInput): string {
     workMatching: input.workMatching,
     scopeSinceDays: input.scopeSinceDays,
     cadence: input.cadence,
-    detailLevel: input.detailLevel ?? 'summary',
-    shareFindings: input.shareFindings ?? false,
+  }
+  // The legacy wire with findings off hashes exactly as before these fields
+  // existed, so acceptances stored by older versions keep matching.
+  if (input.detailLevel !== undefined || input.shareFindings) {
+    Object.assign(canonical, {
+      detailLevel: input.detailLevel,
+      shareFindings: input.shareFindings ?? false,
+    })
   }
   const json = JSON.stringify(canonical)
   return createHash('sha256').update(json).digest('hex')
@@ -91,9 +102,11 @@ export function buildDisclosure(input: DisclosureInput): string {
     ? 'on - session-to-commit links are sent'
     : 'off'
 
-  const detailText = (input.detailLevel ?? 'summary') === 'sessions'
-    ? 'sessions - calls carry session ids, durations, call counts and tools, exact timestamps'
-    : 'summary - usage totals only: per-day buckets, hour-rounded times, no session grouping'
+  const detailText = input.detailLevel === undefined
+    ? 'full - calls carry session ids, durations, call counts and tools, exact timestamps'
+    : input.detailLevel === 'sessions'
+      ? 'sessions - calls carry session ids, durations, call counts and tools, exact timestamps'
+      : 'summary - usage totals only: per-day buckets, hour-rounded times, no session grouping'
   const findingsText = input.shareFindings
     ? 'on - a daily snapshot of `codeburn optimize` findings is uploaded: finding id, title, severity, trend, estimated savings (tokens and USD) and period totals only; never file paths, file names, commands, snippets or explanations'
     : 'off'
@@ -187,7 +200,7 @@ export function detectFingerprintChanges(stored: FingerprintInput | undefined, c
     changes.push('work matching')
   }
 
-  if ((stored.detailLevel ?? 'summary') !== (current.detailLevel ?? 'summary')) {
+  if (stored.detailLevel !== current.detailLevel) {
     changes.push('detail level')
   }
 
@@ -216,7 +229,8 @@ export function detectFingerprintChanges(stored: FingerprintInput | undefined, c
  */
 export function isReductionOnly(stored: FingerprintInput | undefined, current: FingerprintInput): boolean {
   if (!stored) return false
-  const rank = (l: 'summary' | 'sessions' | undefined): number => (l === 'sessions' ? 1 : 0)
+  // Absent is the legacy full span set, which sends as much as sessions.
+  const rank = (l: 'summary' | 'sessions' | undefined): number => (l === 'summary' ? 0 : 1)
   if (rank(current.detailLevel) > rank(stored.detailLevel)) return false
   if ((current.shareFindings ?? false) && !(stored.shareFindings ?? false)) return false
   const same: FingerprintInput = {

@@ -94,3 +94,9 @@ One line per file in this directory, recursively.
 
 - [sync/README.md](sync/README.md) — Push your AI usage telemetry to a shared backend so teams can track adoption, budgets, and ROI across developers.
 - [sync/DEVELOPER.md](sync/DEVELOPER.md) — Architecture, protocol, server contract, and testing for `codeburn sync`.
+
+## docs/team/
+
+- [team/server.md](team/server.md) — Running the self-hosted team server: enrollment, configuration, client devices and automatic sync acceptance, client updates, GitLab sign-in and "set up another machine", storage, TLS, Docker.
+- [team/install.md](team/install.md) — Installing the team's CLI build and enrolling a device from the server's install scripts.
+- [team/gitlab-sso.md](team/gitlab-sso.md) — Design notes for GitLab sign-in on the report viewer.

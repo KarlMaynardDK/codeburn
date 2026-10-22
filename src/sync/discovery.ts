@@ -14,6 +14,8 @@ export interface CodeburnDiscoveryDoc {
   /** "enrollment" = self-hosted team server (no IdP); otherwise OIDC. */
   auth?: 'enrollment' | 'oidc'
   enroll_path?: string
+  /** Where an enrolled device revokes its own credential (team servers that support it). */
+  revoke_path?: string
   /** Detail levels the server accepts. Defaults to ["summary"]. */
   detail_levels: DetailLevel[]
   findings_path?: string
@@ -132,6 +134,7 @@ export function parseDiscoveryDoc(raw: unknown): CodeburnDiscoveryDoc {
   return {
     version, issuer, client_id, scopes, traces_path, max_batch_size, detail_levels,
     ...(enrollment ? { auth: 'enrollment' as const, enroll_path: doc.enroll_path as string } : {}),
+    ...(enrollment && typeof doc.revoke_path === 'string' && doc.revoke_path.startsWith('/') ? { revoke_path: doc.revoke_path } : {}),
     ...(typeof doc.findings_path === 'string' && doc.findings_path.startsWith('/') ? { findings_path: doc.findings_path } : {}),
     ...(typeof doc.org_name === 'string' && doc.org_name ? { org_name: doc.org_name.slice(0, 200) } : {}),
     ...(client_package ? { client_package } : {}),

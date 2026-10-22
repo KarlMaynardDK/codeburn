@@ -26,7 +26,7 @@ export interface SyncConfig {
   orgName?: string
   /** CLI build advertised by the team server at last discovery; `codeburn update` installs it. */
   clientPackage?: ClientPackageInfo
-  /** Client-chosen detail level (clamped to detailLevels). Default summary. */
+  /** Client-chosen detail level (clamped to detailLevels). Absent: summary for enrollment, the legacy full span set for OIDC. */
   detailLevel?: DetailLevel
   /** Whether to share optimize findings (needs findingsPath). Default off. */
   shareFindings?: boolean

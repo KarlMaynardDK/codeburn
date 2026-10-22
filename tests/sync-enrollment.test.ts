@@ -5,6 +5,7 @@
  */
 
 import { createServer, type Server } from 'node:http'
+import { createHash } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -17,6 +18,11 @@ import { setHome } from './setup/home.js'
 
 const { parseAllSessionsMock } = vi.hoisted(() => ({ parseAllSessionsMock: vi.fn() }))
 vi.mock('../src/parser.js', () => ({ parseAllSessions: parseAllSessionsMock }))
+vi.mock('../src/sync/schedule-installer.js', () => ({
+  installSchedule: vi.fn(async () => {}),
+  removeSchedule: vi.fn(async () => {}),
+  getScheduleStatus: vi.fn(async () => ({ installed: false })),
+}))
 
 interface Fake {
   server: Server
@@ -25,6 +31,11 @@ interface Fake {
   traces: Array<{ auth: string | undefined; body: any }>
   findings: Array<{ auth: string | undefined; body: any }>
   rejectTraces: boolean
+  detailLevels: string[]
+  findingsPath: string | undefined
+  revokePath: string | undefined
+  revokes: Array<string | undefined>
+  clientPackage: { version: string; sha256: string; path: string } | undefined
 }
 
 let fake: Fake
@@ -33,7 +44,7 @@ const originalHome = process.env.HOME
 const originalStore = process.env.CODEBURN_SYNC_TOKEN_STORE
 
 async function startFake(): Promise<Fake> {
-  const f = { enrollBodies: [], traces: [], findings: [], rejectTraces: false } as unknown as Fake
+  const f = { enrollBodies: [], traces: [], findings: [], revokes: [], rejectTraces: false, detailLevels: ['summary'], findingsPath: '/v1/findings', revokePath: '/v1/revoke' } as unknown as Fake
   f.server = createServer((req, res) => {
     const chunks: Buffer[] = []
     req.on('data', c => chunks.push(c))
@@ -46,8 +57,13 @@ async function startFake(): Promise<Fake> {
       if (req.url === '/.well-known/codeburn-export.json') {
         return json(200, {
           version: 1, auth: 'enrollment', enroll_path: '/v1/enroll', traces_path: '/v1/traces',
-          max_batch_size: 1000, detail_levels: ['summary'], findings_path: '/v1/findings', org_name: 'Acme',
+          max_batch_size: 1000, detail_levels: f.detailLevels, findings_path: f.findingsPath, org_name: 'Acme',
+          revoke_path: f.revokePath, client_package: f.clientPackage,
         })
+      }
+      if (req.url === '/v1/revoke' && req.method === 'POST') {
+        f.revokes.push(req.headers.authorization)
+        return json(200, { ok: true })
       }
       if (req.url === '/v1/enroll' && req.method === 'POST') {
         const body = JSON.parse(text)
@@ -120,6 +136,11 @@ beforeEach(async () => {
   fake.traces.length = 0
   fake.findings.length = 0
   fake.rejectTraces = false
+  fake.detailLevels = ['summary']
+  fake.findingsPath = '/v1/findings'
+  fake.revokePath = '/v1/revoke'
+  fake.revokes.length = 0
+  fake.clientPackage = undefined
   parseAllSessionsMock.mockResolvedValue([project()])
   vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
   vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
@@ -147,6 +168,23 @@ describe('sync setup --token (enrollment)', () => {
     expect(cfg.detailLevels).toEqual(['summary'])
     expect(cfg.findingsPath).toBe('/v1/findings')
     expect(cfg.orgName).toBe('Acme')
+  })
+
+  it('reminds the user to re-accept when it replaces a config that had automatic sync on', async () => {
+    const { writeSyncConfig, readSyncConfig } = await import('../src/sync/config.js')
+    writeSyncConfig({
+      baseUrl: 'https://otel.example.com', clientId: 'acme', tracesPath: '/v1/traces', issuer: 'https://idp.example.com',
+      auto: { accepted: { fingerprint: 'f', acceptedAt: '2026-09-01T00:00:00.000Z', cadence: 'daily', disclosure: '', attribution: false } },
+    })
+    const err: string[] = []
+    vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: string) => { err.push(String(chunk)); return true }) as never)
+    await run('setup', fake.baseUrl, '--token', 'cbe_good')
+    expect(err.join('')).toContain('codeburn sync auto enable --accept')
+    expect(readSyncConfig()!.auto).toBeUndefined()
+
+    err.length = 0
+    await run('setup', fake.baseUrl, '--token', 'cbe_good')
+    expect(err.join('')).not.toContain('codeburn sync auto enable --accept')
   })
 
   it('exits with an error for a bad token and stores nothing', async () => {
@@ -200,6 +238,59 @@ describe('sync push with enrollment auth', () => {
   })
 })
 
+describe('sync logout with enrollment auth', () => {
+  it('revokes the device on the server, then removes the local credential and config', async () => {
+    await run('setup', fake.baseUrl, '--token', 'cbe_good')
+    const err: string[] = []
+    vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: string) => { err.push(String(chunk)); return true }) as never)
+    await run('logout')
+    expect(fake.revokes).toEqual(['Bearer cbd_secret'])
+    expect(err.join('')).toContain('Device revoked on the team server.')
+    const { createCredentialStore } = await import('../src/sync/credentials.js')
+    const { readSyncConfig } = await import('../src/sync/config.js')
+    expect(createCredentialStore().retrieve()).toBeNull()
+    expect(readSyncConfig()).toBeNull()
+  })
+
+  it('still logs out locally against a server without self-revocation, and says to ask an admin', async () => {
+    await run('setup', fake.baseUrl, '--token', 'cbe_good')
+    fake.revokePath = undefined
+    const err: string[] = []
+    vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: string) => { err.push(String(chunk)); return true }) as never)
+    await run('logout')
+    expect(fake.revokes).toHaveLength(0)
+    expect(err.join('')).toContain('Ask your admin to revoke it')
+    const { createCredentialStore } = await import('../src/sync/credentials.js')
+    expect(createCredentialStore().retrieve()).toBeNull()
+  })
+})
+
+describe('team build notice', () => {
+  const pkg = (version: string) => ({ version, sha256: 'a'.repeat(64), path: `/install/codeburn-team-${version}.tgz` })
+
+  it('push and status point at codeburn update when the server advertises a different build', async () => {
+    await run('setup', fake.baseUrl, '--token', 'cbe_good')
+    fake.clientPackage = pkg('9.9.9-team.202610220000')
+    const err: string[] = []
+    vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: string) => { err.push(String(chunk)); return true }) as never)
+    await run('push')
+    expect(err.join('')).toContain('Your team server has CodeBurn 9.9.9-team.202610220000')
+    expect(err.join('')).toContain('codeburn update')
+    err.length = 0
+    await run('status')
+    expect(err.join('')).toContain('Your team server has CodeBurn 9.9.9-team.202610220000')
+  })
+
+  it('stays quiet when the build matches, and for OIDC configs', async () => {
+    const { teamBuildNotice } = await import('../src/sync/cli.js')
+    const { currentCliVersion } = await import('../src/plugins/loader.js')
+    expect(teamBuildNotice({ authMode: 'enrollment', clientPackage: pkg(currentCliVersion()) })).toBeNull()
+    expect(teamBuildNotice({ authMode: 'enrollment' })).toBeNull()
+    expect(teamBuildNotice({ clientPackage: pkg('9.9.9') })).toBeNull()
+    expect(teamBuildNotice({ authMode: 'enrollment', clientPackage: pkg('1.0.0') }, '1.0.1')).toContain('CodeBurn 1.0.0 (this is 1.0.1)')
+  })
+})
+
 describe('findings privacy', () => {
   it('never posts absolute paths, commands or explanations', async () => {
     await run('setup', fake.baseUrl, '--token', 'cbe_good', '--share-findings')
@@ -222,6 +313,38 @@ describe('findings privacy', () => {
       expect(body).not.toContain(leak)
     }
     expect(fake.findings[0]!.body.findings.findings[0]).toMatchObject({ id: 'junk-reads', severity: 'high', tokensSaved: 1000, estimatedSavingsUSD: 0.5 })
+  })
+})
+
+describe('sync auto run against a team server whose settings change', () => {
+  it('asks for acceptance again before sending more when the server starts allowing sessions', async () => {
+    await run('setup', fake.baseUrl, '--token', 'cbe_good', '--detail', 'sessions')
+    await run('auto', 'enable', '--accept')
+    await run('auto', 'run')
+    const { readReceipts } = await import('../src/sync/config.js')
+    expect(readReceipts().at(-1)).toMatchObject({ result: 'pushed' })
+    expect(fake.traces.length).toBeGreaterThan(0)
+
+    // The admin turns on accept_session_detail: the client asked for sessions, so it would now send more.
+    fake.detailLevels = ['summary', 'sessions']
+    fake.traces.length = 0
+    parseAllSessionsMock.mockResolvedValue([project()])
+    await run('auto', 'run')
+    expect(readReceipts().at(-1)).toMatchObject({ result: 'acceptance-required', changed: ['detail level'] })
+    expect(fake.traces).toHaveLength(0)
+  })
+
+  it('keeps pushing without a new acceptance when the server stops allowing sessions', async () => {
+    fake.detailLevels = ['summary', 'sessions']
+    await run('setup', fake.baseUrl, '--token', 'cbe_good', '--detail', 'sessions')
+    await run('auto', 'enable', '--accept')
+
+    fake.detailLevels = ['summary']
+    await run('auto', 'run')
+    const { readReceipts } = await import('../src/sync/config.js')
+    expect(readReceipts().at(-1)).toMatchObject({ result: 'pushed' })
+    const resource = fake.traces[0]!.body.resourceSpans[0].resource.attributes
+    expect(resource).toContainEqual({ key: 'codeburn.detail_level', value: { stringValue: 'summary' } })
   })
 })
 
@@ -251,16 +374,31 @@ describe('consent fingerprint', () => {
     const { computeAcceptanceFingerprint, detectFingerprintChanges } = await import('../src/sync/consent.js')
     const base = { org: 'o', destination: 'd', outboundFields: ['a'], workMatching: false, scopeSinceDays: 7, cadence: 'daily' as const }
     const f0 = computeAcceptanceFingerprint({ ...base, detailLevel: 'summary', shareFindings: false })
-    expect(computeAcceptanceFingerprint({ ...base })).toBe(f0)
+    expect(computeAcceptanceFingerprint({ ...base, detailLevel: 'summary' })).toBe(f0)
     expect(computeAcceptanceFingerprint({ ...base, detailLevel: 'sessions' })).not.toBe(f0)
     expect(computeAcceptanceFingerprint({ ...base, shareFindings: true })).not.toBe(f0)
     const { isReductionOnly } = await import('../src/sync/consent.js')
     const high = { ...base, detailLevel: 'sessions' as const, shareFindings: true }
     expect(isReductionOnly(high, { ...base, detailLevel: 'summary', shareFindings: false })).toBe(true)
     expect(isReductionOnly(high, { ...high, shareFindings: false })).toBe(true)
-    expect(isReductionOnly({ ...base }, high)).toBe(false)
+    expect(isReductionOnly({ ...base, detailLevel: 'summary' }, high)).toBe(false)
     expect(isReductionOnly(high, { ...high, destination: 'other', detailLevel: 'summary' })).toBe(false)
-    expect(detectFingerprintChanges({ ...base }, { ...base, detailLevel: 'sessions', shareFindings: true }))
+    expect(detectFingerprintChanges({ ...base, detailLevel: 'summary' }, { ...base, detailLevel: 'sessions', shareFindings: true }))
       .toEqual(['detail level', 'findings sharing'])
+  })
+
+  it('hashes an input without detail level or findings exactly as acceptances stored before they existed', async () => {
+    const { computeAcceptanceFingerprint, isReductionOnly, WIRE_CONTRACT_VERSION } = await import('../src/sync/consent.js')
+    const legacy = { org: 'o', destination: 'd', outboundFields: ['b', 'a'], workMatching: false, scopeSinceDays: 7, cadence: 'daily' as const }
+    const oldHash = createHash('sha256').update(JSON.stringify({
+      org: 'o', destination: 'd', contractVersion: WIRE_CONTRACT_VERSION, outboundFields: ['a', 'b'],
+      workMatching: false, scopeSinceDays: 7, cadence: 'daily',
+    })).digest('hex')
+    expect(computeAcceptanceFingerprint(legacy)).toBe(oldHash)
+    expect(computeAcceptanceFingerprint({ ...legacy, shareFindings: false })).toBe(oldHash)
+    expect(computeAcceptanceFingerprint({ ...legacy, shareFindings: true })).not.toBe(oldHash)
+    // The legacy wire ranks as the full span set; what an explicit level adds on the wire is its new keys.
+    expect(isReductionOnly(legacy, { ...legacy, detailLevel: 'summary' })).toBe(true)
+    expect(isReductionOnly(legacy, { ...legacy, detailLevel: 'sessions', outboundFields: ['a', 'b', 'ai.category', 'codeburn.detail_level'] })).toBe(false)
   })
 })

@@ -32,6 +32,7 @@ The plan is to build the server to the existing sync contract and extend the cli
   - `GET /.well-known/codeburn-export.json`: the existing doc plus new optional fields:
     - `auth: "enrollment"`
     - `enroll_path`
+    - `revoke_path` (added later: `POST` with the device credential revokes that device; used by `sync logout`)
     - `detail_levels: ["summary"] | ["summary","sessions"]`
     - `findings_path?`
   - `POST /v1/enroll`: exchanges a one-time enrollment token for a long-lived device credential. The server stores only its hash. One person can enroll several devices.
@@ -69,6 +70,7 @@ The plan is to build the server to the existing sync contract and extend the cli
 - **`otlp.ts`:**
   - Add the resource attribute `codeburn.detail_level`.
   - Add the span attribute `ai.category` (task category). Aggregates are needed per category, and the category is already computed in `ClassifiedTurn`.
+  - Both are sent only when a detail level is in effect. OIDC configs with no explicit level keep the legacy wire without them, so existing receivers and auto-sync acceptances are unaffected (see `docs/sync/DEVELOPER.md`).
   - At `summary` level:
     - Replace `traceId` with a per-device per-day hash, so sessions can't be reconstructed.
     - Omit `ai.work_unit_id`, `ai.session_role`, `ai.lineage_evidence`, `ai.session_duration_ms`, `ai.call_count` and `ai.tools`.

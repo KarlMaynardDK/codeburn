@@ -7,7 +7,7 @@
  */
 
 import { hostname } from 'os'
-import { assertHttps } from './discovery.js'
+import { assertHttps, fetchDiscoveryDoc } from './discovery.js'
 import { getDeviceId } from './otlp.js'
 
 export class EnrollError extends Error {
@@ -66,4 +66,25 @@ export async function enrollDevice(baseUrl: string, enrollPath: string, token: s
       },
     } : {}),
   }
+}
+
+/**
+ * Revokes this device's credential on the team server (POST {revoke_path}).
+ * 'unsupported' when the server predates self-revocation; 'unknown' when it
+ * no longer accepts the credential (already revoked). Throws when unreachable.
+ */
+export async function revokeDevice(baseUrl: string, credential: string): Promise<'revoked' | 'unknown' | 'unsupported'> {
+  const discovery = await fetchDiscoveryDoc(baseUrl)
+  if (!discovery.revoke_path) return 'unsupported'
+  const url = `${baseUrl.replace(/\/$/, '')}${discovery.revoke_path}`
+  assertHttps(url, 'Revoke endpoint')
+  let response: Response
+  try {
+    response = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${credential}` } })
+  } catch (err) {
+    throw new EnrollError(`Cannot reach ${url}: ${(err as Error).message}`)
+  }
+  if (response.status === 401) return 'unknown'
+  if (!response.ok) throw new EnrollError(`${url} returned HTTP ${response.status}`)
+  return 'revoked'
 }

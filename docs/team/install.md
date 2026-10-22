@@ -33,6 +33,9 @@ Prefer to read before running? Download the script (`curl -fsSL .../install.sh -
 its arguments and is never embedded server-side.
 
 If you already have this build installed, `codeburn sync setup <server> --token <token>` is enough.
+If the device is already enrolled with this server, you don't need a token or setup at all: the device credential is
+saved. Re-running setup would enroll it again and drop its automatic sync acceptance. See
+[Client devices and automatic sync](server.md#client-devices-and-automatic-sync).
 
 ## Endpoints
 
@@ -73,7 +76,10 @@ force a new version.
 ## Updates
 
 1. Pull or change the source and rebuild with a new `TEAM_BUILD` (see above).
-2. Members run `codeburn update`.
+2. Devices see the new version at their next push: `codeburn sync push` and `codeburn sync status` then print
+   "Your team server has CodeBurn <version> ... codeburn update". Telling members speeds this up.
+3. Members run `codeburn update` (`codeburn update --check` only reports). No token or setup is needed; the device
+   keeps its credential and automatic sync acceptance. See [Client updates](server.md#client-updates).
 
 The server is the source of truth: for a member enrolled with a team server, `codeburn update` reads `client_package`
 from the discovery document whenever the advertised version differs from the installed one (so rolling the server back

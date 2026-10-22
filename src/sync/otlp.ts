@@ -225,7 +225,9 @@ export interface BuildOtlpOptions {
   /**
    * Detail level stamped as the codeburn.detail_level resource attribute.
    * 'summary' drops every session-correlating field (see buildOtlpPayload).
-   * When omitted the legacy full span set is built and no attribute is stamped.
+   * When omitted the legacy full span set is built exactly as before detail
+   * levels existed: no codeburn.detail_level and no ai.category, so OIDC
+   * receivers set up before team servers see an unchanged wire.
    */
   detailLevel?: WireDetailLevel
   /**
@@ -267,6 +269,15 @@ export const CORE_SYNC_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
   'codeburn.coverage_through', 'codeburn.attribution_methodology',
   'git.repo', 'git.sha', 'git.commit_count', 'git.in_main', 'git.was_reverted', 'git.pr_links',
 ])
+
+/// Core keys written only when BuildOtlpOptions.detailLevel is set. The legacy
+/// wire (no detail level) never carries them.
+export const DETAIL_LEVEL_ONLY_KEYS: ReadonlySet<string> = new Set(['ai.category', 'codeburn.detail_level'])
+
+/** Core keys that actually go on the wire, with or without a detail level. */
+export function coreSyncAttributeKeys(withDetailLevel: boolean): string[] {
+  return Array.from(CORE_SYNC_ATTRIBUTE_KEYS).filter(k => withDetailLevel || !DETAIL_LEVEL_ONLY_KEYS.has(k))
+}
 
 /// Wire guard for plugin-supplied attributes (see BuildOtlpOptions).
 export function filterPluginAttributes(attrs: OtlpAttribute[], declaredKeys: ReadonlySet<string>): OtlpAttribute[] {
@@ -327,7 +338,7 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
     const projectAttribute = safeProjectAttribute(project)
     if (projectAttribute) attributes.push(projectAttribute)
 
-    const categoryValue = safeCategory(category)
+    const categoryValue = opts?.detailLevel ? safeCategory(category) : undefined
     if (categoryValue) attributes.push({ key: 'ai.category', value: { stringValue: categoryValue } })
 
     if (tools.length > 0) {

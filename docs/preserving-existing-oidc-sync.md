@@ -1,7 +1,8 @@
 # Preserving existing OIDC sync on the team-server branch
 
-Status: **open, needs a decision and a fix before `feat/team-server` merges.**
+Status: **fixed on `feat/team-server`** with the recommended fix below (see [Resolution](#resolution)).
 Investigated 2026-10-22 on branch `feat/team-server` (commit `cd60c1c9`, merge base with `main` is `1a3ce74a`).
+The findings below describe the branch before the fix.
 
 This note records everything found while checking whether the team-server work breaks the OTLP sync that already
 existed on `main`, so the next person doesn't have to repeat the investigation.
@@ -190,6 +191,45 @@ Keep the OIDC path identical to `main` on the wire and in consent:
 
 The alternative is to do only step 1 and let OIDC receivers get `ai.category`. Existing users would then be asked once
 to re-accept, because of the genuinely new field. Step 4 is required in that case.
+
+## Resolution
+
+Fixed 2026-10-22 with the recommended fix: OIDC configs from `main` stay identical to `main` on the wire and in consent.
+
+- **Legacy wire** (`wireDetailLevelFor` in `src/sync/cli.ts`): an OIDC config with no explicit `detailLevel` whose
+  effective level is `sessions` passes no detail level to `sendBatches`, from both `sync push` and `sync auto run`.
+  - `buildOtlpPayload` (`src/sync/otlp.ts`) now emits `ai.category` only when a detail level is set, so the legacy
+    path sends neither `ai.category` nor `codeburn.detail_level`.
+  - Enrollment configs, and OIDC users who run `codeburn sync config detail <level>`, get the stamped wire.
+  - An OIDC server that advertises only `summary` also gets the stamped wire: it is new enough to know the attribute.
+- **Consent** (`src/sync/consent.ts`):
+  - A `FingerprintInput` without `detailLevel` now means the legacy wire, not `summary`.
+  - `computeAcceptanceFingerprint` leaves `detailLevel`/`shareFindings` out of the canonical JSON in that case when
+    findings are off, so the hash equals `main`'s.
+  - `isReductionOnly` ranks an absent level as the full set, and `detectFingerprintChanges` compares the raw values.
+  - The outbound field list comes from `coreSyncAttributeKeys(withDetailLevel)` (`otlp.ts`), so it matches what the
+    config actually sends.
+- **Visible re-consent:** `sync push` and `sync status` print a one-line notice when automatic sync is paused waiting
+  for `codeburn sync auto enable --accept`.
+- **Setup reminder:** `sync setup` drops any existing acceptance; it now says so when it does.
+- **Related leak fixed on the way:** `sync auto run` computed the fingerprint from the server capabilities saved in
+  `sync.json` but pushed with the ones it had just fetched. A team server that turned on `accept_session_detail` or
+  `accept_findings` got one push at the higher level before the check caught it. The run now refreshes capabilities
+  before computing the fingerprint (covered in `tests/sync-enrollment.test.ts`).
+- **Docs:** `docs/team/server.md` (Client devices and automatic sync), `docs/team/install.md`, `docs/sync/README.md`.
+- **Tests:** `tests/sync-oidc-upgrade.test.ts` writes a `main`-era `sync.json` (no `authMode`, `main`'s field list,
+  fingerprint hashed independently the way `main` hashed it) and checks that:
+  - `sync auto run` pushes under the old acceptance;
+  - the wire carries only `main`'s keys, with no `ai.category`, no `codeburn.detail_level`, and a session trace id;
+  - `sync push` behaves the same and prints no pause notice;
+  - an explicit `sync config detail sessions` stamps both attributes, pauses auto-sync and prints the notice.
+
+  `tests/sync-enrollment.test.ts` pins the legacy hash at the `consent.ts` level, and its existing push test still
+  covers enrollment getting `summary`, `ai.category` and the resource attribute.
+
+Answers to the open questions below: (1) no, existing OIDC receivers don't get `ai.category` unless the user picks a
+level; (2) yes, an explicit level stamps `codeburn.detail_level` (and `ai.category`), and asks for consent again.
+(3) and (4) are still open.
 
 ## Open questions
 

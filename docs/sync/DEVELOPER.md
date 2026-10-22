@@ -275,7 +275,7 @@ This is a **test fixture**, not a production reference. Any OIDC provider + OTLP
 A discovery doc with `"auth": "enrollment"` selects the self-hosted team server flow instead of OIDC.
 `issuer` / `client_id` / `scopes` are then absent; `enroll_path` is required. Optional fields (all additive, version stays 1):
 `detail_levels` (`["summary"]` or `["summary","sessions"]`, default `["summary"]` for enrollment servers),
-`findings_path` (present only when the server accepts findings), `org_name`.
+`findings_path` (present only when the server accepts findings), `org_name`, `revoke_path`, `client_package`.
 Legacy OIDC docs that omit `detail_levels` are treated as `["summary","sessions"]`, so existing deployments keep receiving the full span set.
 
 `codeburn sync setup <url> --token <enrollment> [--detail summary|sessions] [--share-findings]`:
@@ -289,16 +289,30 @@ Legacy OIDC docs that omit `detail_levels` are treated as `["summary","sessions"
 `sync push` / `sync auto run` use the stored credential directly as `Authorization: Bearer`. There is no refresh grant.
 A 401 means the device or person was revoked: the CLI tells the user to run `codeburn sync setup <url> --token <new token>`.
 
+`sync logout` on an enrollment config re-fetches discovery and, when `revoke_path` is advertised, sends
+`POST {revoke_path}` with the credential as Bearer; the server revokes that device only. Older servers without
+`revoke_path`, or an unreachable server, get a message to ask an admin; the local credential and `sync.json` are
+removed either way.
+
+Every discovery refresh stores `client_package` in `sync.json` (`clientPackage`). `sync push` and `sync status`
+compare its version with the running CLI (`teamBuildNotice`) and point at `codeburn update` on any difference,
+matching update's rule that the server's version wins, including rollbacks.
+
 ## Detail levels
 
 Client settings (in `sync.json`): `detailLevel` (`summary` | `sessions`) and `shareFindings`. Change them with
 `codeburn sync config detail <summary|sessions>` and `codeburn sync config findings <on|off>`.
 The effective level is the client setting clamped to the server's `detail_levels` (`effectiveDetailLevel` in `discovery.ts`).
-Enrollment configs default to `summary`; legacy OIDC configs with no explicit choice keep `sessions`.
+Enrollment configs default to `summary`; OIDC configs with no explicit choice keep the legacy wire (below).
 `sync status` prints the client setting, server-allowed levels, effective level and findings flag.
 
-Every batch carries the resource attribute `codeburn.detail_level` and every usage span carries `ai.category`
-(the `ClassifiedTurn.category` of the turn the call belongs to).
+When a detail level is in effect, every batch carries the resource attribute `codeburn.detail_level` and every usage
+span carries `ai.category` (the `ClassifiedTurn.category` of the turn the call belongs to).
+
+**Legacy wire.** An OIDC config with no explicit `detailLevel` whose effective level is `sessions` sends no detail level
+at all (`wireDetailLevelFor` in `cli.ts`): the full span set with neither `codeburn.detail_level` nor `ai.category`,
+byte for byte what it sent before detail levels existed. Running `codeburn sync config detail <level>` opts the config
+into the stamped wire. `tests/sync-oidc-upgrade.test.ts` pins this.
 
 | | `summary` | `sessions` |
 |---|---|---|
@@ -323,4 +337,12 @@ A failed upload is non-fatal and retried on the next push.
 
 The acceptance fingerprint and the disclosure text (`consent.ts`) include the effective detail level and the findings flag.
 Raising the level or turning findings on changes the fingerprint, so `sync auto run` records `acceptance-required` until
-the user re-runs `codeburn sync auto enable --accept`.
+the user re-runs `codeburn sync auto enable --accept`. `sync auto run` fetches the discovery document and saves the
+server's capabilities before it computes the fingerprint, so a server that starts allowing `sessions` or findings
+pauses the run instead of getting one push at the higher level. `sync push` and `sync status` print a one-line notice while
+automatic sync is paused this way.
+
+On the legacy wire with findings off, the fingerprint input has no `detailLevel` and the canonical JSON leaves both
+fields out, so it hashes exactly as acceptances stored before these fields existed and those keep matching. The
+outbound field list is what the config actually sends (`coreSyncAttributeKeys` in `otlp.ts`), so it leaves out
+`ai.category` and `codeburn.detail_level` on the legacy wire.
