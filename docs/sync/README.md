@@ -126,6 +126,33 @@ testing, ...) on every span and a `codeburn.detail_level` resource attribute on 
 fields, `ai.tools` and exact times are left out; see [Detail levels](DEVELOPER.md#detail-levels).
 OIDC endpoints set up before detail levels existed keep receiving the table above unchanged, with neither attribute.
 
+At both detail levels, spans also carry these fields. Each one is sent only when it has a value: zero, false and
+empty are left out.
+
+| Field | Example | Description |
+|---|---|---|
+| `ai.reasoning_tokens` | `4100` | Reasoning tokens the provider recorded |
+| `ai.web_search_requests` | `2` | Web searches the call made |
+| `ai.cache_write_1h_tokens` | `900` | Tokens written to the one-hour cache |
+| `ai.savings_usd` | `0.12` | For a local-model call, what the same tokens would cost on the paid baseline model |
+| `ai.billing_route` | `bedrock` | The billing route (Bedrock, Vertex, ...); left out for a direct call |
+| `ai.billing_mode` | `metered`, `subscription` | Who billed the call, when known |
+| `ai.nano_aiu` | `5000000` | GitHub Copilot credits (10⁹ nano-AIU = 1 credit) |
+| `ai.request_weight` | `0`, `12` | Requests the record stands for, when not one: `0` for an accounting-only record, N for a daily aggregate |
+| `ai.lines_added` / `ai.lines_removed` | `40` / `4` | Lines changed by the call's edits (counts only, never the diff) |
+| `ai.tool_errors` | `1` | Tool calls that failed |
+| `ai.interrupted` / `ai.user_modified` | `true` | You interrupted the call, or changed an edit it proposed |
+| `ai.active_duration_ms` / `ai.tool_wait_ms` | `1500` / `800` | Time spent generating, and time tools ran |
+| `ai.turn_start` | `true` | Marks the first call of a prompt, so prompts can be counted |
+| `ai.turn_has_edits` / `ai.turn_retries` | `true` / `2` | Whether the prompt led to edits, and how many retries it needed (on the `ai.turn_start` span only) |
+| `ai.mcp_tools` | `["mcp__github__create_pr"]` | MCP tools the call used |
+| `ai.skills` | `["docx"]` | Skills the call used |
+| `ai.subagent_types` | `["Explore"]` | Subagent types the call started |
+| `ai.plan_mode` | `true` | The call used plan mode |
+
+Names go through the same sanitizer as `ai.tools`, so anything shaped like a path, URL or credential is dropped. At
+`summary`, `ai.subscription_covered` is sent as well, since it comes from your plan settings and not from a session.
+
 A pseudonymous `device_id` distinguishes your machines without revealing hostnames. Each export batch also carries a `codeburn.coverage_through` resource attribute: the ISO date your local history is complete through, stamped only when a complete local parse finalized that watermark.
 
 The three lineage fields appear only when your AI tool itself recorded the relationship on disk (today: Claude subagent transcripts and Kimi Code subagent sessions). They are never inferred from timing, shared projects, or directories, and they contain no prompt, title, raw session or agent id, or path: `ai.work_unit_id` is the same SHA-256 derivation the trace id already uses. A session whose parent was not observed (for example, outside the synced window) stays separate rather than being guessed into a group, and a session with no recorded lineage carries none of the three fields.

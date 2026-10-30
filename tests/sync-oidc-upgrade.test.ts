@@ -208,7 +208,9 @@ describe('OIDC config from before team servers', () => {
     const last = readReceipts().at(-1) as { result: string; changed: string[] }
     expect(last.result).toBe('acceptance-required')
     expect(last.changed).toContain('detail level')
-    expect(last.changed).toContain('field set (added: ai.category, codeburn.detail_level)')
+    const fieldChange = last.changed.find(c => c.startsWith('field set (added: '))
+    for (const key of ['ai.category', 'codeburn.detail_level', 'ai.turn_start', 'ai.mcp_tools']) expect(fieldChange).toContain(key)
+    expect(fieldChange).not.toContain('removed:')
     expect(fake.traces).toHaveLength(0)
 
     await run('push')

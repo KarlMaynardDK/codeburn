@@ -8,6 +8,7 @@
 import type { ProjectSummary } from '../types.js'
 import type { PlanMap, PlanProvider } from '../config.js'
 import { isProxiedPath } from '../models.js'
+import { isBehavioralCall, isBehavioralTurn } from '../behavioral-weight.js'
 import { inferSessionProvider } from '../session-output.js'
 import { resolveWorkUnits, workUnitSessionKey } from '../work-units.js'
 import { assertHttps } from './discovery.js'
@@ -269,8 +270,13 @@ export function collectUnsentCalls(projects: ProjectSummary[], now: number = Dat
         ...lineageContext(session, provider, resolution, unitById),
       }
       for (const turn of session.turns) {
+        // The turn's outcome rides on its first behavioral call only, so a
+        // receiver counts turns the way the local reports do.
+        let turnPending = isBehavioralTurn(turn)
         for (const call of turn.assistantCalls) {
           const covered = subscriptionCoveredFor(plans, call.provider, session.workingDirectory)
+          const startsTurn = turnPending && isBehavioralCall(call)
+          if (startsTurn) turnPending = false
           allCalls.push({
             call,
             sessionId: session.sessionId,
@@ -278,6 +284,7 @@ export function collectUnsentCalls(projects: ProjectSummary[], now: number = Dat
             workingDirectory: session.workingDirectory,
             category: turn.category,
             session: covered !== undefined ? { ...sessionContext, subscriptionCovered: covered } : sessionContext,
+            ...(startsTurn ? { turn: { hasEdits: turn.hasEdits, retries: turn.retries } } : {}),
           })
         }
       }

@@ -203,9 +203,14 @@ export async function handleApi(ctx: ApiContext, req: IncomingMessage, res: Serv
   }
   if (path === '/api/team/models') return sendJson(res, 200, await rollup.models(store, filters))
   if (path === '/api/team/projects') return sendJson(res, 200, { projects: await rollup.projects(store, filters) })
+  if (path === '/api/team/tools') return sendJson(res, 200, await rollup.tools(store, filters))
   if (path === '/api/team/sessions') {
     if (!config.accept_session_detail) return sendJson(res, 404, { error: 'sessions_disabled' })
     return sendJson(res, 200, { sessions: await rollup.sessions(store, filters) })
+  }
+  if (path === '/api/team/work') {
+    if (!config.accept_session_detail) return sendJson(res, 404, { error: 'sessions_disabled' })
+    return sendJson(res, 200, await rollup.work(store, filters))
   }
   if (path === '/api/team/insights') {
     return sendJson(res, 200, await computeInsights(store, filters, { includeFindings: config.accept_findings }))

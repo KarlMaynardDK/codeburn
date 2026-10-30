@@ -26,25 +26,84 @@ export function newId(prefix: string): string {
   return prefix + randomBytes(8).toString('hex')
 }
 
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 2
 
-/** Portable DDL with backend-specific numeric types. */
+/**
+ * Span columns added in schema v2, with their defaults. Spans stored before v2 read as zero, empty or
+ * (request_weight) one, which is exactly what an older client meant by leaving the attribute out.
+ */
+function spanV2Columns(real: string, int: string): string[] {
+  return [
+    `speed TEXT NOT NULL DEFAULT 'unknown'`, `route TEXT NOT NULL DEFAULT ''`, `billing TEXT NOT NULL DEFAULT ''`,
+    `cost_estimated ${int} NOT NULL DEFAULT 0`, `subscription_covered ${int} NOT NULL DEFAULT 0`,
+    `reasoning ${int} NOT NULL DEFAULT 0`, `web_search ${int} NOT NULL DEFAULT 0`, `cache_write_1h ${int} NOT NULL DEFAULT 0`,
+    `savings_usd ${real} NOT NULL DEFAULT 0`, `nano_aiu ${int} NOT NULL DEFAULT 0`, `request_weight ${int} NOT NULL DEFAULT 1`,
+    `lines_added ${int} NOT NULL DEFAULT 0`, `lines_removed ${int} NOT NULL DEFAULT 0`, `tool_errors ${int} NOT NULL DEFAULT 0`,
+    `interrupted ${int} NOT NULL DEFAULT 0`, `user_modified ${int} NOT NULL DEFAULT 0`,
+    `active_ms ${int} NOT NULL DEFAULT 0`, `tool_wait_ms ${int} NOT NULL DEFAULT 0`,
+    `turn_start ${int} NOT NULL DEFAULT 0`, `turn_has_edits ${int} NOT NULL DEFAULT 0`, `turn_retries ${int} NOT NULL DEFAULT 0`,
+    `plan_mode ${int} NOT NULL DEFAULT 0`,
+    `mcp_tools TEXT NOT NULL DEFAULT ''`, `skills TEXT NOT NULL DEFAULT ''`, `subagent_types TEXT NOT NULL DEFAULT ''`,
+  ]
+}
+
+/** daily_usage is derived from spans, so a schema change drops and rebuilds it. */
+function dailyUsageTable(real: string, int: string): string {
+  const sums = ['input', 'output', 'reasoning', 'cache_read', 'cache_write', 'cache_write_1h', 'web_search'].map(c => `${c} ${int} NOT NULL`)
+  const costs = ['cost_usd', 'estimated_cost_usd', 'covered_cost_usd', 'savings_usd'].map(c => `${c} ${real} NOT NULL`)
+  const counts = ['nano_aiu', 'calls', 'lines_added', 'lines_removed', 'tool_errors', 'interrupted', 'user_modified', 'active_ms',
+    'tool_wait_ms', 'turns', 'edit_turns', 'one_shot_turns', 'retries', 'plan_mode_calls'].map(c => `${c} ${int} NOT NULL`)
+  return `CREATE TABLE IF NOT EXISTS daily_usage (person_id TEXT NOT NULL, day TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, project TEXT NOT NULL, category TEXT NOT NULL, speed TEXT NOT NULL, route TEXT NOT NULL, billing TEXT NOT NULL, ${[...sums, ...costs, ...counts].join(', ')}, PRIMARY KEY (person_id, day, provider, model, project, category, speed, route, billing))`
+}
+
+/** Rolls spans up into daily_usage. `where` narrows the spans (empty for a full rebuild). */
+function dailyUsageInsert(where: string): string {
+  return `INSERT INTO daily_usage (person_id, day, provider, model, project, category, speed, route, billing, input, output, reasoning, cache_read, cache_write, cache_write_1h, web_search, cost_usd, estimated_cost_usd, covered_cost_usd, savings_usd, nano_aiu, calls, lines_added, lines_removed, tool_errors, interrupted, user_modified, active_ms, tool_wait_ms, turns, edit_turns, one_shot_turns, retries, plan_mode_calls)
+    SELECT person_id, day, provider, model, project, category, speed, route, billing,
+      SUM(input), SUM(output), SUM(reasoning), SUM(cache_read), SUM(cache_write), SUM(cache_write_1h), SUM(web_search), SUM(cost_usd),
+      SUM(CASE WHEN cost_estimated = 1 THEN cost_usd ELSE 0 END), SUM(CASE WHEN subscription_covered = 1 THEN cost_usd ELSE 0 END),
+      SUM(savings_usd), SUM(nano_aiu), SUM(request_weight), SUM(lines_added), SUM(lines_removed), SUM(tool_errors), SUM(interrupted),
+      SUM(user_modified), SUM(active_ms), SUM(tool_wait_ms), SUM(turn_start), SUM(turn_start * turn_has_edits),
+      SUM(CASE WHEN turn_start = 1 AND turn_has_edits = 1 AND turn_retries = 0 THEN 1 ELSE 0 END),
+      SUM(turn_start * turn_has_edits * turn_retries), SUM(plan_mode)
+    FROM spans ${where} GROUP BY person_id, day, provider, model, project, category, speed, route, billing`
+}
+
+/** Statements that move a v1 database to v2. Tables new in v2 come from schemaStatements. */
+function migrationV2(real: string, int: string): string[] {
+  return [
+    ...spanV2Columns(real, int).map(col => `ALTER TABLE spans ADD COLUMN ${col}`),
+    `ALTER TABLE devices ADD COLUMN coverage_through TEXT`,
+    `DROP TABLE daily_usage`,
+    dailyUsageTable(real, int),
+    `CREATE INDEX IF NOT EXISTS daily_usage_day ON daily_usage (day)`,
+    dailyUsageInsert(''),
+  ]
+}
+
+/** Portable DDL with backend-specific numeric types, in the current (v2) shape. */
 export function schemaStatements(real: string, int: string): string[] {
   return [
     `CREATE TABLE IF NOT EXISTS schema_version (version ${int} NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS people (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, team TEXT NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT)`,
-    `CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, person_id TEXT NOT NULL, cred_hash TEXT NOT NULL UNIQUE, label TEXT, client_device_id TEXT, created_at TEXT NOT NULL, last_seen TEXT, revoked_at TEXT)`,
+    `CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, person_id TEXT NOT NULL, cred_hash TEXT NOT NULL UNIQUE, label TEXT, client_device_id TEXT, created_at TEXT NOT NULL, last_seen TEXT, revoked_at TEXT, coverage_through TEXT)`,
     `CREATE TABLE IF NOT EXISTS enrollments (token_hash TEXT PRIMARY KEY, person_id TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT)`,
     `CREATE TABLE IF NOT EXISTS viewers (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, revoked_at TEXT)`,
     `CREATE TABLE IF NOT EXISTS viewer_sessions (token_hash TEXT PRIMARY KEY, viewer_id TEXT NOT NULL, expires_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS sso_sessions (token_hash TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, person_id TEXT, subject TEXT NOT NULL, email TEXT, expires_at TEXT NOT NULL)`,
-    `CREATE TABLE IF NOT EXISTS spans (span_id TEXT PRIMARY KEY, person_id TEXT NOT NULL, device_id TEXT NOT NULL, trace_id TEXT NOT NULL, ts TEXT NOT NULL, day TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, project TEXT NOT NULL, category TEXT NOT NULL, input ${int} NOT NULL, output ${int} NOT NULL, cache_read ${int} NOT NULL, cache_write ${int} NOT NULL, cost_usd ${real} NOT NULL, detail_level TEXT NOT NULL, work_unit_id TEXT, session_role TEXT, call_count ${int}, session_duration_ms ${int})`,
+    `CREATE TABLE IF NOT EXISTS spans (span_id TEXT PRIMARY KEY, person_id TEXT NOT NULL, device_id TEXT NOT NULL, trace_id TEXT NOT NULL, ts TEXT NOT NULL, day TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, project TEXT NOT NULL, category TEXT NOT NULL, input ${int} NOT NULL, output ${int} NOT NULL, cache_read ${int} NOT NULL, cache_write ${int} NOT NULL, cost_usd ${real} NOT NULL, detail_level TEXT NOT NULL, work_unit_id TEXT, session_role TEXT, call_count ${int}, session_duration_ms ${int}, ${spanV2Columns(real, int).join(', ')})`,
     `CREATE INDEX IF NOT EXISTS spans_person_day ON spans (person_id, day)`,
     `CREATE INDEX IF NOT EXISTS spans_trace ON spans (person_id, trace_id)`,
-    `CREATE TABLE IF NOT EXISTS daily_usage (person_id TEXT NOT NULL, day TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, project TEXT NOT NULL, category TEXT NOT NULL, input ${int} NOT NULL, output ${int} NOT NULL, cache_read ${int} NOT NULL, cache_write ${int} NOT NULL, cost_usd ${real} NOT NULL, calls ${int} NOT NULL, PRIMARY KEY (person_id, day, provider, model, project, category))`,
+    dailyUsageTable(real, int),
     `CREATE INDEX IF NOT EXISTS daily_usage_day ON daily_usage (day)`,
+    // MCP tools, skills and subagent types per day; cost is the spend of the calls that used the name.
+    `CREATE TABLE IF NOT EXISTS daily_names (person_id TEXT NOT NULL, day TEXT NOT NULL, project TEXT NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL, calls ${int} NOT NULL, cost_usd ${real} NOT NULL, PRIMARY KEY (person_id, day, project, kind, name))`,
+    `CREATE INDEX IF NOT EXISTS daily_names_day ON daily_names (day)`,
     `CREATE TABLE IF NOT EXISTS sessions (trace_id TEXT NOT NULL, person_id TEXT NOT NULL, project TEXT NOT NULL, started TEXT NOT NULL, duration_ms ${int} NOT NULL, calls ${int} NOT NULL, cost ${real} NOT NULL, PRIMARY KEY (person_id, trace_id))`,
     `CREATE TABLE IF NOT EXISTS findings (person_id TEXT PRIMARY KEY, captured_at TEXT NOT NULL, json TEXT NOT NULL)`,
+    // Git attribution (`codeburn sync push --attribution`): which repo and PRs a session worked on, and its commits.
+    `CREATE TABLE IF NOT EXISTS work_sessions (person_id TEXT NOT NULL, trace_id TEXT NOT NULL, repo TEXT NOT NULL, project TEXT NOT NULL, started TEXT NOT NULL, ended TEXT NOT NULL, commit_count ${int} NOT NULL, pr_links TEXT NOT NULL, PRIMARY KEY (person_id, trace_id))`,
+    `CREATE TABLE IF NOT EXISTS work_commits (person_id TEXT NOT NULL, trace_id TEXT NOT NULL, repo TEXT NOT NULL, sha TEXT NOT NULL, ts TEXT NOT NULL, in_main ${int} NOT NULL, was_reverted ${int} NOT NULL, PRIMARY KEY (person_id, trace_id, sha))`,
   ]
 }
 
@@ -53,9 +112,17 @@ export async function migrate(db: Db): Promise<void> {
   const int = db.kind === 'postgres' ? 'BIGINT' : 'INTEGER'
   await db.tx(async q => {
     if (db.kind === 'postgres') await q.all('SELECT pg_advisory_xact_lock(7203)')
+    // Read the version before creating anything: on a v1 database the CREATE IF NOT EXISTS below skips the old tables.
+    const hasVersionTable = db.kind === 'postgres'
+      ? (await q.all(`SELECT 1 AS x FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'schema_version'`)).length > 0
+      : (await q.all(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'`)).length > 0
+    const stored = hasVersionTable ? (await q.all('SELECT version FROM schema_version'))[0] : undefined
+    const from = stored ? Number(stored.version) : SCHEMA_VERSION
+    if (from > SCHEMA_VERSION) throw new Error(`team-server: database schema v${from} is newer than this server (v${SCHEMA_VERSION}); upgrade codeburn`)
     for (const stmt of schemaStatements(real, int)) await q.all(stmt)
-    const v = await q.all('SELECT version FROM schema_version')
-    if (v.length === 0) await q.all('INSERT INTO schema_version (version) VALUES (?)', [SCHEMA_VERSION])
+    if (from < 2) for (const stmt of migrationV2(real, int)) await q.all(stmt)
+    if (!stored) await q.all('INSERT INTO schema_version (version) VALUES (?)', [SCHEMA_VERSION])
+    else if (from < SCHEMA_VERSION) await q.all('UPDATE schema_version SET version = ?', [SCHEMA_VERSION])
   })
 }
 
@@ -99,6 +166,89 @@ export interface SpanRecord {
   session_role: string | null
   call_count: number | null
   session_duration_ms: number | null
+  speed: string
+  /** Billing route id; empty for a direct call. */
+  route: string
+  /** 'metered', 'subscription', or empty when unknown. */
+  billing: string
+  cost_estimated: boolean
+  subscription_covered: boolean
+  reasoning: number
+  web_search: number
+  cache_write_1h: number
+  savings_usd: number
+  nano_aiu: number
+  /** Requests this span stands for: 0 for supplementary accounting, N for a daily aggregate, else 1. */
+  request_weight: number
+  lines_added: number
+  lines_removed: number
+  tool_errors: number
+  interrupted: boolean
+  user_modified: boolean
+  active_ms: number
+  tool_wait_ms: number
+  turn_start: boolean
+  turn_has_edits: boolean
+  turn_retries: number
+  plan_mode: boolean
+  mcp_tools: string[]
+  skills: string[]
+  subagent_types: string[]
+}
+
+/** One `codeburn.session.attribution` span: the repo, PR links and commit count of a session. */
+export interface WorkSessionRecord {
+  trace_id: string
+  repo: string
+  project: string
+  started: string
+  ended: string
+  commit_count: number
+  pr_links: string[]
+}
+
+/** One `codeburn.commit` span. */
+export interface WorkCommitRecord {
+  trace_id: string
+  repo: string
+  sha: string
+  ts: string
+  in_main: boolean
+  was_reverted: boolean
+}
+
+/** spans columns in insert order, after span_id, person_id and device_id. */
+const SPAN_COLUMNS = [
+  'trace_id', 'ts', 'day', 'provider', 'model', 'project', 'category', 'input', 'output', 'cache_read', 'cache_write', 'cost_usd',
+  'detail_level', 'work_unit_id', 'session_role', 'call_count', 'session_duration_ms', 'speed', 'route', 'billing', 'cost_estimated',
+  'subscription_covered', 'reasoning', 'web_search', 'cache_write_1h', 'savings_usd', 'nano_aiu', 'request_weight', 'lines_added',
+  'lines_removed', 'tool_errors', 'interrupted', 'user_modified', 'active_ms', 'tool_wait_ms', 'turn_start', 'turn_has_edits',
+  'turn_retries', 'plan_mode', 'mcp_tools', 'skills', 'subagent_types',
+] as const
+
+const bit = (b: boolean) => (b ? 1 : 0)
+const nameList = (names: string[]) => (names.length > 0 ? JSON.stringify(names) : '')
+
+function spanValues(s: SpanRecord, day: string): unknown[] {
+  return [
+    s.trace_id, s.ts, day, s.provider, s.model, s.project, s.category, s.input, s.output, s.cache_read, s.cache_write, s.cost_usd,
+    s.detail_level, s.work_unit_id, s.session_role, s.call_count, s.session_duration_ms, s.speed, s.route, s.billing, bit(s.cost_estimated),
+    bit(s.subscription_covered), s.reasoning, s.web_search, s.cache_write_1h, s.savings_usd, s.nano_aiu, s.request_weight, s.lines_added,
+    s.lines_removed, s.tool_errors, bit(s.interrupted), bit(s.user_modified), s.active_ms, s.tool_wait_ms, bit(s.turn_start), bit(s.turn_has_edits),
+    s.turn_retries, bit(s.plan_mode), nameList(s.mcp_tools), nameList(s.skills), nameList(s.subagent_types),
+  ]
+}
+
+const NAME_KINDS = [['mcp_tools', 'mcp'], ['skills', 'skill'], ['subagent_types', 'subagent']] as const
+
+function parseNames(json: unknown): string[] {
+  if (typeof json !== 'string' || !json) return []
+  try {
+    const v = JSON.parse(json)
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
+  } catch {
+    return []
+  }
 }
 
 const nowIso = () => new Date().toISOString()
@@ -325,36 +475,79 @@ export class Store {
         days.add(day)
         traces.add(s.trace_id)
         await q.all(
-          `INSERT INTO spans (span_id, person_id, device_id, trace_id, ts, day, provider, model, project, category, input, output, cache_read, cache_write, cost_usd, detail_level, work_unit_id, session_role, call_count, session_duration_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (span_id) DO UPDATE SET device_id = excluded.device_id, trace_id = excluded.trace_id, ts = excluded.ts, day = excluded.day,
-             provider = excluded.provider, model = excluded.model, project = excluded.project, category = excluded.category,
-             input = excluded.input, output = excluded.output, cache_read = excluded.cache_read, cache_write = excluded.cache_write,
-             cost_usd = excluded.cost_usd, detail_level = excluded.detail_level, work_unit_id = excluded.work_unit_id,
-             session_role = excluded.session_role, call_count = excluded.call_count, session_duration_ms = excluded.session_duration_ms
+          `INSERT INTO spans (span_id, person_id, device_id, ${SPAN_COLUMNS.join(', ')})
+           VALUES (${['?', '?', '?', ...SPAN_COLUMNS.map(() => '?')].join(', ')})
+           ON CONFLICT (span_id) DO UPDATE SET device_id = excluded.device_id, ${SPAN_COLUMNS.map(c => `${c} = excluded.${c}`).join(', ')}
            WHERE spans.person_id = excluded.person_id`,
-          [s.span_id, personId, deviceId, s.trace_id, s.ts, day, s.provider, s.model, s.project, s.category, s.input, s.output,
-            s.cache_read, s.cache_write, s.cost_usd, s.detail_level, s.work_unit_id, s.session_role, s.call_count, s.session_duration_ms])
+          [s.span_id, personId, deviceId, ...spanValues(s, day)])
         stored++
       }
       for (const day of days) {
         await q.all('DELETE FROM daily_usage WHERE person_id = ? AND day = ?', [personId, day])
-        await q.all(
-          `INSERT INTO daily_usage (person_id, day, provider, model, project, category, input, output, cache_read, cache_write, cost_usd, calls)
-           SELECT person_id, day, provider, model, project, category, SUM(input), SUM(output), SUM(cache_read), SUM(cache_write), SUM(cost_usd), COUNT(*)
-           FROM spans WHERE person_id = ? AND day = ? GROUP BY person_id, day, provider, model, project, category`, [personId, day])
+        await q.all(dailyUsageInsert('WHERE person_id = ? AND day = ?'), [personId, day])
+        await this.rebuildDailyNames(q, personId, day)
       }
       if (withSessions) {
         for (const trace of traces) {
           await q.all('DELETE FROM sessions WHERE person_id = ? AND trace_id = ?', [personId, trace])
           await q.all(
             `INSERT INTO sessions (trace_id, person_id, project, started, duration_ms, calls, cost)
-             SELECT trace_id, person_id, MAX(project), MIN(ts), COALESCE(MAX(session_duration_ms), 0), COUNT(*), SUM(cost_usd)
+             SELECT trace_id, person_id, MAX(project), MIN(ts), COALESCE(MAX(session_duration_ms), 0), SUM(request_weight), SUM(cost_usd)
              FROM spans WHERE person_id = ? AND trace_id = ? AND detail_level = 'sessions' GROUP BY trace_id, person_id`, [personId, trace])
         }
       }
       return { stored, conflicts }
     })
+  }
+
+  /** Recomputes the MCP tool, skill and subagent name rollup for one person and day from their spans. */
+  private async rebuildDailyNames(q: Querier, personId: string, day: string): Promise<void> {
+    await q.all('DELETE FROM daily_names WHERE person_id = ? AND day = ?', [personId, day])
+    const rows = await q.all(
+      `SELECT project, cost_usd, request_weight, mcp_tools, skills, subagent_types FROM spans
+       WHERE person_id = ? AND day = ? AND (mcp_tools <> '' OR skills <> '' OR subagent_types <> '')`, [personId, day])
+    const agg = new Map<string, { project: string; kind: string; name: string; calls: number; cost: number }>()
+    for (const r of rows) {
+      for (const [col, kind] of NAME_KINDS) {
+        for (const name of new Set(parseNames(r[col]))) {
+          const key = `${r.project}\u0000${kind}\u0000${name}`
+          const cur = agg.get(key) ?? { project: String(r.project), kind, name, calls: 0, cost: 0 }
+          cur.calls += Number(r.request_weight)
+          cur.cost += Number(r.cost_usd)
+          agg.set(key, cur)
+        }
+      }
+    }
+    for (const a of agg.values()) {
+      await q.all('INSERT INTO daily_names (person_id, day, project, kind, name, calls, cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [personId, day, a.project, a.kind, a.name, a.calls, a.cost])
+    }
+  }
+
+  /** Upserts git attribution for a person. A commit's in_main / was_reverted state moves forward on each resend. */
+  async ingestAttribution(personId: string, sessions: WorkSessionRecord[], commits: WorkCommitRecord[]): Promise<void> {
+    if (sessions.length === 0 && commits.length === 0) return
+    await this.db.tx(async q => {
+      for (const s of sessions) {
+        await q.all(
+          `INSERT INTO work_sessions (person_id, trace_id, repo, project, started, ended, commit_count, pr_links) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (person_id, trace_id) DO UPDATE SET repo = excluded.repo, project = excluded.project, started = excluded.started,
+             ended = excluded.ended, commit_count = excluded.commit_count, pr_links = excluded.pr_links`,
+          [personId, s.trace_id, s.repo, s.project, s.started, s.ended, s.commit_count, JSON.stringify(s.pr_links)])
+      }
+      for (const c of commits) {
+        await q.all(
+          `INSERT INTO work_commits (person_id, trace_id, repo, sha, ts, in_main, was_reverted) VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (person_id, trace_id, sha) DO UPDATE SET repo = excluded.repo, ts = excluded.ts, in_main = excluded.in_main,
+             was_reverted = excluded.was_reverted`,
+          [personId, c.trace_id, c.repo, c.sha, c.ts, bit(c.in_main), bit(c.was_reverted)])
+      }
+    })
+  }
+
+  /** Records the date a device's local data is complete through. Never moves backwards. */
+  async setCoverage(deviceId: string, through: string): Promise<void> {
+    await this.all('UPDATE devices SET coverage_through = ? WHERE id = ? AND (coverage_through IS NULL OR coverage_through < ?)', [through, deviceId, through])
   }
 
   async saveFindings(personId: string, capturedAt: string, json: string): Promise<void> {
@@ -372,7 +565,10 @@ export class Store {
     return this.db.tx(async q => {
       const del = await q.all('DELETE FROM spans WHERE day < ? RETURNING span_id', [cutoffDay])
       await q.all('DELETE FROM daily_usage WHERE day < ?', [cutoffDay])
+      await q.all('DELETE FROM daily_names WHERE day < ?', [cutoffDay])
       await q.all('DELETE FROM sessions WHERE started < ?', [cutoff])
+      await q.all('DELETE FROM work_sessions WHERE ended < ?', [cutoff])
+      await q.all('DELETE FROM work_commits WHERE ts < ?', [cutoff])
       await q.all('DELETE FROM viewer_sessions WHERE expires_at < ?', [now.toISOString()])
       await q.all('DELETE FROM sso_sessions WHERE expires_at < ?', [now.toISOString()])
       await q.all('DELETE FROM enrollments WHERE expires_at < ? AND used_at IS NULL', [cutoff])

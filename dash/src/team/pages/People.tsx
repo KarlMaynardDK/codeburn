@@ -28,9 +28,12 @@ export function People({ filters, onOpen }: { filters: Filters; onOpen: (id: str
         { key: 'tokens', label: 'Tokens', num: true },
         { key: 'calls', label: 'Calls', num: true },
         { key: 'cache', label: 'Cache read', num: true },
+        { key: 'oneShot', label: 'One-shot', num: true },
+        { key: 'lines', label: 'Lines +/-', num: true },
         { key: 'model', label: 'Top model' },
         { key: 'trend', label: 'Trend' },
         { key: 'seen', label: 'Last seen' },
+        { key: 'through', label: 'Data through' },
       ]}
       rows={people.map((p) => ({
         name: (
@@ -43,11 +46,14 @@ export function People({ filters, onOpen }: { filters: Filters; onOpen: (id: str
         tokens: fmtTokens(tok(p)),
         calls: fmtNum(p.calls),
         cache: pct(p.cache_read_ratio),
+        oneShot: pct(p.one_shot_rate ?? undefined),
+        lines: p.lines_added || p.lines_removed ? `+${fmtNum(p.lines_added)} / -${fmtNum(p.lines_removed)}` : '-',
         model: p.top_model ? label(p.top_model) : '-',
         trend: <Spark values={p.trend} />,
         seen: when(p.last_seen),
+        through: p.data_through ?? '-',
       }))}
-      csv={people.map((p) => [p.name, p.email, p.team, p.cost, p.input, p.output, p.cache_read, p.cache_write, p.calls, p.cache_read_ratio, p.top_model, p.last_seen])}
+      csv={people.map((p) => [p.name, p.email, p.team, p.cost, p.input, p.output, p.cache_read, p.cache_write, p.calls, p.cache_read_ratio, p.one_shot_rate, p.lines_added, p.lines_removed, p.top_model, p.last_seen, p.data_through])}
     />
   )
 }
@@ -93,6 +99,12 @@ function Detail({ d }: { d: Awaited<ReturnType<typeof getPerson>> }) {
         <MetricCard label="Tokens" value={fmtTokens(tok(p))} />
         <MetricCard label="Calls" value={fmtNum(p.calls)} />
         <MetricCard label="Cache read" value={pct(p.cache_read_ratio)} />
+      </div>
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <MetricCard label="One-shot edits" value={pct(p.one_shot_rate ?? undefined)} sub={p.edit_turns ? `${fmtNum(p.one_shot_turns)} of ${fmtNum(p.edit_turns)} edit prompts` : undefined} />
+        <MetricCard label="Lines changed" value={`+${fmtNum(p.lines_added)} / -${fmtNum(p.lines_removed)}`} />
+        <MetricCard label="Tool errors" value={fmtNum(p.tool_errors)} />
+        <MetricCard label="Data through" value={p.data_through ?? '-'} sub={p.last_seen ? `last seen ${when(p.last_seen)}` : undefined} />
       </div>
       <Panel title="Usage over time">
         <DailyChart daily={d.daily} unit="cost" />

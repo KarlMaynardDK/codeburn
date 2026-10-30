@@ -10,7 +10,8 @@ import { hostname, userInfo } from 'os'
 import { posix, win32 } from 'path'
 import { isTrustedAbsoluteWorkingDirectory } from '../path-privacy.js'
 import type { ParsedApiCall } from '../types.js'
-import { billableOutputTokens } from '../models.js'
+import { billableOutputTokens, callBillingMode, effectiveRouteId } from '../models.js'
+import { behavioralCallWeight } from '../behavioral-weight.js'
 import type { SessionAttributionRecord } from '../yield.js'
 
 export interface OtlpSpan {
@@ -111,6 +112,14 @@ export interface CallWithSession {
   session?: SessionWireContext
   /** Task category of the turn this call belongs to (ClassifiedTurn.category). Sent as ai.category. */
   category?: string
+  /** Set only on the first behavioral call of a behavioral turn, so a receiver counts each turn once. */
+  turn?: TurnWireContext
+}
+
+/** Turn outcome facts (ClassifiedTurn.hasEdits / retries), sent as ai.turn_* on a detail-level wire. */
+export interface TurnWireContext {
+  hasEdits: boolean
+  retries: number
 }
 
 /**
@@ -214,6 +223,60 @@ function safeProjectAttribute(project: string | undefined): OtlpAttribute | null
 
 export type WireDetailLevel = 'summary' | 'sessions'
 
+const positiveInt = (key: string, value: number | undefined): OtlpAttribute[] =>
+  value !== undefined && Number.isFinite(value) && value > 0 ? [{ key, value: { intValue: String(Math.round(value)) } }] : []
+
+function identifierList(key: string, values: readonly string[]): OtlpAttribute[] {
+  const safe = sanitizeToolIdentifiers([...new Set(values)])
+  return safe.length > 0 ? [{ key, value: { arrayValue: { values: safe.map(v => ({ stringValue: v })) } } }] : []
+}
+
+/**
+ * Per-call counts, flags and names carried only on a detail-level wire (summary
+ * and sessions alike). Numbers and identifiers only: never prompts, paths,
+ * commands or titles. Zero and false values are omitted; a receiver reads a
+ * missing key as zero, false or (for ai.request_weight) one.
+ */
+function detailLevelCallAttributes(call: ParsedApiCall, turn: TurnWireContext | undefined): OtlpAttribute[] {
+  const attributes: OtlpAttribute[] = [
+    ...positiveInt('ai.reasoning_tokens', call.usage.reasoningTokens),
+    ...positiveInt('ai.web_search_requests', call.usage.webSearchRequests),
+    ...positiveInt('ai.cache_write_1h_tokens', call.cacheCreationOneHourTokens),
+    ...positiveInt('ai.nano_aiu', call.nanoAiu),
+    ...positiveInt('ai.lines_added', call.locAdded),
+    ...positiveInt('ai.lines_removed', call.locRemoved),
+    ...positiveInt('ai.tool_errors', call.toolErrors),
+    ...positiveInt('ai.active_duration_ms', call.activeDurationMs),
+    ...positiveInt('ai.tool_wait_ms', call.toolWaitMs),
+  ]
+  if (call.savingsUSD !== undefined && Number.isFinite(call.savingsUSD) && call.savingsUSD > 0) {
+    attributes.push({ key: 'ai.savings_usd', value: { doubleValue: call.savingsUSD } })
+  }
+  const route = effectiveRouteId(call.model, call.route)
+  const safeRoute = route ? sanitizeIdentifier(route, 32) : undefined
+  if (safeRoute) attributes.push({ key: 'ai.billing_route', value: { stringValue: safeRoute } })
+  const billing = callBillingMode(call)
+  if (billing) attributes.push({ key: 'ai.billing_mode', value: { stringValue: billing } })
+  // Supplementary accounting rows weigh 0 and daily-aggregate rows weigh N, so
+  // a receiver counting requests agrees with the local reports.
+  const weight = behavioralCallWeight(call)
+  if (weight !== 1) attributes.push({ key: 'ai.request_weight', value: { intValue: String(weight) } })
+  if (call.interrupted) attributes.push({ key: 'ai.interrupted', value: { boolValue: true } })
+  if (call.userModified) attributes.push({ key: 'ai.user_modified', value: { boolValue: true } })
+  if (turn) {
+    attributes.push({ key: 'ai.turn_start', value: { boolValue: true } })
+    if (turn.hasEdits) attributes.push({ key: 'ai.turn_has_edits', value: { boolValue: true } })
+    attributes.push(...positiveInt('ai.turn_retries', turn.retries))
+  }
+  attributes.push(
+    ...identifierList('ai.mcp_tools', call.mcpTools),
+    ...identifierList('ai.skills', call.skills),
+    ...identifierList('ai.subagent_types', call.subagentTypes),
+  )
+  if (call.hasPlanMode) attributes.push({ key: 'ai.plan_mode', value: { boolValue: true } })
+  return attributes
+}
+
 /** Task categories are a closed vocabulary; anything else ships as nothing. */
 function safeCategory(category: string | undefined): string | undefined {
   if (!category) return undefined
@@ -259,6 +322,15 @@ export interface BuildOtlpOptions {
   }
 }
 
+/// Per-call keys written by detailLevelCallAttributes, on both detail levels.
+const DETAIL_CALL_KEYS = [
+  'ai.reasoning_tokens', 'ai.web_search_requests', 'ai.cache_write_1h_tokens', 'ai.savings_usd',
+  'ai.billing_route', 'ai.billing_mode', 'ai.nano_aiu', 'ai.request_weight', 'ai.lines_added', 'ai.lines_removed',
+  'ai.tool_errors', 'ai.interrupted', 'ai.user_modified', 'ai.active_duration_ms', 'ai.tool_wait_ms',
+  'ai.turn_start', 'ai.turn_has_edits', 'ai.turn_retries',
+  'ai.mcp_tools', 'ai.skills', 'ai.subagent_types', 'ai.plan_mode',
+]
+
 /// Attribute keys the core emitter writes. Plugins add fields; they never
 /// overwrite these, so a plugin cannot lie about cost, tokens, or lineage.
 export const CORE_SYNC_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
@@ -268,11 +340,13 @@ export const CORE_SYNC_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
   'ai.session_duration_ms', 'ai.subscription_covered', 'ai.category', 'codeburn.device_id', 'codeburn.detail_level',
   'codeburn.coverage_through', 'codeburn.attribution_methodology',
   'git.repo', 'git.sha', 'git.commit_count', 'git.in_main', 'git.was_reverted', 'git.pr_links',
+  ...DETAIL_CALL_KEYS,
 ])
 
 /// Core keys written only when BuildOtlpOptions.detailLevel is set. The legacy
-/// wire (no detail level) never carries them.
-export const DETAIL_LEVEL_ONLY_KEYS: ReadonlySet<string> = new Set(['ai.category', 'codeburn.detail_level'])
+/// wire (no detail level) never carries them, so receivers set up before team
+/// servers keep the exact field set their users accepted.
+export const DETAIL_LEVEL_ONLY_KEYS: ReadonlySet<string> = new Set(['ai.category', 'codeburn.detail_level', ...DETAIL_CALL_KEYS])
 
 /** Core keys that actually go on the wire, with or without a detail level. */
 export function coreSyncAttributeKeys(withDetailLevel: boolean): string[] {
@@ -306,7 +380,7 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
 
   const summary = opts?.detailLevel === 'summary'
 
-  const spans: OtlpSpan[] = calls.map(({ call, sessionId, workingDirectory, session: fullSession, category }) => {
+  const spans: OtlpSpan[] = calls.map(({ call, sessionId, workingDirectory, session: fullSession, category, turn }) => {
     // Summary level never sees session context at all.
     const session = summary ? undefined : fullSession
     const perCallEnrichment = summary ? [] : opts?.pluginEnrichment?.perCall.get(call.deduplicationKey) ?? []
@@ -348,9 +422,14 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
       })
     }
 
-    // cost_estimated = true when provider reports char-based estimates
+    // cost_estimated = true when provider reports char-based estimates. The
+    // detail-level wire also honours the parser's own estimate flag; the legacy
+    // wire keeps the old heuristic unchanged.
     const isEstimated = call.provider === 'kiro' || call.usage.inputTokens === 0
+      || (opts?.detailLevel !== undefined && call.isEstimated === true)
     attributes.push({ key: 'ai.cost_estimated', value: { boolValue: isEstimated } })
+
+    if (opts?.detailLevel) attributes.push(...detailLevelCallAttributes(call, turn))
 
     // --- CB-3 additive fields (boundary spec section 7). Each is emitted only
     // when its value is proven; an old receiver ignoring them loses nothing.
@@ -389,6 +468,9 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
       if (session.subscriptionCovered !== undefined) {
         attributes.push({ key: 'ai.subscription_covered', value: { boolValue: session.subscriptionCovered } })
       }
+    } else if (summary && fullSession?.subscriptionCovered !== undefined) {
+      // A plan or proxy-path decision, not a session fact, so summary keeps it.
+      attributes.push({ key: 'ai.subscription_covered', value: { boolValue: fullSession.subscriptionCovered } })
     }
 
     // Plugin socket: declared-and-guarded plugin fields only (see

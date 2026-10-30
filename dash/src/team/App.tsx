@@ -10,16 +10,20 @@ import { Overview } from './pages/Overview'
 import { People, PersonDetail } from './pages/People'
 import { Models } from './pages/Models'
 import { Projects } from './pages/Projects'
+import { Tools } from './pages/Tools'
+import { Work } from './pages/Work'
 import { Sessions } from './pages/Sessions'
 import { Insights } from './pages/Insights'
 import { Register } from './Register'
 
-type Page = 'overview' | 'people' | 'models' | 'projects' | 'sessions' | 'insights'
+type Page = 'overview' | 'people' | 'models' | 'tools' | 'projects' | 'work' | 'sessions' | 'insights'
 const PAGES: Array<{ key: Page; label: string }> = [
   { key: 'overview', label: 'Overview' },
   { key: 'people', label: 'People' },
   { key: 'models', label: 'Models & tools' },
+  { key: 'tools', label: 'MCP & skills' },
   { key: 'projects', label: 'Projects' },
+  { key: 'work', label: 'Repos & PRs' },
   { key: 'sessions', label: 'Sessions' },
   { key: 'insights', label: 'Insights' },
 ]
@@ -187,7 +191,7 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
   const range = useMemo(() => computeRange(period, new Date(), custom), [period, custom])
   const filters: Filters = { ...range, team: team || undefined, person: person || undefined }
   const hasSessions = meta.detail_levels?.includes('sessions') ?? false
-  const pages = PAGES.filter((p) => p.key !== 'sessions' || hasSessions)
+  const pages = PAGES.filter((p) => (p.key !== 'sessions' && p.key !== 'work') || hasSessions)
   const page = pages.some((p) => p.key === route.page) ? route.page : 'overview'
   const member = meta.viewer?.role === 'member'
   const people = (meta.people ?? []).filter((p) => !team || p.team === team)
@@ -273,7 +277,9 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
             <People filters={{ ...filters, person: undefined }} onOpen={(id) => go('people', id)} />
           ))}
         {page === 'models' && <Models filters={filters} />}
+        {page === 'tools' && <Tools filters={filters} />}
         {page === 'projects' && <Projects filters={filters} />}
+        {page === 'work' && <Work filters={filters} />}
         {page === 'sessions' && <Sessions filters={filters} />}
         {page === 'insights' && <Insights filters={filters} />}
       </main>

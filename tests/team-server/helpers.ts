@@ -50,10 +50,12 @@ export async function startServer(backend: 'sqlite' | 'postgres', overrides: Par
 
 // ---- OTLP builders (mirror src/sync/otlp.ts shapes) ----
 
-type Attr = { key: string; value: Record<string, unknown> }
-const s = (key: string, v: string): Attr => ({ key, value: { stringValue: v } })
-const i = (key: string, v: number): Attr => ({ key, value: { intValue: String(v) } })
-const d = (key: string, v: number): Attr => ({ key, value: { doubleValue: v } })
+export type Attr = { key: string; value: Record<string, unknown> }
+export const s = (key: string, v: string): Attr => ({ key, value: { stringValue: v } })
+export const i = (key: string, v: number): Attr => ({ key, value: { intValue: String(v) } })
+export const d = (key: string, v: number): Attr => ({ key, value: { doubleValue: v } })
+export const b = (key: string, v: boolean): Attr => ({ key, value: { boolValue: v } })
+export const arr = (key: string, v: string[]): Attr => ({ key, value: { arrayValue: { values: v.map(x => ({ stringValue: x })) } } })
 
 export interface SpanSpec {
   id: string
@@ -70,6 +72,9 @@ export interface SpanSpec {
   cacheWrite?: number
   cost?: number
   session?: boolean
+  speed?: string
+  /** Extra attributes appended as-is. */
+  attrs?: Attr[]
 }
 
 export const hoursAgo = (h: number) => Math.floor((Date.now() - h * 3600_000) / 3600_000) * 3600_000
@@ -84,7 +89,7 @@ export function span(o: SpanSpec) {
     i('ai.input_tokens', o.input ?? 100),
     i('ai.output_tokens', o.output ?? 50),
     d('ai.cost_usd', o.cost ?? 0.5),
-    s('ai.speed', 'standard'),
+    s('ai.speed', o.speed ?? 'standard'),
     s('ai.project', o.project ?? 'app'),
     i('ai.cache_read_tokens', o.cacheRead ?? 0),
     i('ai.cache_write_tokens', o.cacheWrite ?? 0),
@@ -94,6 +99,7 @@ export function span(o: SpanSpec) {
     attrs.push(s('ai.work_unit_id', 'wu1'), s('ai.session_role', 'root'), s('ai.lineage_evidence', 'provider'),
       i('ai.session_duration_ms', 90_000), i('ai.call_count', 3))
   }
+  attrs.push(...(o.attrs ?? []))
   return {
     traceId: o.trace ?? 'a'.repeat(32),
     spanId: o.id,
@@ -104,8 +110,8 @@ export function span(o: SpanSpec) {
   }
 }
 
-export function payload(spans: unknown[], level: 'summary' | 'sessions' | null = 'sessions') {
-  const attributes: Attr[] = [s('codeburn.device_id', 'someone-else')]
+export function payload(spans: unknown[], level: 'summary' | 'sessions' | null = 'sessions', resource: Attr[] = []) {
+  const attributes: Attr[] = [s('codeburn.device_id', 'someone-else'), ...resource]
   if (level) attributes.push(s('codeburn.detail_level', level))
   return { resourceSpans: [{ resource: { attributes }, scopeSpans: [{ spans }] }] }
 }

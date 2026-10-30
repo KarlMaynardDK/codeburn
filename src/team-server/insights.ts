@@ -11,6 +11,12 @@ export const MIN_PEERS_FOR_CACHE_RULE = 3
 export const MIN_SIMPLE_SPEND = 1
 export const SPIKE_FACTOR = 2
 export const SPIKE_MIN_INCREASE_USD = 5
+export const MIN_EDIT_TURNS = 10
+/** Absolute gap below the median one-shot rate that triggers the rule. */
+export const ONE_SHOT_GAP = 0.2
+export const MIN_CALLS_FOR_ERROR_RULE = 50
+export const MIN_TOOL_ERROR_RATE = 0.05
+export const FAST_SHARE_INFO = 0.25
 
 export const isPremiumModel = (model: string) => {
   const m = model.toLowerCase()
@@ -112,6 +118,59 @@ export async function computeInsights(store: Store, f: Filters, opts: { includeF
         detail: `${usd(cur)} in the last 7 days against ${usd(prev)} the week before.`,
       })
     }
+  }
+
+  // Rules 4 and 5 compare people on turn outcomes and tool errors, which only newer clients send.
+  const outcome = await store.all(
+    `SELECT p.name AS name, SUM(du.calls) AS calls, SUM(du.tool_errors) AS tool_errors, SUM(du.edit_turns) AS edit_turns, SUM(du.one_shot_turns) AS one_shot_turns
+     FROM daily_usage du JOIN people p ON p.id = du.person_id WHERE du.day >= ? AND du.day <= ?${sc.sql} GROUP BY p.id, p.name`,
+    [f.from, f.to, ...sc.params])
+
+  // Rule 4: one-shot rate well below the team median.
+  const oneShot = outcome
+    .filter(r => n(r.edit_turns) >= MIN_EDIT_TURNS)
+    .map(r => ({ name: r.name as string, rate: n(r.one_shot_turns) / n(r.edit_turns) }))
+  if (oneShot.length >= MIN_PEERS_FOR_CACHE_RULE) {
+    const med = median(oneShot.map(e => e.rate))
+    for (const e of oneShot) {
+      if (e.rate < med - ONE_SHOT_GAP) {
+        insights.push({
+          id: 'low-one-shot', severity: 'info', person: e.name, value: e.rate,
+          title: `${e.name} often needs retries on edits`,
+          detail: `${pct(e.rate)} of edit prompts landed without a retry, against a team median of ${pct(med)}. More context up front or plan mode may help.`,
+        })
+      }
+    }
+  }
+
+  // Rule 5: tool error rate well above the team median.
+  const errors = outcome
+    .filter(r => n(r.calls) >= MIN_CALLS_FOR_ERROR_RULE)
+    .map(r => ({ name: r.name as string, rate: n(r.tool_errors) / n(r.calls) }))
+  if (errors.length >= MIN_PEERS_FOR_CACHE_RULE) {
+    const med = median(errors.map(e => e.rate))
+    for (const e of errors) {
+      if (e.rate >= MIN_TOOL_ERROR_RATE && e.rate > med * 2) {
+        insights.push({
+          id: 'tool-errors', severity: 'warn', person: e.name, value: e.rate,
+          title: `${e.name} hits many tool errors`,
+          detail: `${(e.rate * 100).toFixed(1)} failed tool calls per 100 calls, against a team median of ${(med * 100).toFixed(1)}. A broken MCP server or a missing permission is a common cause.`,
+        })
+      }
+    }
+  }
+
+  // Rule 6: a large share of spend in fast mode, which bills at a premium.
+  const speed = (await store.all(
+    `SELECT SUM(du.cost_usd) AS cost, SUM(CASE WHEN du.speed = 'fast' THEN du.cost_usd ELSE 0 END) AS fast
+     FROM daily_usage du JOIN people p ON p.id = du.person_id WHERE du.day >= ? AND du.day <= ?${sc.sql}`,
+    [f.from, f.to, ...sc.params]))[0] ?? {}
+  if (n(speed.cost) > 0 && n(speed.fast) / n(speed.cost) >= FAST_SHARE_INFO) {
+    insights.push({
+      id: 'fast-mode-share', severity: 'info', value: n(speed.fast) / n(speed.cost),
+      title: 'Fast mode is a large share of spend',
+      detail: `${usd(n(speed.fast))} of ${usd(n(speed.cost))} (${pct(n(speed.fast) / n(speed.cost))}) ran in fast mode, which is billed at a premium.`,
+    })
   }
 
   const out: { insights: Insight[]; findings?: Array<{ title: string; people: number; estimated_savings_usd: number }> } = { insights }

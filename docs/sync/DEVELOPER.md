@@ -321,6 +321,8 @@ into the stamped wire. `tests/sync-oidc-upgrade.test.ts` pins this.
 | `ai.work_unit_id`, `ai.session_role`, `ai.lineage_evidence`, `ai.session_duration_ms`, `ai.call_count`, `ai.tools` | omitted | sent when proven |
 | plugin attributes / extra spans, attribution spans (`--attribution`) | not sent | sent |
 | provider, model, tokens, cost, project basename, `ai.category` | sent | sent |
+| per-call counts, flags and names (`detailLevelCallAttributes` in `otlp.ts`: reasoning, web search, 1h cache writes, savings, billing route/mode, Copilot credits, request weight, lines, tool errors, interruptions, active/tool time, `ai.turn_*`, MCP tools, skills, subagent types, plan mode) | sent | sent |
+| `ai.subscription_covered` | sent | sent |
 
 `spanId` is unchanged (still derived from the deduplication key), so the sent-ledger and server upserts behave identically at both levels.
 Prompts, file paths and turn content are never sent at any level. Strings still go through `sanitizeModelIdentifier`,

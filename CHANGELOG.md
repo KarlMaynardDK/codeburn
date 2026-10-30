@@ -2,7 +2,11 @@
 
 ## Unreleased
 
+### Added
+- **Richer team server reports.** Clients pushing to a team server now also send reasoning tokens, web searches, one-hour cache writes, local-model savings, billing route and mode, Copilot credits, lines changed, tool errors, interruptions, active and tool time, prompt outcomes (edits and retries), and the MCP tools, skills, subagent types and plan mode each call used. Counts and names only; never prompts, paths or commands. The server now also keeps speed, estimated cost, subscription coverage, each device's "data through" date and, with session detail on, git attribution. The viewer gains one-shot rate, lines changed and billing splits on Overview and People, an **MCP & skills** page, a **Repos & PRs** page, and three new insights. The server upgrades its database in place. OIDC endpoints set up before detail levels keep the wire they had. Team devices with automatic sync pause until the person accepts the new fields.
+
 ### Fixed
+- **Team server call counts match the local reports.** Accounting-only records (Copilot rollups, Hermes deltas) no longer count as calls, and daily-aggregate records count as the requests they stand for.
 - **Copilot agent requests in VS Code chat count every model call.** Copilot Chat 0.69 keeps only the last call of an agent request in its metadata, so CodeBurn showed a fraction of the output and cost. It now reads the request's totals (all calls, with the cache split when VS Code records it), and a request that records GitHub's credits costs exactly that bill (1 credit = $0.01) in reports and plan credits. A chat session that also ran on the agent host is counted once, from the agent host. In Copilot plan credits each chat request is rated on its own. Past Copilot days re-derive once after the update.
 - Copilot showed `claude-sonnet-4-6` as "Sonnet 4" instead of "Sonnet 4.6".
 

@@ -52,8 +52,9 @@ Created in the data dir with these defaults on first start (restart after editin
 
 - `accept_session_detail`: when false, the discovery document advertises only `summary`, and session-level span
   attributes (`ai.work_unit_id`, `ai.session_role`, `ai.call_count`, `ai.session_duration_ms`) are dropped on ingest
-  even if a client sent them. No session rows are stored and the Sessions page returns 404. Turn it on to store
-  sessions from clients that push at the `sessions` detail level.
+  even if a client sent them. No session rows are stored and the Sessions and Repos & PRs pages return 404. Turn it
+  on to store sessions from clients that push at the `sessions` detail level, and git attribution (repo, PR links and
+  commits, sent with `codeburn sync push --attribution`).
 - `accept_findings`: enables `POST /v1/findings` (the latest `codeburn optimize` snapshot per person) and the
   findings section of the Insights page.
 - `retention_days`: raw spans, rollups and sessions older than this are pruned on startup and every 24 hours.
@@ -115,8 +116,12 @@ matches that fingerprint. Otherwise it records `acceptance-required`, sends noth
 
 - **Moving to this server always needs a new acceptance.** The destination is part of the fingerprint, and
   `sync setup` replaces the old configuration. Setup prints a reminder when it drops an acceptance.
-- **Everything a team server device sends is covered**, including `ai.category` (task category) on every span and
-  `codeburn.detail_level` on every batch.
+- **Everything a team server device sends is covered**, including `ai.category` (task category) on every span,
+  `codeburn.detail_level` on every batch, and the per-call counts and names listed in
+  [What Gets Sent](../sync/README.md#what-gets-sent).
+- **Updating the client can add fields**, which pauses automatic sync until the person accepts again. The update that
+  added turn outcomes, line counts, MCP tool, skill and subagent names and the other per-call counts is one of these.
+  Only calls pushed after the update carry the new fields; data already on the server is not re-sent.
 - **While a device is waiting for acceptance**, `codeburn sync push` and `codeburn sync status` print
   "Automatic sync is paused" with the command to run. `codeburn sync auto status` lists what changed. Manual
   `codeburn sync push` keeps working throughout.
@@ -366,6 +371,10 @@ Select PostgreSQL with `--database-url`, the `CODEBURN_TEAM_DATABASE_URL` enviro
 schema). Back up the data dir (SQLite) or the database (PostgreSQL); `team-server.json` lives in the data dir either
 way.
 
+The server upgrades the schema in place on startup. Schema v2 adds columns to the stored spans and rebuilds the daily
+rollup from them, so existing data stays. Usage stored before v2 shows zero for the new counts, and as `unknown` speed.
+A server refuses to start on a database written by a newer version.
+
 ## TLS and reverse proxy
 
 The sync client only accepts `https://` URLs off loopback. Either terminate TLS in a reverse proxy (recommended) or
@@ -464,9 +473,14 @@ docker exec codeburn-team node dist/cli.js team admin add-viewer --name "Manager
 - `POST /v1/findings`: `{captured_at, findings}`, only when `accept_findings` is on.
 - `GET /auth/gitlab/login`, `GET /auth/gitlab/callback`: GitLab sign-in, only when it is configured (404 otherwise).
 - `/register`: the self-registration page (part of the viewer).
-- `/api/team/*`: viewer API (auth-methods, login, logout, meta, overview, people, models, projects, sessions,
-  insights, and `registration` / `registration/token` for self-registration). "Tokens" in these
+- `/api/team/*`: viewer API (auth-methods, login, logout, meta, overview, people, models, tools, projects, sessions,
+  work, insights, and `registration` / `registration/token` for self-registration). "Tokens" in these
   responses are input + output + cache read + cache write; `cache_read_ratio` is cache reads / (input + cache reads).
+  `calls` counts requests: accounting-only records add cost but no call. `one_shot_rate` is edit prompts that needed
+  no retry / edit prompts, and is null until a client sends turn outcomes. `tools` returns MCP tools, skills and
+  subagent types with the spend of the calls that used each one (a call that used two counts toward both). `work`
+  returns repos and PRs from git attribution, with each session's total spend, and is 404 without
+  `accept_session_detail`.
 
 ## Insights rules
 
@@ -474,6 +488,11 @@ docker exec codeburn-team node dist/cli.js team admin add-viewer --name "Manager
 - Premium models (name contains `opus`, `gpt-5`, `o3` or `pro`) above 50% of a person's spend on
   conversation/exploration/general/unknown work.
 - A person's last 7 days of spend above 2x the previous 7 days and more than $5 higher.
+- A one-shot rate more than 20 points below the team median (people with at least 10 edit prompts, at least 3 such
+  people).
+- Tool errors above 2x the team median and at least 5 per 100 calls (people with at least 50 calls, at least 3 such
+  people).
+- Fast mode at 25% or more of the period's spend.
 - Recurring `optimize` findings across the team with total estimated savings (when findings are enabled).
 
 The constants live in `src/team-server/insights.ts`.

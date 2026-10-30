@@ -15,7 +15,7 @@ export const CORE_SYNC_FIELD_MEANINGS: ReadonlyMap<string, string> = new Map([
   ['ai.input_tokens', 'tokens sent to the model'],
   ['ai.output_tokens', 'tokens returned by the model'],
   ['ai.cost_usd', 'the cost of the call in US dollars'],
-  ['ai.speed', 'how many output tokens per second'],
+  ['ai.speed', 'the service tier of the call (standard, fast or flex)'],
   ['ai.project', 'directory name of the project'],
   ['ai.tools', 'tools available to the model'],
   ['ai.cost_estimated', 'whether cost was estimated or billed'],
@@ -38,6 +38,28 @@ export const CORE_SYNC_FIELD_MEANINGS: ReadonlyMap<string, string> = new Map([
   ['git.in_main', 'whether commits were to the main branch (only when work matching is on)'],
   ['git.was_reverted', 'whether work was reverted (only when work matching is on)'],
   ['git.pr_links', 'pull request URLs (only when work matching is on)'],
+  ['ai.reasoning_tokens', 'reasoning tokens the provider recorded'],
+  ['ai.web_search_requests', 'how many web searches the call made'],
+  ['ai.cache_write_1h_tokens', 'tokens written to the one-hour cache'],
+  ['ai.savings_usd', 'what a local model call would have cost on a paid model, in US dollars'],
+  ['ai.billing_route', 'the billing route (for example bedrock or vertex)'],
+  ['ai.billing_mode', 'whether the call was metered or subscription-billed'],
+  ['ai.nano_aiu', 'GitHub Copilot credits used, in nano-units'],
+  ['ai.request_weight', 'how many requests the record stands for, when not one'],
+  ['ai.lines_added', 'how many lines the call added'],
+  ['ai.lines_removed', 'how many lines the call removed'],
+  ['ai.tool_errors', 'how many tool calls failed'],
+  ['ai.interrupted', 'whether you interrupted the call'],
+  ['ai.user_modified', 'whether you changed an edit the call proposed'],
+  ['ai.active_duration_ms', 'how long the model was generating, in milliseconds'],
+  ['ai.tool_wait_ms', 'how long tools ran, in milliseconds'],
+  ['ai.turn_start', 'marks the first call of a prompt'],
+  ['ai.turn_has_edits', 'whether the prompt led to file edits'],
+  ['ai.turn_retries', 'how many retries the prompt needed'],
+  ['ai.mcp_tools', 'names of the MCP tools the call used'],
+  ['ai.skills', 'names of the skills the call used'],
+  ['ai.subagent_types', 'types of subagents the call started'],
+  ['ai.plan_mode', 'whether the call used plan mode'],
 ])
 
 export interface FingerprintInput {
@@ -106,7 +128,7 @@ export function buildDisclosure(input: DisclosureInput): string {
     ? 'full - calls carry session ids, durations, call counts and tools, exact timestamps'
     : input.detailLevel === 'sessions'
       ? 'sessions - calls carry session ids, durations, call counts and tools, exact timestamps'
-      : 'summary - usage totals only: per-day buckets, hour-rounded times, no session grouping'
+      : 'summary - usage, counts and MCP tool, skill and subagent names only: per-day buckets, hour-rounded times, no session grouping'
   const findingsText = input.shareFindings
     ? 'on - a daily snapshot of `codeburn optimize` findings is uploaded: finding id, title, severity, trend, estimated savings (tokens and USD) and period totals only; never file paths, file names, commands, snippets or explanations'
     : 'off'

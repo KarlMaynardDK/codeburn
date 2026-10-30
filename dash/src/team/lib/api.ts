@@ -85,16 +85,48 @@ export type Meta = {
   people?: Array<{ id: string; name: string; team?: string | null }>
 }
 export type DailyRow = { day: string; cost: number; input: number; output: number; cache_read: number; cache_write: number; calls: number }
+/** Counts newer clients send per call. Zero when every client in the period predates them. */
+export type Extras = {
+  reasoning: number
+  cache_write_1h: number
+  web_search: number
+  estimated_cost_usd: number
+  covered_cost_usd: number
+  savings_usd: number
+  nano_aiu: number
+  lines_added: number
+  lines_removed: number
+  tool_errors: number
+  interrupted: number
+  user_modified: number
+  active_ms: number
+  tool_wait_ms: number
+  turns: number
+  edit_turns: number
+  one_shot_turns: number
+  retries: number
+  plan_mode_calls: number
+  /** Null when no turn outcomes were sent for the period. */
+  one_shot_rate: number | null
+}
+export const EMPTY_EXTRAS: Extras = {
+  reasoning: 0, cache_write_1h: 0, web_search: 0, estimated_cost_usd: 0, covered_cost_usd: 0, savings_usd: 0, nano_aiu: 0,
+  lines_added: 0, lines_removed: 0, tool_errors: 0, interrupted: 0, user_modified: 0, active_ms: 0, tool_wait_ms: 0,
+  turns: 0, edit_turns: 0, one_shot_turns: 0, retries: 0, plan_mode_calls: 0, one_shot_rate: null,
+}
 export type Overview = {
-  totals: { cost: number; input: number; output: number; cache_read: number; cache_write: number; calls: number; active_people: number }
+  totals: { cost: number; input: number; output: number; cache_read: number; cache_write: number; calls: number; active_people: number } & Extras
   daily: DailyRow[]
   mtd?: { cost: number; projected_month_cost: number; days_elapsed: number; days_in_month: number }
   by_provider: Breakdown[]
   by_model: Breakdown[]
   by_team: Breakdown[]
+  by_speed: Breakdown[]
+  by_route: Breakdown[]
+  by_billing: Breakdown[]
   compare?: { cost: number; tokens: number }
 }
-export type PersonRow = {
+export type PersonRow = Extras & {
   id: string
   name: string
   email?: string | null
@@ -109,7 +141,14 @@ export type PersonRow = {
   top_model?: string | null
   trend: number[]
   last_seen?: string | null
+  /** Latest date any of the person's devices reported its data complete through. */
+  data_through?: string | null
 }
+export type NameRow = { kind: 'mcp' | 'skill' | 'subagent' | string; name: string; calls: number; cost: number; people: number }
+export type ToolsData = { names: NameRow[]; plan_mode: { calls: number; people: number; share: number } }
+export type RepoRow = { repo: string; sessions: number; cost: number; people: number; prs: number; commits: number; landed: number; reverted: number }
+export type PrRow = { url: string; repo: string; sessions: number; cost: number; people: number }
+export type WorkData = { repos: RepoRow[]; prs: PrRow[] }
 export type PersonDetail = {
   person: PersonRow
   by_provider: Breakdown[]
@@ -134,25 +173,28 @@ export const getMeta = () => request<Meta>('GET', '/api/team/meta')
 export async function getOverview(x: Filters, compare: boolean): Promise<Overview> {
   const o = await request<Partial<Overview>>('GET', '/api/team/overview', { ...f(x), compare: compare ? 'previous' : undefined })
   return {
-    totals: { cost: 0, input: 0, output: 0, cache_read: 0, cache_write: 0, calls: 0, active_people: 0, ...o.totals },
+    totals: { cost: 0, input: 0, output: 0, cache_read: 0, cache_write: 0, calls: 0, active_people: 0, ...EMPTY_EXTRAS, ...o.totals },
     daily: o.daily ?? [],
     mtd: o.mtd,
     by_provider: o.by_provider ?? [],
     by_model: o.by_model ?? [],
     by_team: o.by_team ?? [],
+    by_speed: o.by_speed ?? [],
+    by_route: o.by_route ?? [],
+    by_billing: o.by_billing ?? [],
     compare: o.compare,
   }
 }
 
 export async function getPeople(x: Filters): Promise<PersonRow[]> {
   const r = await request<{ people?: PersonRow[] }>('GET', '/api/team/people', f(x))
-  return (r.people ?? []).map((p) => ({ ...p, trend: p.trend ?? [] }))
+  return (r.people ?? []).map((p) => ({ ...EMPTY_EXTRAS, ...p, trend: p.trend ?? [] }))
 }
 
 export async function getPerson(id: string, x: Filters): Promise<PersonDetail> {
   const r = await request<Partial<PersonDetail>>('GET', `/api/team/people/${encodeURIComponent(id)}`, f(x))
   return {
-    person: { ...(r.person as PersonRow), trend: r.person?.trend ?? [] },
+    person: { ...EMPTY_EXTRAS, ...(r.person as PersonRow), trend: r.person?.trend ?? [] },
     by_provider: r.by_provider ?? [],
     by_model: r.by_model ?? [],
     by_project: r.by_project ?? [],
@@ -172,6 +214,16 @@ export async function getProjects(x: Filters): Promise<ProjectRow[]> {
 
 export async function getSessions(x: Filters): Promise<SessionRow[]> {
   return (await request<{ sessions?: SessionRow[] }>('GET', '/api/team/sessions', f(x))).sessions ?? []
+}
+
+export async function getTools(x: Filters): Promise<ToolsData> {
+  const r = await request<Partial<ToolsData>>('GET', '/api/team/tools', f(x))
+  return { names: r.names ?? [], plan_mode: r.plan_mode ?? { calls: 0, people: 0, share: 0 } }
+}
+
+export async function getWork(x: Filters): Promise<WorkData> {
+  const r = await request<Partial<WorkData>>('GET', '/api/team/work', f(x))
+  return { repos: r.repos ?? [], prs: r.prs ?? [] }
 }
 
 export async function getInsights(x: Filters): Promise<{ insights: Insight[]; findings: Finding[] }> {

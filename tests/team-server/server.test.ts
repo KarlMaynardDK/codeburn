@@ -3,7 +3,7 @@ import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { BACKENDS, daysAgo, dayStr, enrollPerson, hoursAgo, payload, post, send, span, startServer, viewerClient, type TestServer } from './helpers.js'
+import { arr, b, BACKENDS, daysAgo, dayStr, enrollPerson, hoursAgo, i, payload, post, s, send, span, startServer, viewerClient, type TestServer } from './helpers.js'
 
 describe.each(BACKENDS)('team server (%s)', backend => {
   let t: TestServer
@@ -423,6 +423,100 @@ describe.each(BACKENDS)('team server (%s)', backend => {
       const trav = await fetch(`${t.base}/..%2f..%2fpackage.json`)
       expect(await trav.text()).not.toContain('"name"')
       expect((await fetch(`${t.base}/v1/nothing`)).status).toBe(404)
+    })
+  })
+
+  describe('schema v2 fields', () => {
+    it('reports speed, billing, turn outcomes, lines and request weight', async () => {
+      t = await startServer(backend)
+      const a = await enrollPerson(t, 'Ann')
+      await send(t, a.cred, [
+        span({ id: 'v1', speed: 'fast', cost: 2, attrs: [b('ai.turn_start', true), b('ai.turn_has_edits', true), i('ai.lines_added', 40), i('ai.lines_removed', 4), s('ai.billing_route', 'bedrock'), s('ai.billing_mode', 'metered'), b('ai.cost_estimated', true), i('ai.reasoning_tokens', 7)] }),
+        span({ id: 'v2', cost: 1, attrs: [b('ai.turn_start', true), b('ai.turn_has_edits', true), i('ai.turn_retries', 3), i('ai.tool_errors', 2), b('ai.plan_mode', true)] }),
+        // Supplementary accounting: cost counts, the call does not.
+        span({ id: 'v3', cost: 0.5, attrs: [i('ai.request_weight', 0), b('ai.subscription_covered', true)] }),
+      ], 'summary')
+      const v = await viewerClient(t)
+      const day = dayStr(hoursAgo(1))
+      const ov = (await v.get(`/api/team/overview?from=${day}&to=${day}`)).json
+      expect(ov.totals).toMatchObject({
+        cost: 3.5, calls: 2, turns: 2, edit_turns: 2, one_shot_turns: 1, retries: 3, one_shot_rate: 0.5, lines_added: 40, lines_removed: 4,
+        tool_errors: 2, plan_mode_calls: 1, estimated_cost_usd: 2, covered_cost_usd: 0.5, reasoning: 7,
+      })
+      expect(ov.by_speed).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'fast', cost: 2, calls: 1 }), expect.objectContaining({ name: 'standard', cost: 1.5, calls: 1 })]))
+      expect(ov.by_route).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'bedrock', cost: 2 }), expect.objectContaining({ name: 'direct', cost: 1.5 })]))
+      expect(ov.by_billing).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'metered', cost: 2 }), expect.objectContaining({ name: 'unknown' })]))
+      const people = (await v.get(`/api/team/people?from=${day}&to=${day}`)).json.people
+      expect(people[0]).toMatchObject({ calls: 2, one_shot_rate: 0.5, lines_added: 40 })
+    })
+
+    it('rolls up MCP tools, skills, subagent types and plan mode', async () => {
+      t = await startServer(backend)
+      const a = await enrollPerson(t, 'Ann')
+      const c = await enrollPerson(t, 'Cy')
+      await send(t, a.cred, [
+        span({ id: 'n1', cost: 1, attrs: [arr('ai.mcp_tools', ['mcp__github__create_pr', 'mcp__github__get_issue']), arr('ai.skills', ['docx']), b('ai.plan_mode', true)] }),
+        span({ id: 'n2', cost: 2, attrs: [arr('ai.mcp_tools', ['mcp__github__create_pr']), arr('ai.subagent_types', ['Explore'])] }),
+      ], 'summary')
+      await send(t, c.cred, [span({ id: 'n3', cost: 4, attrs: [arr('ai.mcp_tools', ['mcp__github__create_pr', 'bad\nname'])] })], 'summary')
+      const v = await viewerClient(t)
+      const day = dayStr(hoursAgo(1))
+      const r = (await v.get(`/api/team/tools?from=${day}&to=${day}`)).json
+      expect(r.names).toEqual([
+        { kind: 'mcp', name: 'mcp__github__create_pr', calls: 3, cost: 7, people: 2 },
+        { kind: 'mcp', name: 'mcp__github__get_issue', calls: 1, cost: 1, people: 1 },
+        { kind: 'skill', name: 'docx', calls: 1, cost: 1, people: 1 },
+        { kind: 'subagent', name: 'Explore', calls: 1, cost: 2, people: 1 },
+      ])
+      expect(r.plan_mode).toEqual({ calls: 1, people: 1, share: 1 / 3 })
+      // The person filter (forced for member viewers) scopes the names too.
+      const member = (await v.get(`/api/team/tools?from=${day}&to=${day}&person=${c.person.id}`)).json
+      expect(member.names).toEqual([{ kind: 'mcp', name: 'mcp__github__create_pr', calls: 1, cost: 4, people: 1 }])
+    })
+
+    it('stores git attribution only with session detail and joins it to session spend', async () => {
+      const attribution = (trace: string) => ({
+        resourceSpans: [{
+          resource: { attributes: [s('codeburn.device_id', 'x'), s('codeburn.attribution_methodology', 'timestamp-window')] },
+          scopeSpans: [{ spans: [
+            { traceId: trace, spanId: 'as1', name: 'codeburn.session.attribution', startTimeUnixNano: (BigInt(hoursAgo(2)) * 1_000_000n).toString(), endTimeUnixNano: (BigInt(hoursAgo(1)) * 1_000_000n).toString(),
+              attributes: [s('ai.project', 'app'), s('git.repo', 'github.com/acme/app'), i('git.commit_count', 2), arr('git.pr_links', ['https://github.com/acme/app/pull/7'])] },
+            { traceId: trace, spanId: 'ac1', name: 'codeburn.commit', startTimeUnixNano: (BigInt(hoursAgo(1)) * 1_000_000n).toString(), endTimeUnixNano: (BigInt(hoursAgo(1)) * 1_000_000n).toString(),
+              attributes: [s('git.repo', 'github.com/acme/app'), s('git.sha', 'ABCDEF1234567'), b('git.in_main', true), b('git.was_reverted', false)] },
+            { traceId: trace, spanId: 'ac2', name: 'codeburn.commit', startTimeUnixNano: (BigInt(hoursAgo(1)) * 1_000_000n).toString(), endTimeUnixNano: (BigInt(hoursAgo(1)) * 1_000_000n).toString(),
+              attributes: [s('git.repo', 'github.com/acme/app'), s('git.sha', 'fedcba7654321'), b('git.in_main', true), b('git.was_reverted', true)] },
+          ] }],
+        }],
+      })
+      t = await startServer(backend)
+      let a = await enrollPerson(t, 'Ann')
+      await post(t.base, '/v1/traces', attribution('t'.repeat(32)), { authorization: `Bearer ${a.cred}` })
+      expect(await t.store.all('SELECT * FROM work_sessions')).toEqual([])
+      await t.cleanup()
+
+      t = await startServer(backend, { accept_session_detail: true })
+      a = await enrollPerson(t, 'Ann')
+      const trace = 't'.repeat(32)
+      await send(t, a.cred, [span({ id: 'w1', trace, cost: 3, at: hoursAgo(2) })], 'sessions')
+      const r = await post(t.base, '/v1/traces', attribution(trace), { authorization: `Bearer ${a.cred}` })
+      expect(r.json.partialSuccess).toEqual({})
+      const v = await viewerClient(t)
+      const day = dayStr(hoursAgo(1))
+      const work = (await v.get(`/api/team/work?from=${dayStr(hoursAgo(2))}&to=${day}`)).json
+      expect(work.repos).toEqual([{ repo: 'github.com/acme/app', sessions: 1, cost: 3, people: 1, prs: 1, commits: 2, landed: 2, reverted: 1 }])
+      expect(work.prs).toEqual([{ url: 'https://github.com/acme/app/pull/7', repo: 'github.com/acme/app', sessions: 1, cost: 3, people: 1 }])
+      expect((await t.store.all('SELECT sha FROM work_commits ORDER BY sha')).map(x => x.sha)).toEqual(['abcdef1234567', 'fedcba7654321'])
+    })
+
+    it('records the coverage date per device and never moves it backwards', async () => {
+      t = await startServer(backend)
+      const a = await enrollPerson(t, 'Ann')
+      const auth = { authorization: `Bearer ${a.cred}` }
+      await post(t.base, '/v1/traces', payload([span({ id: 'c1' })], 'summary', [s('codeburn.coverage_through', '2026-10-20')]), auth)
+      await post(t.base, '/v1/traces', payload([span({ id: 'c2' })], 'summary', [s('codeburn.coverage_through', '2026-10-18')]), auth)
+      const v = await viewerClient(t)
+      const day = dayStr(hoursAgo(1))
+      expect((await v.get(`/api/team/people?from=${day}&to=${day}`)).json.people[0].data_through).toBe('2026-10-20')
     })
   })
 
