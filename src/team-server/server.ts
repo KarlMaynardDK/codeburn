@@ -7,7 +7,8 @@ import { handleApi, readBody, sendJson } from './api.js'
 import { FailureLimiter, OAUTH_COOKIE, bearer, clearedOauthCookie, clientVersion, oauthCookie, readCookie, sessionCookie } from './auth.js'
 import { installPs1Script, installShScript, originFromRequest, type ClientPackage } from './client-package.js'
 import { assertServeConfig, type TeamServerConfig } from './config.js'
-import { checkState, completeLogin, decideAccess, startLogin } from './gitlab.js'
+import { checkState, completeLogin, decideAccess, registrationEnabled, startLogin } from './gitlab.js'
+import { helpPage } from './help.js'
 import { parseCoaching } from './coaching.js'
 import { ingestOtlp } from './ingest.js'
 import type { Store } from './store.js'
@@ -128,6 +129,17 @@ export function createTeamServer(opts: TeamServerOptions): Server {
     }
 
     const pkg = opts.clientPackage
+    // Public, like the installers: it holds instructions only, nothing about any person.
+    if (path === '/help' && (method === 'GET' || method === 'HEAD')) {
+      const fwd = req.headers['x-forwarded-proto']
+      const origin = config.public_url ?? originFromRequest(req.headers.host, Array.isArray(fwd) ? fwd[0] : fwd, tls)
+      if (!origin) return sendJson(res, 400, { error: 'invalid_host' })
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer',
+        'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      })
+      return void res.end(method === 'HEAD' ? undefined : helpPage(origin, config, { installers: !!pkg, registration: registrationEnabled(config.gitlab), signIn: !!config.gitlab }))
+    }
     if (pkg && (method === 'GET' || method === 'HEAD') &&
         (path === '/install/codeburn-team.tgz' || path === '/install/codeburn.tgz' || path === pkg.path || path === '/install.sh' || path === '/install.ps1')) {
       if (path === '/install.sh' || path === '/install.ps1') {

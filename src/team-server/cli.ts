@@ -1,5 +1,6 @@
 import type { Command } from 'commander'
 import { installerLines, setupCommand } from './client-package.js'
+import { postSetupSteps } from './help.js'
 
 interface StoreFlags { dataDir?: string; databaseUrl?: string }
 
@@ -27,7 +28,12 @@ async function setupUrl(opts: StoreFlags & { url?: string }): Promise<string> {
   return loadConfig(resolveDataDir(opts.dataDir)).public_url ?? 'http://127.0.0.1:8787'
 }
 
-function printSetupLines(url: string, token: string): void {
+async function setupSteps(opts: StoreFlags) {
+  const { loadConfig, resolveDataDir } = await import('./config.js')
+  return postSetupSteps(loadConfig(resolveDataDir(opts.dataDir)))
+}
+
+function printSetupLines(url: string, token: string, steps: ReturnType<typeof postSetupSteps>): void {
   const base = url.replace(/\/$/, '')
   const l = installerLines(base, token)
   process.stdout.write(`Install CodeBurn from this server and connect (macOS/Linux):
@@ -41,6 +47,12 @@ function printSetupLines(url: string, token: string): void {
   process.stdout.write(`Already have this build installed:
   ${setupCommand(base, token)}
 `)
+  process.stdout.write('\nThen, on that machine:\n')
+  steps.forEach((s, k) => {
+    process.stdout.write(`  ${k + 1}. ${s.title}\n`)
+    for (const c of s.commands) process.stdout.write(`       ${c}\n`)
+  })
+  process.stdout.write(`\nSetup, upgrade and uninstall help: ${base}/help\n`)
 }
 
 export function registerTeamCommands(program: Command): void {
@@ -122,7 +134,7 @@ export function registerTeamCommands(program: Command): void {
           const { person, enrollmentToken } = await store.addPerson({ name: opts.name, email: opts.email, team: opts.team })
           process.stdout.write(`Created ${person.name} (${person.id}). The token is single-use and expires in 7 days.\n\n`)
           process.stdout.write(`Enrollment token: ${enrollmentToken}\n\n`)
-          printSetupLines(await setupUrl(opts), enrollmentToken)
+          printSetupLines(await setupUrl(opts), enrollmentToken, await setupSteps(opts))
         })
       } catch (err) { fail(err) }
     })
@@ -166,7 +178,7 @@ export function registerTeamCommands(program: Command): void {
           process.stdout.write(`Enrollment token: ${token}
 
 `)
-          printSetupLines(await setupUrl(opts), token)
+          printSetupLines(await setupUrl(opts), token, await setupSteps(opts))
         })
       } catch (err) { fail(err) }
     })

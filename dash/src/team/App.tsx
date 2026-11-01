@@ -212,6 +212,9 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
               Set up another machine
             </a>
           ) : null}
+          <a href="/help" target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
+            Setup help
+          </a>
           {meta.viewer?.name ? <span>{meta.viewer.name}</span> : null}
           <Button onClick={onLogout}>Log out</Button>
         </div>

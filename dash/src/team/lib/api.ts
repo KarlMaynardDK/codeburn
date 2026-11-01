@@ -64,11 +64,15 @@ export type InstallInfo = {
   url: string
   install: { unix: string; windows: string } | null
   setup: string
+  /** What to run after setup, limited to what this server accepts. */
+  steps: SetupStep[]
   person: { name: string; email: string; team: string }
 }
+export type SetupStep = { title: string; note?: string; commands: string[] }
 export const getRegistration = () => request<Registration>('GET', '/api/team/registration')
-export const register = (team: string) => request<InstallInfo>('POST', '/api/team/registration', undefined, { team })
-export const newInstallToken = () => request<InstallInfo>('POST', '/api/team/registration/token', undefined, {})
+const withSteps = (info: InstallInfo): InstallInfo => ({ ...info, steps: info.steps ?? [] })
+export const register = (team: string) => request<InstallInfo>('POST', '/api/team/registration', undefined, { team }).then(withSteps)
+export const newInstallToken = () => request<InstallInfo>('POST', '/api/team/registration/token', undefined, {}).then(withSteps)
 
 // ---- Member profile --------------------------------------------------------
 export type Profile = {

@@ -142,6 +142,7 @@ main() {
   else
     printf '\\nInstalled. To connect this machine, ask your admin for an enrollment token and run:\\n  codeburn sync setup %s --token <token>\\n' "$BASE_URL"
   fi
+  printf '\\nWhat to run next, upgrading and uninstalling: %s/help\\n' "$BASE_URL"
 }
 
 main "$@"
@@ -213,6 +214,8 @@ if ($Token -ne '') {
   Write-Host 'Installed. To connect this machine, ask your admin for an enrollment token and run:'
   Write-Host "  codeburn sync setup $BaseUrl --token <token>"
 }
+Write-Host ''
+Write-Host "What to run next, upgrading and uninstalling: $BaseUrl/help"
 `
 }
 

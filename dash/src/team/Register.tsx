@@ -9,7 +9,7 @@ import { Button, ErrorNote, Loading } from './ui'
 
 const TEAM_MAX_LENGTH = 64
 
-function CopyLine({ label, text }: { label: string; text: string }) {
+function CopyLine({ label, text }: { label?: string; text: string }) {
   const [copied, setCopied] = useState(false)
   const copy = async () => {
     try {
@@ -22,10 +22,10 @@ function CopyLine({ label, text }: { label: string; text: string }) {
   }
   return (
     <div className="flex flex-col gap-1">
-      <div className="text-xs text-tertiary-foreground">{label}</div>
+      {label ? <div className="text-xs text-tertiary-foreground">{label}</div> : null}
       <div className="flex items-start gap-2">
         <code className="flex-1 select-all break-all rounded-md border border-border bg-outer-background px-3 py-2 font-mono text-xs">{text}</code>
-        <Button onClick={copy} title="Copy" aria-label={`Copy ${label}`}>
+        <Button onClick={copy} title="Copy" aria-label={`Copy ${label ?? text}`}>
           {copied ? <Check size={12} /> : <Copy size={12} />}
         </Button>
       </div>
@@ -74,6 +74,31 @@ function Instructions({ info }: { info: InstallInfo }) {
       ) : (
         <CopyLine label="With codeburn installed" text={info.setup} />
       )}
+      {info.steps.length ? (
+        <div className="flex flex-col gap-3 border-t border-border pt-4">
+          <p className="text-sm font-medium">Then, on that machine</p>
+          <p className="text-xs text-tertiary-foreground">
+            Setting up a machine resets your automatic-sync consent, so these finish the job. Run them in order.
+          </p>
+          <ol className="flex flex-col gap-4">
+            {info.steps.map((s, k) => (
+              <li key={s.title} className="flex flex-col gap-1.5">
+                <div className="text-sm">
+                  <span className="mr-1.5 text-tertiary-foreground">{k + 1}.</span>
+                  <strong>{s.title}</strong>
+                </div>
+                {s.note ? <div className="text-xs text-tertiary-foreground">{s.note}</div> : null}
+                {s.commands.map((c) => (
+                  <CopyLine key={c} text={c} />
+                ))}
+              </li>
+            ))}
+          </ol>
+        </div>
+      ) : null}
+      <a href="/help" target="_blank" rel="noopener noreferrer" className="text-sm text-primary hover:underline">
+        Full help: what is sent, upgrading, logging out and uninstalling
+      </a>
     </div>
   )
 }

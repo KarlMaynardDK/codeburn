@@ -250,6 +250,7 @@ describe.each(BACKENDS)('GitLab sign-in (%s)', backend => {
       const r = (await s.post('/api/team/registration', { team: 'core' })).json
       expect(r.install.unix).toBe(`curl -fsSL ${PUBLIC_URL}/install.sh | sh -s -- --token ${r.token}`)
       expect(r.install.windows).toContain(`irm ${PUBLIC_URL}/install.ps1`)
+      expect(r.steps.map((s: any) => s.commands[0])).toContain('codeburn sync auto enable --accept')
     })
 
     it('lets members create a fresh install token, invalidating the unused one', async () => {

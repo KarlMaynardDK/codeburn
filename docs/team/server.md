@@ -531,7 +531,15 @@ docker exec codeburn-team node dist/cli.js team admin add-viewer --name "Manager
 - `POST /v1/coaching`: `{captured_at, coaching}`, only when `accept_coaching` is on (404 `coaching_disabled` otherwise,
   400 `coaching_required` when `coaching` is not an object). The latest snapshot per person is kept.
 - `GET /auth/gitlab/login`, `GET /auth/gitlab/callback`: GitLab sign-in, only when it is configured (404 otherwise).
-- `/register`: the self-registration page (part of the viewer).
+- `/register`: the self-registration page (part of the viewer). Once a token exists it also lists what to run after
+  setup (choose what to send, `sync auto enable --accept`, `sync status`, `sync push --since all`), limited to the
+  options this server accepts (`accept_session_detail`, `accept_findings`, `accept_coaching`). `codeburn team admin
+  add-person` and `rotate-enrollment` print the same steps.
+- `GET /help`: a public, server-rendered help page for members: install and connect, finish setup, what is sent, changing
+  it, checking it, upgrading, another machine, logging out, uninstalling and troubleshooting. It shows the install
+  one-liners only when a client package is served and only the options this server accepts. It uses `public_url` (or
+  the validated Host header) for the server address, like the installers, and is linked from the dashboard header,
+  the install-token page and the installer scripts.
 - `/api/team/*`: viewer API (auth-methods, login, logout, meta, overview, people, models, tools, projects, sessions,
   work, insights, `coaching` (the per-person table behind the Insights page), `registration` / `registration/token` for self-registration, and `profile` for a member's own details:
   `GET` reads them and `POST {name?, team?, hidden_projects?}` changes them, with identity taken from the session). "Tokens" in these

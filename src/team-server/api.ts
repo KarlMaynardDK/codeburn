@@ -4,6 +4,7 @@ import { cleanProjectNames, type Person, type Store, type Viewer } from './store
 import { FailureLimiter, SESSION_COOKIE, clearedSessionCookie, isSameOriginRequest, readCookie, sessionCookie } from './auth.js'
 import { installerLines, setupCommand } from './client-package.js'
 import { registrationEnabled } from './gitlab.js'
+import { postSetupSteps } from './help.js'
 import { coachingOverview, computeInsights } from './insights.js'
 import * as rollup from './rollup.js'
 
@@ -43,6 +44,7 @@ function installResponse(ctx: ApiContext, person: Pick<Person, 'name' | 'email' 
     url,
     install: ctx.installers ? installerLines(url, token) : null,
     setup: setupCommand(url, token),
+    steps: postSetupSteps(ctx.config),
     person: { name: person.name, email: person.email, team: person.team },
   }
 }

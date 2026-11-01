@@ -156,6 +156,7 @@ describe('add-person / rotate-enrollment output', () => {
     expect(out).toContain(`curl -fsSL https://cb.example.com/install.sh | sh -s -- --token ${token}`)
     expect(out).toContain(`& ([scriptblock]::Create((irm https://cb.example.com/install.ps1))) -Token ${token}`)
     expect(out).toContain(`codeburn sync setup https://cb.example.com --token ${token}`)
+    expect(out).toContain('codeburn sync push --since all')
     const id = /Created Ada \(([^)]+)\)/.exec(out)?.[1]
     expect(id).toBeTruthy()
     const out2 = await run(['rotate-enrollment', id!, '--data-dir', dir, '--url', 'https://cb.example.com'])
