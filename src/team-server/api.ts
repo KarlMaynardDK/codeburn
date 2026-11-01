@@ -4,7 +4,7 @@ import { cleanProjectNames, type Person, type Store, type Viewer } from './store
 import { FailureLimiter, SESSION_COOKIE, clearedSessionCookie, isSameOriginRequest, readCookie, sessionCookie } from './auth.js'
 import { installerLines, setupCommand } from './client-package.js'
 import { registrationEnabled } from './gitlab.js'
-import { computeInsights } from './insights.js'
+import { coachingOverview, computeInsights } from './insights.js'
 import * as rollup from './rollup.js'
 
 export function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string | string[]> = {}): void {
@@ -204,6 +204,7 @@ export async function handleApi(ctx: ApiContext, req: IncomingMessage, res: Serv
     org_name: config.org_name,
     detail_levels: config.accept_session_detail ? ['summary', 'sessions'] : ['summary'],
     accept_findings: config.accept_findings,
+    accept_coaching: config.accept_coaching,
     viewer: { name: viewer.name, role: viewer.role },
     registration: registrationEnabled(config.gitlab),
   }
@@ -256,7 +257,10 @@ export async function handleApi(ctx: ApiContext, req: IncomingMessage, res: Serv
     return sendJson(res, 200, await rollup.work(store, filters))
   }
   if (path === '/api/team/insights') {
-    return sendJson(res, 200, await computeInsights(store, filters, { includeFindings: config.accept_findings }))
+    return sendJson(res, 200, await computeInsights(store, filters, { includeFindings: config.accept_findings, includeCoaching: config.accept_coaching }))
+  }
+  if (path === '/api/team/coaching') {
+    return sendJson(res, 200, await coachingOverview(store, filters, { includeCoaching: config.accept_coaching }))
   }
   return sendJson(res, 404, { error: 'not_found' })
 }

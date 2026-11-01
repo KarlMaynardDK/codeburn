@@ -8,6 +8,7 @@ import { FailureLimiter, OAUTH_COOKIE, bearer, clearedOauthCookie, clientVersion
 import { installPs1Script, installShScript, originFromRequest, type ClientPackage } from './client-package.js'
 import { assertServeConfig, type TeamServerConfig } from './config.js'
 import { checkState, completeLogin, decideAccess, startLogin } from './gitlab.js'
+import { parseCoaching } from './coaching.js'
 import { ingestOtlp } from './ingest.js'
 import type { Store } from './store.js'
 
@@ -91,6 +92,7 @@ export function discoveryDoc(config: TeamServerConfig, pkg?: ClientPackage) {
     max_batch_size: MAX_BATCH_SIZE,
     detail_levels: config.accept_session_detail ? ['summary', 'sessions'] : ['summary'],
     ...(config.accept_findings ? { findings_path: '/v1/findings' } : {}),
+    ...(config.accept_coaching ? { coaching_path: '/v1/coaching' } : {}),
     org_name: config.org_name,
     ...(pkg ? { client_package: { version: pkg.version, sha256: pkg.sha256, path: pkg.path } } : {}),
   }
@@ -178,7 +180,7 @@ export function createTeamServer(opts: TeamServerOptions): Server {
       return sendJson(res, 200, { ok: true })
     }
 
-    if (path === '/v1/traces' || path === '/v1/findings') {
+    if (path === '/v1/traces' || path === '/v1/findings' || path === '/v1/coaching') {
       if (method !== 'POST') return sendJson(res, 405, { error: 'method_not_allowed' })
       const cred = bearer(req)
       const identity = cred ? await store.authenticateDevice(cred, clientVersion(req)) : null
@@ -192,6 +194,18 @@ export function createTeamServer(opts: TeamServerOptions): Server {
         const captured = typeof body.captured_at === 'string' && !Number.isNaN(Date.parse(body.captured_at))
           ? new Date(body.captured_at).toISOString() : new Date().toISOString()
         await store.saveFindings(identity.personId, captured, JSON.stringify(body.findings))
+        return sendJson(res, 200, { ok: true })
+      }
+
+      if (path === '/v1/coaching') {
+        if (!config.accept_coaching) return sendJson(res, 404, { error: 'coaching_disabled' })
+        const body = await readJson(req, res)
+        if (!body) return
+        const snapshot = parseCoaching(body.coaching)
+        if (!snapshot) return sendJson(res, 400, { error: 'coaching_required' })
+        const captured = typeof body.captured_at === 'string' && !Number.isNaN(Date.parse(body.captured_at))
+          ? new Date(body.captured_at).toISOString() : new Date().toISOString()
+        await store.saveCoaching(identity.personId, captured, JSON.stringify(snapshot))
         return sendJson(res, 200, { ok: true })
       }
 

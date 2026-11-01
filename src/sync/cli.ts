@@ -10,6 +10,7 @@ import { randomBytes } from 'crypto'
 import { fetchDiscoveryDoc, DiscoveryError, effectiveDetailLevel, type CodeburnDiscoveryDoc, type DetailLevel } from './discovery.js'
 import { enrollDevice, EnrollError, revokeDevice } from './enroll.js'
 import { maybeSendFindings } from './findings.js'
+import { maybeSendCoaching } from './coaching.js'
 import {
   AuthError,
   fetchOidcConfig,
@@ -99,6 +100,7 @@ async function resolveAccessToken(config: Config, store: ReturnType<typeof creat
 function refreshServerCapabilities(config: Config, discovery: CodeburnDiscoveryDoc): void {
   const same = JSON.stringify(config.detailLevels ?? null) === JSON.stringify(discovery.detail_levels)
     && config.findingsPath === discovery.findings_path
+    && config.coachingPath === discovery.coaching_path
     && JSON.stringify(config.clientPackage ?? null) === JSON.stringify(discovery.client_package ?? null)
   if (same) return
   if (discovery.client_package) config.clientPackage = discovery.client_package
@@ -106,6 +108,8 @@ function refreshServerCapabilities(config: Config, discovery: CodeburnDiscoveryD
   config.detailLevels = discovery.detail_levels
   if (discovery.findings_path) config.findingsPath = discovery.findings_path
   else delete config.findingsPath
+  if (discovery.coaching_path) config.coachingPath = discovery.coaching_path
+  else delete config.coachingPath
   writeSyncConfig(config)
 }
 
@@ -166,6 +170,7 @@ async function executePush(input: ExecutePushInput): Promise<{ result: PushResul
   if (result.outcome === 'complete') {
     updateLastSync()
     await maybeSendFindings({ config, findingsPath: discoveryDoc.findings_path, bearer: tokens.access_token, log })
+    await maybeSendCoaching({ config, coachingPath: discoveryDoc.coaching_path, bearer: tokens.access_token, log })
   }
 
   return { result, attrResult, attrFacts }
@@ -188,6 +193,7 @@ function buildAcceptanceFingerprintInput(
     cadence,
     ...(detailLevel ? { detailLevel } : {}),
     shareFindings: config.shareFindings === true && !!config.findingsPath,
+    ...(config.shareCoaching === true && !!config.coachingPath ? { shareCoaching: true } : {}),
   }
 }
 
@@ -232,7 +238,8 @@ export function registerSyncCommands(program: Command): void {
     .option('--token <token>', 'One-time enrollment token (team servers)')
     .option('--detail <level>', 'Detail level to send: summary (default) or sessions')
     .option('--share-findings', 'Upload a daily snapshot of `codeburn optimize` findings (when the server accepts them)')
-    .action(async (url: string, opts: { token?: string; detail?: string; shareFindings?: boolean }) => {
+    .option('--share-coaching', 'Upload a daily snapshot of workflow counts (prompts, corrections, time to first edit, reworked files; no text or paths) when the server accepts them')
+    .action(async (url: string, opts: { token?: string; detail?: string; shareFindings?: boolean; shareCoaching?: boolean }) => {
       try {
         const baseUrl = url.replace(/\/$/, '')
         if (opts.detail !== undefined && opts.detail !== 'summary' && opts.detail !== 'sessions') {
@@ -242,6 +249,7 @@ export function registerSyncCommands(program: Command): void {
         const clientPrefs = {
           ...(opts.detail ? { detailLevel: opts.detail as DetailLevel } : {}),
           shareFindings: opts.shareFindings === true,
+          shareCoaching: opts.shareCoaching === true,
         }
         // Setup writes a fresh config, which drops any auto-sync acceptance.
         const previous = readSyncConfig()
@@ -269,6 +277,7 @@ export function registerSyncCommands(program: Command): void {
             enrollPath: discovery.enroll_path,
             detailLevels: discovery.detail_levels,
             ...(discovery.findings_path ? { findingsPath: discovery.findings_path } : {}),
+            ...(discovery.coaching_path ? { coachingPath: discovery.coaching_path } : {}),
             ...(discovery.org_name ? { orgName: discovery.org_name } : {}),
             ...(discovery.client_package ? { clientPackage: discovery.client_package } : {}),
             ...clientPrefs,
@@ -282,6 +291,11 @@ export function registerSyncCommands(program: Command): void {
             process.stderr.write(discovery.findings_path
               ? `  Findings sharing: on\n`
               : `  Findings sharing: requested, but this server does not accept findings\n`)
+          }
+          if (clientPrefs.shareCoaching) {
+            process.stderr.write(discovery.coaching_path
+              ? `  Coaching stats sharing: on\n`
+              : `  Coaching stats sharing: requested, but this server does not accept coaching stats\n`)
           }
           process.stderr.write(`\nRun \`codeburn sync push\` to send telemetry data.\n`)
           if (hadAutoSync) process.stderr.write(autoSyncReminder)
@@ -385,6 +399,7 @@ export function registerSyncCommands(program: Command): void {
           authMode: 'oidc',
           detailLevels: discovery.detail_levels,
           ...(discovery.findings_path ? { findingsPath: discovery.findings_path } : {}),
+          ...(discovery.coaching_path ? { coachingPath: discovery.coaching_path } : {}),
           ...clientPrefs,
         })
 
@@ -432,6 +447,7 @@ export function registerSyncCommands(program: Command): void {
       process.stdout.write(`Detail levels (server allows): ${(config.detailLevels ?? (config.authMode === 'enrollment' ? ['summary'] : ['summary', 'sessions'])).join(', ')}\n`)
       process.stdout.write(`Detail level (effective): ${effectiveLevelFor(config)}\n`)
       process.stdout.write(`Share findings: ${config.shareFindings ? 'on' : 'off'}${config.shareFindings && !config.findingsPath ? ' (server does not accept findings)' : ''}${config.lastFindingsSent ? `, last sent ${config.lastFindingsSent}` : ''}\n`)
+      process.stdout.write(`Share coaching: ${config.shareCoaching ? 'on' : 'off'}${config.shareCoaching && !config.coachingPath ? ' (server does not accept coaching stats)' : ''}${config.lastCoachingSent ? `, last sent ${config.lastCoachingSent}` : ''}\n`)
       process.stdout.write(`Token storage: ${store.method()}\n`)
       process.stdout.write(`Last sync: ${config.lastSync ?? 'never'}\n`)
       const buildNotice = teamBuildNotice(config)
@@ -445,7 +461,7 @@ export function registerSyncCommands(program: Command): void {
   // --- config ---
   const configCmd = sync
     .command('config')
-    .description('Change what sync sends (detail level, findings)')
+    .description('Change what sync sends (detail level, findings, coaching stats)')
 
   configCmd
     .command('detail <level>')
@@ -492,6 +508,30 @@ export function registerSyncCommands(program: Command): void {
       process.stdout.write(`Findings sharing ${state}.\n`)
       if (state === 'on' && !config.findingsPath) {
         process.stderr.write('Note: this server does not currently accept findings; nothing will be uploaded.\n')
+      }
+      if (config.auto?.accepted) {
+        process.stderr.write('Automatic sync will pause until you accept the changed disclosure: codeburn sync auto enable --accept\n')
+      }
+    })
+
+  configCmd
+    .command('coaching <state>')
+    .description('Turn coaching stats sharing (counts only) on or off')
+    .action((state: string) => {
+      const config = readSyncConfig()
+      if (!config) {
+        process.stderr.write('Sync not configured. Run `codeburn sync setup <url>` first.\n')
+        process.exit(1)
+      }
+      if (state !== 'on' && state !== 'off') {
+        process.stderr.write('Invalid value. Use: on or off\n')
+        process.exit(1)
+      }
+      config.shareCoaching = state === 'on'
+      writeSyncConfig(config)
+      process.stdout.write(`Coaching stats sharing ${state}.\n`)
+      if (state === 'on' && !config.coachingPath) {
+        process.stderr.write('Note: this server does not currently accept coaching stats; nothing will be uploaded.\n')
       }
       if (config.auto?.accepted) {
         process.stderr.write('Automatic sync will pause until you accept the changed disclosure: codeburn sync auto enable --accept\n')
@@ -673,7 +713,7 @@ export function registerSyncCommands(program: Command): void {
           if (frozen.length > 0) {
             process.stderr.write(`[dry-run] ${frozen.length} Copilot calls frozen: their sessions were already synced in the other shape (rollup vs per-request), and a usage span cannot be retracted. See docs/sync/README.md.\n`)
           }
-          process.stderr.write(`[dry-run] Detail level: ${detailLevel}${detailLevel === 'summary' ? ' (no session ids, tools or durations; hour-rounded times)' : ''}; findings sharing: ${config.shareFindings && (discoveryDoc?.findings_path ?? config.findingsPath) ? 'on' : 'off'}\n`)
+          process.stderr.write(`[dry-run] Detail level: ${detailLevel}${detailLevel === 'summary' ? ' (no session ids, tools or durations; hour-rounded times)' : ''}; findings sharing: ${config.shareFindings && (discoveryDoc?.findings_path ?? config.findingsPath) ? 'on' : 'off'}; coaching stats sharing: ${config.shareCoaching && (discoveryDoc?.coaching_path ?? config.coachingPath) ? 'on' : 'off'}\n`)
           process.stderr.write(`[dry-run] Would push ${toPushCount} calls ($${cost.toFixed(2)}) to ${config.baseUrl}${config.tracesPath}\n`)
           const toPushList = unsent.slice(0, MAX_PER_PUSH)
           const withLineage = toPushList.filter(c => c.session?.workUnitId !== undefined).length
@@ -749,6 +789,7 @@ export function registerSyncCommands(program: Command): void {
             : `Nothing to push (${allCalls.length} calls already synced).\n`)
           updateLastSync()
           await maybeSendFindings({ config, findingsPath: discoveryDoc?.findings_path, bearer: tokens.access_token, log: msg => process.stderr.write(`${msg}\n`) })
+          await maybeSendCoaching({ config, coachingPath: discoveryDoc?.coaching_path, bearer: tokens.access_token, log: msg => process.stderr.write(`${msg}\n`) })
           const buildNotice = teamBuildNotice(config)
           if (buildNotice) process.stderr.write(buildNotice)
           return
@@ -836,6 +877,7 @@ export function registerSyncCommands(program: Command): void {
         // Findings ride after a successful usage push, at most once a day.
         if (result.outcome === 'complete') {
           await maybeSendFindings({ config, findingsPath: sendDiscovery.findings_path, bearer: tokens.access_token, log: msg => process.stderr.write(`${msg}\n`) })
+          await maybeSendCoaching({ config, coachingPath: sendDiscovery.coaching_path, bearer: tokens.access_token, log: msg => process.stderr.write(`${msg}\n`) })
         }
 
         // Summary
@@ -917,6 +959,7 @@ export function registerSyncCommands(program: Command): void {
           scopeSinceDays: 7,
           detailLevel: fingerprintInput.detailLevel,
           shareFindings: fingerprintInput.shareFindings,
+          shareCoaching: fingerprintInput.shareCoaching,
         }
 
         const disclosure = buildDisclosure(disclosureInput)

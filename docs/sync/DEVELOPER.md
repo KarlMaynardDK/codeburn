@@ -275,10 +275,10 @@ This is a **test fixture**, not a production reference. Any OIDC provider + OTLP
 A discovery doc with `"auth": "enrollment"` selects the self-hosted team server flow instead of OIDC.
 `issuer` / `client_id` / `scopes` are then absent; `enroll_path` is required. Optional fields (all additive, version stays 1):
 `detail_levels` (`["summary"]` or `["summary","sessions"]`, default `["summary"]` for enrollment servers),
-`findings_path` (present only when the server accepts findings), `org_name`, `revoke_path`, `client_package`.
+`findings_path` and `coaching_path` (present only when the server accepts them), `org_name`, `revoke_path`, `client_package`.
 Legacy OIDC docs that omit `detail_levels` are treated as `["summary","sessions"]`, so existing deployments keep receiving the full span set.
 
-`codeburn sync setup <url> --token <enrollment> [--detail summary|sessions] [--share-findings]`:
+`codeburn sync setup <url> --token <enrollment> [--detail summary|sessions] [--share-findings] [--share-coaching]`:
 
 1. Fetch discovery. If `auth !== "enrollment"` the OIDC browser flow runs unchanged (`--token` is ignored).
 2. `POST {enroll_path}` with `{ token, label: <hostname>, device_id: <codeburn device id> }`.
@@ -298,10 +298,21 @@ Every discovery refresh stores `client_package` in `sync.json` (`clientPackage`)
 compare its version with the running CLI (`teamBuildNotice`) and point at `codeburn update` on any difference,
 matching update's rule that the server's version wins, including rollbacks.
 
+## Coaching snapshot
+
+`src/sync/coaching.ts`. With `shareCoaching` on and the server advertising `coaching_path`, a successful push is followed
+by at most one upload per UTC day (`lastCoachingSent`) of numbers computed from the same functions `codeburn report`
+uses (`scanUserCorrections`, `medianTimeToFirstEditMs`, `aggregateFileChurn` in `src/workflow-insights.ts`, which this
+feature does not change): prompts, corrections, sessions with edits, median time to first edit, and how many files were
+edited in 3 or more sessions (with the busiest file's session and edit counts). `sanitizeCoachingReport` is an explicit
+allow-list of numbers plus the period label, so prompt text, file names and paths cannot be sent. `shareCoaching` is part
+of the acceptance fingerprint only when true, so existing acceptances keep matching; turning it on needs a new
+acceptance, turning it off does not. A failed upload never fails the push.
+
 ## Detail levels
 
-Client settings (in `sync.json`): `detailLevel` (`summary` | `sessions`) and `shareFindings`. Change them with
-`codeburn sync config detail <summary|sessions>` and `codeburn sync config findings <on|off>`.
+Client settings (in `sync.json`): `detailLevel` (`summary` | `sessions`), `shareFindings` and `shareCoaching`. Change them with
+`codeburn sync config detail <summary|sessions>`, `codeburn sync config findings <on|off>` and `codeburn sync config coaching <on|off>`.
 The effective level is the client setting clamped to the server's `detail_levels` (`effectiveDetailLevel` in `discovery.ts`).
 Enrollment configs default to `summary`; OIDC configs with no explicit choice keep the legacy wire (below).
 `sync status` prints the client setting, server-allowed levels, effective level and findings flag.

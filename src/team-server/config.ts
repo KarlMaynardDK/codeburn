@@ -5,6 +5,8 @@ import { join, resolve } from 'node:path'
 export interface TeamServerConfig {
   accept_session_detail: boolean
   accept_findings: boolean
+  /** Accept the daily coaching snapshot (prompt, correction and rework counts) clients send with `sync coaching on`. */
+  accept_coaching: boolean
   retention_days: number
   org_name: string
   /** Optional; the --database-url flag and CODEBURN_TEAM_DATABASE_URL take precedence. */
@@ -84,6 +86,7 @@ function gitlabConfig(raw: unknown): GitlabConfig | undefined {
 export const DEFAULT_CONFIG: TeamServerConfig = {
   accept_session_detail: false,
   accept_findings: false,
+  accept_coaching: false,
   retention_days: 400,
   org_name: '',
 }
@@ -102,7 +105,7 @@ function envBool(name: string): boolean | undefined {
 }
 
 /**
- * Environment overrides (CODEBURN_TEAM_ACCEPT_SESSION_DETAIL, CODEBURN_TEAM_ACCEPT_FINDINGS,
+ * Environment overrides (CODEBURN_TEAM_ACCEPT_SESSION_DETAIL, CODEBURN_TEAM_ACCEPT_FINDINGS, CODEBURN_TEAM_ACCEPT_COACHING,
  * CODEBURN_TEAM_RETENTION_DAYS, CODEBURN_TEAM_ORG_NAME, CODEBURN_TEAM_PUBLIC_URL, CODEBURN_TEAM_GITLAB_*) win over
  * team-server.json, so container deployments can be configured without editing a file inside the data volume.
  */
@@ -111,6 +114,8 @@ function applyEnv(cfg: TeamServerConfig, rawGitlab?: unknown): TeamServerConfig 
   if (session !== undefined) cfg.accept_session_detail = session
   const findings = envBool('CODEBURN_TEAM_ACCEPT_FINDINGS')
   if (findings !== undefined) cfg.accept_findings = findings
+  const coaching = envBool('CODEBURN_TEAM_ACCEPT_COACHING')
+  if (coaching !== undefined) cfg.accept_coaching = coaching
   const days = Number(process.env.CODEBURN_TEAM_RETENTION_DAYS)
   if (Number.isFinite(days) && days > 0) cfg.retention_days = Math.floor(days)
   const org = process.env.CODEBURN_TEAM_ORG_NAME
@@ -138,6 +143,7 @@ export function loadConfig(dataDir: string): TeamServerConfig {
   const cfg: TeamServerConfig = { ...DEFAULT_CONFIG }
   if (typeof raw.accept_session_detail === 'boolean') cfg.accept_session_detail = raw.accept_session_detail
   if (typeof raw.accept_findings === 'boolean') cfg.accept_findings = raw.accept_findings
+  if (typeof raw.accept_coaching === 'boolean') cfg.accept_coaching = raw.accept_coaching
   if (typeof raw.retention_days === 'number' && raw.retention_days > 0) cfg.retention_days = Math.floor(raw.retention_days)
   if (typeof raw.org_name === 'string') cfg.org_name = raw.org_name
   if (typeof raw.database_url === 'string' && raw.database_url) cfg.database_url = raw.database_url

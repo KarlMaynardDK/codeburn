@@ -31,8 +31,16 @@ describe('team server config env overrides', () => {
     vi.stubEnv('CODEBURN_TEAM_RETENTION_DAYS', '-5')
     vi.stubEnv('CODEBURN_TEAM_ORG_NAME', '')
     expect(loadConfig(dir)).toEqual({
-      accept_session_detail: true, accept_findings: false, retention_days: 400, org_name: '',
+      accept_session_detail: true, accept_findings: false, accept_coaching: false, retention_days: 400, org_name: '',
     })
+  })
+
+  it('reads accept_coaching from the file and the environment', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cb-team-cfg-'))
+    await writeFile(join(dir, 'team-server.json'), JSON.stringify({ accept_coaching: true }))
+    expect(loadConfig(dir).accept_coaching).toBe(true)
+    vi.stubEnv('CODEBURN_TEAM_ACCEPT_COACHING', 'off')
+    expect(loadConfig(dir).accept_coaching).toBe(false)
   })
 })
 

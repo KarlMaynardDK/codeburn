@@ -91,6 +91,7 @@ export type Meta = {
   org_name?: string
   detail_levels?: string[]
   accept_findings?: boolean
+  accept_coaching?: boolean
   viewer?: { name: string; role?: Role }
   /** Set for members: the only person they can see. */
   person_id?: string
@@ -175,8 +176,48 @@ export type MatrixCell = { model: string; category: string; cost: number; tokens
 export type ModelsData = { matrix: MatrixCell[]; by_model: Breakdown[] }
 export type ProjectRow = { project: string; cost: number; tokens: number; calls: number; people: number; top_person?: string | null }
 export type SessionRow = { trace_id: string; person: string; project: string; started: string; duration_ms: number; calls: number; cost: number }
-export type Insight = { id: string; severity: 'info' | 'warn'; title: string; detail: string; person?: string; value?: number }
-export type Finding = { title: string; people: number; estimated_savings_usd: number }
+export type EvidenceTable = { title: string; columns: string[]; rows: string[][] }
+export type InsightKind = 'training' | 'cost' | 'setup'
+export type Insight = {
+  id: string
+  severity: 'info' | 'warn'
+  kind: InsightKind
+  title: string
+  detail: string
+  person?: string
+  person_id?: string
+  value?: number
+  evidence?: EvidenceTable[]
+  action?: string
+}
+export type Finding = { title: string; people: number; names?: string[]; estimated_savings_usd: number }
+export type CoachingRow = {
+  person_id: string
+  name: string
+  team: string
+  cost: number
+  edit_turns: number
+  one_shot_rate: number | null
+  retries_per_edit: number | null
+  plan_share: number | null
+  interrupted_rate: number | null
+  cache_ratio: number | null
+  premium_simple_share: number | null
+  tool_error_rate: number | null
+  corrections_rate: number | null
+  median_time_to_first_edit_ms: number | null
+  reworked_files: number | null
+  flags: string[]
+}
+export type TeamMedians = {
+  one_shot_rate: number | null
+  retries_per_edit: number | null
+  plan_share: number | null
+  interrupted_rate: number | null
+  cache_ratio: number | null
+  tool_error_rate: number | null
+}
+export type CoachingData = { rows: CoachingRow[]; medians: TeamMedians; coaching_enabled: boolean }
 
 // ---- Endpoints (each normalises missing arrays so the UI never crashes) ----
 export type Filters = { from: string; to: string; team?: string; person?: string; project?: string }
@@ -243,4 +284,10 @@ export async function getWork(x: Filters): Promise<WorkData> {
 export async function getInsights(x: Filters): Promise<{ insights: Insight[]; findings: Finding[] }> {
   const r = await request<{ insights?: Insight[]; findings?: Finding[] }>('GET', '/api/team/insights', f(x))
   return { insights: r.insights ?? [], findings: r.findings ?? [] }
+}
+
+export async function getCoaching(x: Filters): Promise<CoachingData> {
+  const r = await request<Partial<CoachingData>>('GET', '/api/team/coaching', f(x))
+  const none = { one_shot_rate: null, retries_per_edit: null, plan_share: null, interrupted_rate: null, cache_ratio: null, tool_error_rate: null }
+  return { rows: r.rows ?? [], medians: r.medians ?? none, coaching_enabled: r.coaching_enabled === true }
 }

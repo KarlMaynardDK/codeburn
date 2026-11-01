@@ -118,6 +118,8 @@ export function schemaStatements(real: string, int: string): string[] {
     `CREATE INDEX IF NOT EXISTS daily_names_day ON daily_names (day)`,
     `CREATE TABLE IF NOT EXISTS sessions (trace_id TEXT NOT NULL, person_id TEXT NOT NULL, project TEXT NOT NULL, started TEXT NOT NULL, duration_ms ${int} NOT NULL, calls ${int} NOT NULL, cost ${real} NOT NULL, PRIMARY KEY (person_id, trace_id))`,
     `CREATE TABLE IF NOT EXISTS findings (person_id TEXT PRIMARY KEY, captured_at TEXT NOT NULL, json TEXT NOT NULL)`,
+    // The latest coaching snapshot per person (counts the client computed locally: corrections, time to first edit, rework).
+    `CREATE TABLE IF NOT EXISTS coaching (person_id TEXT PRIMARY KEY, captured_at TEXT NOT NULL, json TEXT NOT NULL)`,
     // Git attribution (`codeburn sync push --attribution`): which repo and PRs a session worked on, and its commits.
     `CREATE TABLE IF NOT EXISTS work_sessions (person_id TEXT NOT NULL, trace_id TEXT NOT NULL, repo TEXT NOT NULL, project TEXT NOT NULL, started TEXT NOT NULL, ended TEXT NOT NULL, commit_count ${int} NOT NULL, pr_links TEXT NOT NULL, hidden ${int} NOT NULL DEFAULT 0, PRIMARY KEY (person_id, trace_id))`,
     // Projects a member chose to hide: their spans show as 'unknown' to everyone, admins included.
@@ -502,6 +504,11 @@ export class Store {
          SELECT ?, captured_at, json FROM findings WHERE person_id = ? AND 1=1
          ON CONFLICT (person_id) DO NOTHING`, [toId, fromId])
       await q.all('DELETE FROM findings WHERE person_id = ?', [fromId])
+      await q.all(
+        `INSERT INTO coaching (person_id, captured_at, json)
+         SELECT ?, captured_at, json FROM coaching WHERE person_id = ? AND 1=1
+         ON CONFLICT (person_id) DO NOTHING`, [toId, fromId])
+      await q.all('DELETE FROM coaching WHERE person_id = ?', [fromId])
       const devices = await q.all('UPDATE devices SET person_id = ? WHERE person_id = ? RETURNING id', [toId, fromId])
       await q.all('UPDATE sso_sessions SET person_id = ? WHERE person_id = ?', [toId, fromId])
       await q.all('DELETE FROM enrollments WHERE person_id = ? AND used_at IS NULL', [fromId])
@@ -521,7 +528,7 @@ export class Store {
       const [c] = await q.all('SELECT COUNT(*) AS n FROM spans WHERE person_id = ?', [id])
       const spans = Number(c?.n ?? 0)
       if (spans > 0 && !force) return { deleted: false as const, reason: 'has_usage' as const, spans }
-      for (const t of ['spans', 'daily_usage', 'daily_names', 'sessions', 'findings', 'work_sessions', 'work_commits', 'hidden_projects', 'devices', 'enrollments', 'sso_sessions']) {
+      for (const t of ['spans', 'daily_usage', 'daily_names', 'sessions', 'findings', 'coaching', 'work_sessions', 'work_commits', 'hidden_projects', 'devices', 'enrollments', 'sso_sessions']) {
         await q.all(`DELETE FROM ${t} WHERE person_id = ?`, [id])
       }
       await q.all('DELETE FROM people WHERE id = ?', [id])
@@ -783,6 +790,12 @@ export class Store {
   async saveFindings(personId: string, capturedAt: string, json: string): Promise<void> {
     await this.all(
       `INSERT INTO findings (person_id, captured_at, json) VALUES (?, ?, ?)
+       ON CONFLICT (person_id) DO UPDATE SET captured_at = excluded.captured_at, json = excluded.json`, [personId, capturedAt, json])
+  }
+
+  async saveCoaching(personId: string, capturedAt: string, json: string): Promise<void> {
+    await this.all(
+      `INSERT INTO coaching (person_id, captured_at, json) VALUES (?, ?, ?)
        ON CONFLICT (person_id) DO UPDATE SET captured_at = excluded.captured_at, json = excluded.json`, [personId, capturedAt, json])
   }
 

@@ -19,6 +19,8 @@ export interface CodeburnDiscoveryDoc {
   /** Detail levels the server accepts. Defaults to ["summary"]. */
   detail_levels: DetailLevel[]
   findings_path?: string
+  /** Where a coaching snapshot (counts only) is uploaded, when the server accepts it. */
+  coaching_path?: string
   org_name?: string
   /** The CLI build a team server distributes (self-hosted team servers only). */
   client_package?: ClientPackageInfo
@@ -136,6 +138,7 @@ export function parseDiscoveryDoc(raw: unknown): CodeburnDiscoveryDoc {
     ...(enrollment ? { auth: 'enrollment' as const, enroll_path: doc.enroll_path as string } : {}),
     ...(enrollment && typeof doc.revoke_path === 'string' && doc.revoke_path.startsWith('/') ? { revoke_path: doc.revoke_path } : {}),
     ...(typeof doc.findings_path === 'string' && doc.findings_path.startsWith('/') ? { findings_path: doc.findings_path } : {}),
+    ...(typeof doc.coaching_path === 'string' && doc.coaching_path.startsWith('/') ? { coaching_path: doc.coaching_path } : {}),
     ...(typeof doc.org_name === 'string' && doc.org_name ? { org_name: doc.org_name.slice(0, 200) } : {}),
     ...(client_package ? { client_package } : {}),
   }

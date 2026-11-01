@@ -23,6 +23,7 @@ export interface SyncConfig {
   /** Detail levels the server advertised at setup/last discovery. */
   detailLevels?: DetailLevel[]
   findingsPath?: string
+  coachingPath?: string
   orgName?: string
   /** CLI build advertised by the team server at last discovery; `codeburn update` installs it. */
   clientPackage?: ClientPackageInfo
@@ -32,6 +33,10 @@ export interface SyncConfig {
   shareFindings?: boolean
   /** YYYY-MM-DD (UTC) of the last successful findings upload. */
   lastFindingsSent?: string
+  /** Whether to share coaching stats: counts only, never text or paths (needs coachingPath). Default off. */
+  shareCoaching?: boolean
+  /** YYYY-MM-DD (UTC) of the last successful coaching upload. */
+  lastCoachingSent?: string
   /** Team enrollments install the server's CLI build before a scheduled push. Default on; false turns it off. */
   autoUpdate?: boolean
   auto?: AutoSyncConfig
@@ -73,11 +78,14 @@ export function readSyncConfig(): SyncConfig | null {
         ? { detailLevels: data.detailLevels.filter((l): l is DetailLevel => l === 'summary' || l === 'sessions') }
         : {}),
       ...(typeof data.findingsPath === 'string' ? { findingsPath: data.findingsPath } : {}),
+      ...(typeof data.coachingPath === 'string' ? { coachingPath: data.coachingPath } : {}),
       ...(typeof data.orgName === 'string' ? { orgName: data.orgName } : {}),
       ...(parseClientPackage(data.clientPackage) ? { clientPackage: parseClientPackage(data.clientPackage)! } : {}),
       ...(data.detailLevel === 'summary' || data.detailLevel === 'sessions' ? { detailLevel: data.detailLevel } : {}),
       ...(typeof data.shareFindings === 'boolean' ? { shareFindings: data.shareFindings } : {}),
       ...(typeof data.lastFindingsSent === 'string' ? { lastFindingsSent: data.lastFindingsSent } : {}),
+      ...(typeof data.shareCoaching === 'boolean' ? { shareCoaching: data.shareCoaching } : {}),
+      ...(typeof data.lastCoachingSent === 'string' ? { lastCoachingSent: data.lastCoachingSent } : {}),
       ...(typeof data.autoUpdate === 'boolean' ? { autoUpdate: data.autoUpdate } : {}),
       auto: typeof data.auto === 'object' && data.auto ? (data.auto as AutoSyncConfig) : undefined,
     }

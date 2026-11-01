@@ -78,6 +78,8 @@ export interface FingerprintInput {
   detailLevel?: 'summary' | 'sessions'
   /** Whether optimize findings are uploaded after a push. Default false. */
   shareFindings?: boolean
+  /** Whether coaching stats (counts only) are uploaded after a push. Default false. */
+  shareCoaching?: boolean
 }
 
 export function computeAcceptanceFingerprint(input: FingerprintInput): string {
@@ -98,6 +100,8 @@ export function computeAcceptanceFingerprint(input: FingerprintInput): string {
       shareFindings: input.shareFindings ?? false,
     })
   }
+  // Added only when on, so every acceptance stored before coaching existed keeps matching.
+  if (input.shareCoaching) Object.assign(canonical, { shareCoaching: true })
   const json = JSON.stringify(canonical)
   return createHash('sha256').update(json).digest('hex')
 }
@@ -111,6 +115,7 @@ export interface DisclosureInput {
   scopeSinceDays: number | null
   detailLevel?: 'summary' | 'sessions'
   shareFindings?: boolean
+  shareCoaching?: boolean
 }
 
 export function buildDisclosure(input: DisclosureInput): string {
@@ -133,6 +138,10 @@ export function buildDisclosure(input: DisclosureInput): string {
     ? 'on - a daily snapshot of `codeburn optimize` findings is uploaded: finding id, title, severity, trend, estimated savings (tokens and USD) and period totals only; never file paths, file names, commands, snippets or explanations'
     : 'off'
 
+  const coachingText = input.shareCoaching
+    ? 'on - a daily snapshot is uploaded, counts only: number of prompts, number of times you corrected the assistant, number of sessions with edits, median time to first edit, and how many files were reworked across sessions; never prompt text, file names or paths'
+    : 'off'
+
   const fieldsList = input.outboundFields.length > 0
     ? input.outboundFields
       .map(f => `  ${f.key}: ${f.disclosure}`)
@@ -147,6 +156,7 @@ export function buildDisclosure(input: DisclosureInput): string {
     `Work matching: ${workMatchingText}`,
     `Detail level: ${detailText}`,
     `Share findings: ${findingsText}`,
+    `Share coaching stats: ${coachingText}`,
     '',
     'Data sent to the endpoint:',
     fieldsList,
@@ -232,6 +242,10 @@ export function detectFingerprintChanges(stored: FingerprintInput | undefined, c
     changes.push('findings sharing')
   }
 
+  if ((stored.shareCoaching ?? false) !== (current.shareCoaching ?? false)) {
+    changes.push('coaching sharing')
+  }
+
   const storedFields = new Set(stored.outboundFields)
   const currentFields = new Set(current.outboundFields)
   const added = Array.from(currentFields).filter(f => !storedFields.has(f)).sort()
@@ -249,7 +263,7 @@ export function detectFingerprintChanges(stored: FingerprintInput | undefined, c
 
 /**
  * True when `current` differs from `stored` only by sending LESS: a lower
- * detail level and/or findings turned off. Such a change needs no new consent.
+ * detail level and/or findings or coaching turned off. Such a change needs no new consent.
  */
 export function isReductionOnly(stored: FingerprintInput | undefined, current: FingerprintInput): boolean {
   if (!stored) return false
@@ -257,10 +271,12 @@ export function isReductionOnly(stored: FingerprintInput | undefined, current: F
   const rank = (l: 'summary' | 'sessions' | undefined): number => (l === 'summary' ? 0 : 1)
   if (rank(current.detailLevel) > rank(stored.detailLevel)) return false
   if ((current.shareFindings ?? false) && !(stored.shareFindings ?? false)) return false
+  if ((current.shareCoaching ?? false) && !(stored.shareCoaching ?? false)) return false
   const same: FingerprintInput = {
     ...current,
     detailLevel: stored.detailLevel,
     shareFindings: stored.shareFindings,
+    shareCoaching: stored.shareCoaching,
   }
   return computeAcceptanceFingerprint(same) === computeAcceptanceFingerprint(stored)
 }

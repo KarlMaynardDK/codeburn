@@ -95,7 +95,7 @@ export function registerTeamCommands(program: Command): void {
         log(clientPackage
           ? `  client package: codeburn ${clientPackage.version} (sha256 ${clientPackage.sha256.slice(0, 12)}...) at /install.sh, /install.ps1`
           : '  client package: none (install endpoints disabled)')
-        log(`  session detail accepted: ${config.accept_session_detail}, findings accepted: ${config.accept_findings}`)
+        log(`  session detail accepted: ${config.accept_session_detail}, findings accepted: ${config.accept_findings}, coaching accepted: ${config.accept_coaching}`)
         log(config.gitlab
           ? `  GitLab sign-in: ${config.gitlab.url}, self-registration ${config.gitlab.register_groups.length > 0 ? 'on' : 'off'}`
           : '  GitLab sign-in: off')

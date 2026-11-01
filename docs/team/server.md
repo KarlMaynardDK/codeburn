@@ -47,6 +47,7 @@ Created in the data dir with these defaults on first start (restart after editin
 {
   "accept_session_detail": false,
   "accept_findings": false,
+  "accept_coaching": false,
   "retention_days": 400,
   "org_name": ""
 }
@@ -59,6 +60,8 @@ Created in the data dir with these defaults on first start (restart after editin
   commits, sent with `codeburn sync push --attribution`).
 - `accept_findings`: enables `POST /v1/findings` (the latest `codeburn optimize` snapshot per person) and the
   findings section of the Insights page.
+- `accept_coaching`: enables `POST /v1/coaching` (see "Coaching snapshots" below), the coaching insights that need it
+  and the extra columns of the "Who might need coaching" table. Env: `CODEBURN_TEAM_ACCEPT_COACHING`.
 - `retention_days`: raw spans, rollups and sessions older than this are pruned on startup and every 24 hours.
 - `org_name`: shown in the viewer and in the discovery document.
 - `database_url`: optional PostgreSQL URL (see below).
@@ -138,6 +141,8 @@ Devices read the discovery document before every automatic run, so a change take
 | `accept_session_detail` on → off | Devices drop to `summary` and keep pushing; sending less needs no new acceptance. |
 | `accept_findings` off → on | Devices with findings sharing turned on pause until the person accepts again. Other devices are unaffected. |
 | `accept_findings` on → off | Devices stop uploading findings and keep pushing. |
+| `accept_coaching` off → on | Devices with coaching sharing turned on pause until the person accepts again. Other devices are unaffected. |
+| `accept_coaching` on → off | Devices stop uploading coaching stats and keep pushing. |
 | `org_name`, `retention_days`, `public_url`, `gitlab` | No effect on acceptance. |
 
 ## Client updates
@@ -523,10 +528,12 @@ docker exec codeburn-team node dist/cli.js team admin add-viewer --name "Manager
   Re-sending a span id overwrites it, so pushes are idempotent. A span id owned by another person is never
   reassigned.
 - `POST /v1/findings`: `{captured_at, findings}`, only when `accept_findings` is on.
+- `POST /v1/coaching`: `{captured_at, coaching}`, only when `accept_coaching` is on (404 `coaching_disabled` otherwise,
+  400 `coaching_required` when `coaching` is not an object). The latest snapshot per person is kept.
 - `GET /auth/gitlab/login`, `GET /auth/gitlab/callback`: GitLab sign-in, only when it is configured (404 otherwise).
 - `/register`: the self-registration page (part of the viewer).
 - `/api/team/*`: viewer API (auth-methods, login, logout, meta, overview, people, models, tools, projects, sessions,
-  work, insights, `registration` / `registration/token` for self-registration, and `profile` for a member's own details:
+  work, insights, `coaching` (the per-person table behind the Insights page), `registration` / `registration/token` for self-registration, and `profile` for a member's own details:
   `GET` reads them and `POST {name?, team?, hidden_projects?}` changes them, with identity taken from the session). "Tokens" in these
   responses are input + output + cache read + cache write; `cache_read_ratio` is cache reads / (input + cache reads).
   `calls` counts requests: accounting-only records add cost but no call. `one_shot_rate` is edit prompts that needed
@@ -535,17 +542,57 @@ docker exec codeburn-team node dist/cli.js team admin add-viewer --name "Manager
   returns repos and PRs from git attribution, with each session's total spend, and is 404 without
   `accept_session_detail`.
 
-## Insights rules
+## Insights
 
-- Cache-read ratio below half the team median (people with at least $1 spend, at least 3 such people).
-- Premium models (name contains `opus`, `gpt-5`, `o3` or `pro`) above 50% of a person's spend on
-  conversation/exploration/general/unknown work.
-- A person's last 7 days of spend above 2x the previous 7 days and more than $5 higher.
-- A one-shot rate more than 20 points below the team median (people with at least 10 edit prompts, at least 3 such
-  people).
-- Tool errors above 2x the team median and at least 5 per 100 calls (people with at least 50 calls, at least 3 such
-  people).
-- Fast mode at 25% or more of the period's spend.
-- Recurring `optimize` findings across the team with total estimated savings (when findings are enabled).
+The Insights page has three parts: a "Who might need coaching" table (one row per person next to the team median,
+people with the most flags first), insight cards grouped into coaching opportunities, spend to watch, and setup or
+missing data, and the recurring `optimize` findings (with the names of the people who have each). Every card names the
+person (linking to their page), shows the numbers behind it as small tables, and says what to try. The tables and cards
+come from `GET /api/team/coaching` and `GET /api/team/insights`.
+
+Rules that compare a person with the team use the median of the people who have enough data for that measure, and need
+at least 2 such people (`MIN_PEERS`). A person is never compared with only themselves. Rules marked "absolute" use the
+same thresholds as the coaching notes of the local `codeburn report` and work for a single person.
+
+| Insight | Kind | Fires when | Evidence shown |
+| --- | --- | --- | --- |
+| `low-cache-read` | training | Cache-read ratio below half the team median (at least $1 spend). | Ratio against median, session count and average length. |
+| `premium-on-simple` | training | Premium models (name contains `opus`, `gpt-5`, `o3` or `pro`) are over 50% of a person's spend (at least $1) on conversation, exploration, general or unknown work. | Model by task type with spend and share, and the projects. |
+| `spend-spike` | cost | Last 7 days above 2x the 7 days before and more than $5 higher. | The projects and models that grew most. |
+| `low-one-shot` | training | One-shot rate more than 20 points below the team median (at least 10 edit prompts). | Rate, retries per edit prompt, and one-shot rate by task type against the team's. |
+| `weak-task-type` (absolute) | training | A task type with at least 5 edit prompts and a one-shot rate under 60%, for people `low-one-shot` did not already flag. | One-shot rate by task type. |
+| `no-plan-mode` (absolute) | training | One-shot rate under 60% (at least 10 edit prompts) and no call used plan mode. | Plan-mode calls and share against the team's. |
+| `tool-errors` | setup | At least 5 failed tool calls per 100 and above 2x the team median (at least 50 calls). | Errors and rate, and the person's most used MCP tools. |
+| `frequent-interrupts` | training | At least 5% of calls interrupted and above 2x the team median (at least 50 calls). | Interrupted calls and share. |
+| `fast-mode-share` | cost | Fast mode is 25% or more of the period's spend. | Fast spend by person. |
+| `frequent-corrections` (absolute) | training | At least 15% of prompts, and at least 3, told the assistant it was wrong. Needs a coaching snapshot. | Prompts, corrections and share. |
+| `slow-first-edit` (absolute) | training | Median time to first edit of 5 minutes or more over at least 3 sessions. Needs a coaching snapshot. | Sessions and median time. |
+| `file-churn` (absolute) | training | At least one file edited in 3 or more sessions. Needs a coaching snapshot. | File count and the busiest file's sessions and edits (no names). |
+| `coaching-not-shared` | setup | Someone with usage in the period has no coaching snapshot (only when `accept_coaching` is on). | The people, their team and spend. |
+
+Insights are computed over the period and filters of the page. The coaching snapshot insights are the exception: a
+snapshot covers the 30 days before it was taken, so they ignore the date range and the project filter, and each card
+says which window it covers.
 
 The constants live in `src/team-server/insights.ts`.
+
+## Coaching snapshots
+
+Some of the coaching signals in `codeburn report` (how often the person corrected the assistant, time to first edit,
+files reworked across sessions) are worked out from prompt text and file edits, so they can only be computed on the
+person's machine. With `accept_coaching` on, a client that has coaching sharing on uploads one small snapshot a day
+after a successful push:
+
+```json
+{"captured_at": "...", "coaching": {
+  "period": {"label": "Last 30 days", "start": "2026-10-02", "end": "2026-11-01"},
+  "user_turns": 40, "corrections": 10, "sessions_with_edits": 6, "median_time_to_first_edit_ms": 480000,
+  "reworked_files": {"files_in_3plus_sessions": 2, "max_sessions": 5, "max_edits": 17}
+}}
+```
+
+Counts only. Prompt text, file names and paths never leave the machine, and the server re-validates every field with
+an allow-list and clamps the numbers, so a modified client can't store anything else. Sharing is off by default. A
+person turns it on with `codeburn sync setup ... --share-coaching` or `codeburn sync config coaching on`, which, like
+findings, needs them to accept the changed consent before automatic sync continues. The local `codeburn report` is
+unchanged. Merging people moves the snapshot to the target when it has none, and deleting a person removes it.
