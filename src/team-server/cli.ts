@@ -136,7 +136,7 @@ export function registerTeamCommands(program: Command): void {
           for (const p of people) {
             process.stdout.write(`${p.id}  ${p.name}${p.email ? ` <${p.email}>` : ''}${p.team ? `  [${p.team}]` : ''}${p.revoked_at ? '  REVOKED' : ''}\n`)
             for (const d of p.devices) {
-              process.stdout.write(`    ${d.id}  ${d.label ?? '(no label)'}  last seen ${d.last_seen ?? 'never'}${d.revoked_at ? '  REVOKED' : ''}\n`)
+              process.stdout.write(`    ${d.id}  ${d.label ?? '(no label)'}  last seen ${d.last_seen ?? 'never'}  client ${d.client_version ?? 'unknown'}${d.revoked_at ? '  REVOKED' : ''}\n`)
             }
           }
         })

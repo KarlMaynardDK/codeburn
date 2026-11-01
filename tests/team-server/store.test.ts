@@ -223,4 +223,17 @@ describe.each(BACKENDS)('store (%s)', backend => {
     expect(await ts.store.all('SELECT * FROM spans')).toEqual([])
     expect(await ts.store.all('SELECT * FROM daily_usage')).toEqual([])
   })
+  it('records the client version a device reports and keeps it when later pushes omit it', async () => {
+    ts = await makeStore(backend)
+    const { enrollmentToken } = await ts.store.addPerson({ name: 'Ann', email: '', team: '' })
+    const enrolled = (await ts.store.enroll(enrollmentToken, 'laptop', null))!
+    const devices = async () => (await ts.store.listPeople())[0]!.devices
+    expect((await devices())[0]!.client_version).toBeNull()
+    await ts.store.authenticateDevice(enrolled.credential, '1.2.3')
+    expect((await devices())[0]!.client_version).toBe('1.2.3')
+    await ts.store.authenticateDevice(enrolled.credential)
+    expect((await devices())[0]!.client_version).toBe('1.2.3')
+    await ts.store.authenticateDevice(enrolled.credential, '1.3.0-team.7')
+    expect((await devices())[0]!.client_version).toBe('1.3.0-team.7')
+  })
 })

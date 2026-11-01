@@ -39,6 +39,7 @@ import {
   type Receipt,
   buildReceipt,
 } from './consent.js'
+import { autoUpdateBeforeSync, runSelf } from './auto-update.js'
 import { installSchedule, removeSchedule, getScheduleStatus } from './schedule-installer.js'
 
 type Config = NonNullable<Awaited<ReturnType<typeof readSyncConfig>>>
@@ -422,6 +423,7 @@ export function registerSyncCommands(program: Command): void {
       process.stdout.write(`Traces path: ${config.tracesPath}\n`)
       if (config.authMode === 'enrollment') {
         process.stdout.write(`Auth: enrollment (team server${config.orgName ? `: ${config.orgName}` : ''})\n`)
+        process.stdout.write(`Client: ${currentCliVersion()}; automatic CLI updates ${config.autoUpdate === false ? 'off' : 'on'}\n`)
       } else {
         process.stdout.write(`Issuer: ${config.issuer}\n`)
       }
@@ -955,6 +957,30 @@ export function registerSyncCommands(program: Command): void {
       }
     })
 
+  // --- auto updates ---
+  auto
+    .command('updates [state]')
+    .description('Show, or turn on/off, installing the team build before each scheduled push')
+    .action((state?: string) => {
+      const config = readSyncConfig()
+      if (!config) {
+        process.stderr.write('Sync is not configured. Run: codeburn sync setup <url> --token <token>\n')
+        process.exitCode = 1
+        return
+      }
+      if (state !== undefined) {
+        if (state !== 'on' && state !== 'off') {
+          process.stderr.write('Usage: codeburn sync auto updates [on|off]\n')
+          process.exitCode = 1
+          return
+        }
+        config.autoUpdate = state === 'on'
+        writeSyncConfig(config)
+      }
+      const applies = config.authMode === 'enrollment'
+      process.stdout.write(`Automatic CLI updates: ${config.autoUpdate === false ? 'off' : 'on'}${applies ? '' : ' (only applies to team-server enrollments)'}\n`)
+    })
+
   // --- auto disable ---
   auto
     .command('disable')
@@ -1085,7 +1111,8 @@ export function registerSyncCommands(program: Command): void {
   auto
     .command('run')
     .description('Run automatic push (invoked by scheduler)')
-    .action(async () => {
+    .option('--no-update', 'Do not install the team build first')
+    .action(async (opts: { update?: boolean }) => {
       const config = readSyncConfig()
       const at = new Date().toISOString()
 
@@ -1106,6 +1133,23 @@ export function registerSyncCommands(program: Command): void {
         // this run will actually send, and the server may now allow more.
         const discoveryDoc = await fetchDiscoveryDoc(config.baseUrl)
         refreshServerCapabilities(config, discoveryDoc)
+
+        // A team server owns the CLI build: install its current one before pushing, then rerun on the new
+        // files (this process still holds the old code). The rerun passes --no-update, so it cannot loop.
+        if (opts.update !== false) {
+          const installed = currentCliVersion()
+          const outcome = await autoUpdateBeforeSync(config, installed, args => runSelf(args))
+          if (outcome.action === 'updated') {
+            appendReceipt(buildReceipt(at, undefined, { result: 'updated', from: outcome.from, to: outcome.to }))
+            const rerun = await runSelf(['sync', 'auto', 'run', '--no-update'], { inherit: true })
+            process.exitCode = rerun.code ?? 1
+            return
+          }
+          if (outcome.action === 'failed') {
+            // Keep syncing on the build we have; a stuck update must not stop usage from reaching the server.
+            appendReceipt(buildReceipt(at, undefined, { result: 'update-failed', from: outcome.from, to: outcome.to, reason: outcome.reason }))
+          }
+        }
 
         // Recompute fingerprint
         const pluginLoads: PluginLoad[] = await loadPlugins()

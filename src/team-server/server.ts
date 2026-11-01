@@ -4,7 +4,7 @@ import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import { dirname, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { handleApi, readBody, sendJson } from './api.js'
-import { FailureLimiter, OAUTH_COOKIE, bearer, clearedOauthCookie, oauthCookie, readCookie, sessionCookie } from './auth.js'
+import { FailureLimiter, OAUTH_COOKIE, bearer, clearedOauthCookie, clientVersion, oauthCookie, readCookie, sessionCookie } from './auth.js'
 import { installPs1Script, installShScript, originFromRequest, type ClientPackage } from './client-package.js'
 import { assertServeConfig, type TeamServerConfig } from './config.js'
 import { checkState, completeLogin, decideAccess, startLogin } from './gitlab.js'
@@ -181,7 +181,7 @@ export function createTeamServer(opts: TeamServerOptions): Server {
     if (path === '/v1/traces' || path === '/v1/findings') {
       if (method !== 'POST') return sendJson(res, 405, { error: 'method_not_allowed' })
       const cred = bearer(req)
-      const identity = cred ? await store.authenticateDevice(cred) : null
+      const identity = cred ? await store.authenticateDevice(cred, clientVersion(req)) : null
       if (!identity) return sendJson(res, 401, { error: 'unauthorized' })
 
       if (path === '/v1/findings') {

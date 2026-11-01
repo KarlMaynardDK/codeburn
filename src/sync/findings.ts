@@ -7,6 +7,7 @@
  */
 
 import { assertHttps } from './discovery.js'
+import { currentCliVersion } from '../plugins/loader.js'
 import { readSyncConfig, writeSyncConfig, type SyncConfig } from './config.js'
 
 export function utcDay(now: number = Date.now()): string {
@@ -98,7 +99,7 @@ export async function maybeSendFindings(opts: SendFindingsOptions): Promise<Find
     const findings = sanitizeFindingsReport(await (opts.buildReport ?? buildFindingsReport)())
     const response = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${opts.bearer}` },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${opts.bearer}`, 'X-Codeburn-Client-Version': currentCliVersion() },
       body: JSON.stringify({ captured_at: new Date(now).toISOString(), findings }),
     })
     if (response.status === 401) {

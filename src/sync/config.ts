@@ -32,6 +32,8 @@ export interface SyncConfig {
   shareFindings?: boolean
   /** YYYY-MM-DD (UTC) of the last successful findings upload. */
   lastFindingsSent?: string
+  /** Team enrollments install the server's CLI build before a scheduled push. Default on; false turns it off. */
+  autoUpdate?: boolean
   auto?: AutoSyncConfig
 }
 
@@ -76,6 +78,7 @@ export function readSyncConfig(): SyncConfig | null {
       ...(data.detailLevel === 'summary' || data.detailLevel === 'sessions' ? { detailLevel: data.detailLevel } : {}),
       ...(typeof data.shareFindings === 'boolean' ? { shareFindings: data.shareFindings } : {}),
       ...(typeof data.lastFindingsSent === 'string' ? { lastFindingsSent: data.lastFindingsSent } : {}),
+      ...(typeof data.autoUpdate === 'boolean' ? { autoUpdate: data.autoUpdate } : {}),
       auto: typeof data.auto === 'object' && data.auto ? (data.auto as AutoSyncConfig) : undefined,
     }
   } catch {

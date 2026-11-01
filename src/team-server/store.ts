@@ -26,7 +26,7 @@ export function newId(prefix: string): string {
   return prefix + randomBytes(8).toString('hex')
 }
 
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 /**
  * Span columns added in schema v2, with their defaults. Spans stored before v2 read as zero, empty or
@@ -81,12 +81,17 @@ function migrationV2(real: string, int: string): string[] {
   ]
 }
 
-/** Portable DDL with backend-specific numeric types, in the current (v2) shape. */
+/** Statements that move a v2 database to v3: the CLI version each device last reported. */
+function migrationV3(): string[] {
+  return [`ALTER TABLE devices ADD COLUMN client_version TEXT`]
+}
+
+/** Portable DDL with backend-specific numeric types, in the current (v3) shape. */
 export function schemaStatements(real: string, int: string): string[] {
   return [
     `CREATE TABLE IF NOT EXISTS schema_version (version ${int} NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS people (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, team TEXT NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT)`,
-    `CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, person_id TEXT NOT NULL, cred_hash TEXT NOT NULL UNIQUE, label TEXT, client_device_id TEXT, created_at TEXT NOT NULL, last_seen TEXT, revoked_at TEXT, coverage_through TEXT)`,
+    `CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, person_id TEXT NOT NULL, cred_hash TEXT NOT NULL UNIQUE, label TEXT, client_device_id TEXT, created_at TEXT NOT NULL, last_seen TEXT, revoked_at TEXT, coverage_through TEXT, client_version TEXT)`,
     `CREATE TABLE IF NOT EXISTS enrollments (token_hash TEXT PRIMARY KEY, person_id TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT)`,
     `CREATE TABLE IF NOT EXISTS viewers (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, revoked_at TEXT)`,
     `CREATE TABLE IF NOT EXISTS viewer_sessions (token_hash TEXT PRIMARY KEY, viewer_id TEXT NOT NULL, expires_at TEXT NOT NULL)`,
@@ -121,6 +126,7 @@ export async function migrate(db: Db): Promise<void> {
     if (from > SCHEMA_VERSION) throw new Error(`team-server: database schema v${from} is newer than this server (v${SCHEMA_VERSION}); upgrade codeburn`)
     for (const stmt of schemaStatements(real, int)) await q.all(stmt)
     if (from < 2) for (const stmt of migrationV2(real, int)) await q.all(stmt)
+    if (from < 3) for (const stmt of migrationV3()) await q.all(stmt)
     if (!stored) await q.all('INSERT INTO schema_version (version) VALUES (?)', [SCHEMA_VERSION])
     else if (from < SCHEMA_VERSION) await q.all('UPDATE schema_version SET version = ?', [SCHEMA_VERSION])
   })
@@ -364,22 +370,24 @@ export class Store {
     })
   }
 
-  async authenticateDevice(credential: string): Promise<{ deviceId: string; personId: string } | null> {
+  /** Authenticates a device credential and stamps last_seen, plus the CLI version the device reports (when it sends one). */
+  async authenticateDevice(credential: string, clientVersion?: string | null): Promise<{ deviceId: string; personId: string } | null> {
     if (!credential.startsWith('cbd_')) return null
     const rows = await this.all(
       `SELECT d.id AS device_id, d.person_id AS person_id FROM devices d JOIN people p ON p.id = d.person_id
        WHERE d.cred_hash = ? AND d.revoked_at IS NULL AND p.revoked_at IS NULL`, [sha256hex(credential)])
     if (rows.length === 0) return null
-    await this.all('UPDATE devices SET last_seen = ? WHERE id = ?', [nowIso(), rows[0]!.device_id])
+    if (clientVersion) await this.all('UPDATE devices SET last_seen = ?, client_version = ? WHERE id = ?', [nowIso(), clientVersion, rows[0]!.device_id])
+    else await this.all('UPDATE devices SET last_seen = ? WHERE id = ?', [nowIso(), rows[0]!.device_id])
     return { deviceId: rows[0]!.device_id as string, personId: rows[0]!.person_id as string }
   }
 
-  async listPeople(): Promise<Array<Person & { devices: Array<{ id: string; label: string | null; last_seen: string | null; revoked_at: string | null }> }>> {
+  async listPeople(): Promise<Array<Person & { devices: Array<{ id: string; label: string | null; last_seen: string | null; revoked_at: string | null; client_version: string | null }> }>> {
     const people = await this.all('SELECT id, name, email, team, revoked_at FROM people ORDER BY created_at, id')
-    const devices = await this.all('SELECT id, person_id, label, last_seen, revoked_at FROM devices ORDER BY created_at, id')
+    const devices = await this.all('SELECT id, person_id, label, last_seen, revoked_at, client_version FROM devices ORDER BY created_at, id')
     return people.map(p => ({
       id: p.id, name: p.name, email: p.email, team: p.team, revoked_at: p.revoked_at ?? null,
-      devices: devices.filter(d => d.person_id === p.id).map(d => ({ id: d.id, label: d.label ?? null, last_seen: d.last_seen ?? null, revoked_at: d.revoked_at ?? null })),
+      devices: devices.filter(d => d.person_id === p.id).map(d => ({ id: d.id, label: d.label ?? null, last_seen: d.last_seen ?? null, revoked_at: d.revoked_at ?? null, client_version: d.client_version ?? null })),
     }))
   }
 

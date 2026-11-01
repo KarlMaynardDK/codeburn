@@ -12,6 +12,7 @@ import { isBehavioralCall, isBehavioralTurn } from '../behavioral-weight.js'
 import { inferSessionProvider } from '../session-output.js'
 import { resolveWorkUnits, workUnitSessionKey } from '../work-units.js'
 import { assertHttps } from './discovery.js'
+import { currentCliVersion } from '../plugins/loader.js'
 import { ledgerKeySet, appendToLedger, type LedgerEntry } from './ledger.js'
 import {
   buildOtlpPayload,
@@ -450,6 +451,7 @@ async function sendBatchesCore<T>(opts: SendBatchesCoreOptions<T>): Promise<Push
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${opts.accessToken}`,
+          'X-Codeburn-Client-Version': currentCliVersion(),
         },
         body: JSON.stringify(payload),
       })

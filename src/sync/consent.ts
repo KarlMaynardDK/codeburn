@@ -184,6 +184,8 @@ export type ReceiptResult =
   | { result: 'not-accepted' }
   | { result: 'acceptance-required'; changed: string[] }
   | { result: 'pushed'; spans: number }
+  | { result: 'updated'; from: string; to: string }
+  | { result: 'update-failed'; from: string; to: string; reason: string }
   | { result: 'error'; reason: string }
 
 export interface Receipt {

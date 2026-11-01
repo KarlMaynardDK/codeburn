@@ -174,6 +174,17 @@ describe.each(BACKENDS)('team server (%s)', backend => {
       const [row] = await t.store.all('SELECT last_seen FROM devices')
       expect(row!.last_seen > '2020-01-01').toBe(true)
     })
+
+    it('records the X-Codeburn-Client-Version header and ignores malformed values', async () => {
+      t = await startServer(backend)
+      const a = await enrollPerson(t, 'Ann')
+      const version = async () => (await t.store.all('SELECT client_version FROM devices'))[0]!.client_version
+      expect(await version()).toBeNull()
+      await post(t.base, '/v1/traces', payload([span({ id: 's1' })]), { authorization: `Bearer ${a.cred}`, 'x-codeburn-client-version': '0.9.7-team.202610' })
+      expect(await version()).toBe('0.9.7-team.202610')
+      await post(t.base, '/v1/traces', payload([span({ id: 's2' })]), { authorization: `Bearer ${a.cred}`, 'x-codeburn-client-version': '1.0 <script>' })
+      expect(await version()).toBe('0.9.7-team.202610')
+    })
   })
 
   describe('session detail gating', () => {

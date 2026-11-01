@@ -82,3 +82,10 @@ export class FailureLimiter {
     this.hits.set(key, recent)
   }
 }
+
+/** CLI version a device reports in X-Codeburn-Client-Version; null when absent or not a plain version string. */
+export function clientVersion(req: IncomingMessage): string | null {
+  const v = req.headers['x-codeburn-client-version']
+  const value = Array.isArray(v) ? v[0] : v
+  return typeof value === 'string' && /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$/.test(value) ? value : null
+}

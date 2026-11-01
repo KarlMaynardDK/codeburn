@@ -156,7 +156,8 @@ covered in [Installing the client from your server](install.md).
 3. Optionally tell members. Each device learns the new version at its next push (manual or automatic), and from
    then on `codeburn sync push` and `codeburn sync status` print
    `Your team server has CodeBurn <version> (this is <installed>). Install it with: codeburn update`.
-   Devices never update themselves; the member runs the command.
+   A device with [automatic sync](#automatic-sync-acceptance) installs the new build itself before its next
+   scheduled push (see [Automatic updates](#automatic-updates)); other devices wait for the member to run the command.
 
 **Updating a device (member)**
 
@@ -183,6 +184,33 @@ When it can't update:
 | The server advertises no client package | Skipped. A `codeburn-team` build never installs the public `codeburn@latest` |
 | A `codeburn-team` build on a device that isn't enrolled | Skipped. Enroll it first (`codeburn sync setup <url> --token ...`) |
 | The CLI was installed with Homebrew, pnpm, bun or volta | Reported as managed. Reinstall with the server's `install.sh` / `install.ps1` (no token needed for that) to switch it to npm |
+
+**Which version each device runs**
+
+Every push (traces and findings) carries an `X-Codeburn-Client-Version` header with the CLI version. The server stores
+the latest one per device, and `codeburn team admin list` prints it next to each device (`client 0.9.7-team.202610`;
+`client unknown` for a device that hasn't pushed since the server was upgraded). Compare it with the
+`client package:` line the server prints at startup to see who is behind.
+
+<a id="automatic-updates"></a>
+**Automatic updates**
+
+On a team-server enrollment, each scheduled `codeburn sync auto run` checks the build the server advertises before it
+pushes. If it differs from the installed version (any difference, so rollbacks apply too), the run:
+
+1. runs `codeburn update --cli`, which downloads the build, verifies its sha256 and installs it with npm, exactly
+   like the manual command;
+2. restarts itself on the new files (`sync auto run --no-update`) and syncs with the new build;
+3. writes an `updated` receipt (`from`, `to`) to `codeburn sync auto status`.
+
+If the update fails (no permission, server unreachable, a managed install, a checksum mismatch), the run writes an
+`update-failed` receipt with the reason and **still syncs with the installed build**, so a stuck update never stops
+usage reaching the server. If the new build changes what is sent, the acceptance fingerprint changes and the pushes
+pause until the member accepts again, as described below.
+
+Turn it off per device with `codeburn sync auto updates off` (`on` to restore; no argument shows the state), or with
+`CODEBURN_NO_AUTO_UPDATE=1` in the scheduler's environment. `codeburn sync status` shows the setting. It never applies
+to OIDC setups, and a manual `codeburn sync push` doesn't update; it only prints the notice.
 
 **Updates and automatic sync**
 
