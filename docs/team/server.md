@@ -30,6 +30,8 @@ collector and `/api/team/*` still work.
 | `codeburn team admin add-person --name N [--email E] [--team T] [--url U]` | Create a person, print a 7-day single-use enrollment token. |
 | `codeburn team admin list` | People, their devices and last-seen time. |
 | `codeburn team admin revoke <person-id\|device-id>` | Revoke a person (all devices) or one device. Its credential gets 401 immediately. |
+| `codeburn team admin merge-person <from-id> <to-id>` | Move all usage, sessions, git attribution and devices from one person to another, then revoke the first. Use it when someone ends up with two accounts. |
+| `codeburn team admin delete-person <id> [--force]` | Permanently delete a person and their devices. Refuses while they still own usage (merge first) unless `--force`. Frees their email for registration. |
 | `codeburn team admin rotate-enrollment <person-id> [--url U]` | Invalidate unused tokens, print a new one (also how an extra device is enrolled). |
 | `codeburn team admin add-viewer --name N` | Create a viewer login key. |
 

@@ -171,6 +171,40 @@ export function registerTeamCommands(program: Command): void {
       } catch (err) { fail(err) }
     })
 
+  storeOpts(admin
+    .command('merge-person <from-id> <to-id>')
+    .description('Move all usage, sessions, attribution and devices from one person to another, then revoke the first'))
+    .action(async (fromId: string, toId: string, opts: StoreFlags) => {
+      try {
+        await withStore(opts, async store => {
+          const r = await store.mergePerson(fromId, toId)
+          if (!r) {
+            process.stderr.write('codeburn team: both ids must be existing, different people, and the target must not be revoked (see `codeburn team admin list`)\n')
+            process.exitCode = 1
+            return
+          }
+          process.stdout.write(`Moved ${r.spans} spans (${r.days} days) and ${r.devices} devices from ${fromId} to ${toId}. ${fromId} is now revoked.\n`)
+        })
+      } catch (err) { fail(err) }
+    })
+
+  storeOpts(admin
+    .command('delete-person <id>')
+    .description('Permanently delete a person and their devices. Refuses while they still have usage unless --force (merge first)')
+    .option('--force', 'Also delete the usage they own'))
+    .action(async (id: string, opts: StoreFlags & { force?: boolean }) => {
+      try {
+        await withStore(opts, async store => {
+          const r = await store.deletePerson(id, !!opts.force)
+          if (r.deleted) { process.stdout.write(`Deleted ${id} and ${r.spans} spans.\n`); return }
+          process.exitCode = 1
+          process.stderr.write(r.reason === 'unknown'
+            ? `codeburn team: no person with id ${id}\n`
+            : `codeburn team: ${id} still owns ${r.spans} spans. Run \`codeburn team admin merge-person ${id} <to-id>\` first, or pass --force to delete them.\n`)
+        })
+      } catch (err) { fail(err) }
+    })
+
   storeOpts(admin.command('add-viewer').description('Create a viewer login key for the report viewer').requiredOption('--name <name>', 'Viewer name'))
     .action(async (opts: StoreFlags & { name: string }) => {
       try {

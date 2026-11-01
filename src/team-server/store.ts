@@ -395,6 +395,83 @@ export class Store {
     return d.length > 0 ? 'device' : null
   }
 
+  /**
+   * Moves everything one person owns (spans and their rollups, sessions, git attribution, devices, viewer
+   * sessions, findings) onto another, then revokes the source person so its email can't register again.
+   * Span ids are unique across people, so the move can't collide; per-person keys that could (sessions,
+   * attribution, findings) keep the target's row. Returns null when either person is unknown, the same, or
+   * the target is revoked.
+   */
+  async mergePerson(fromId: string, toId: string): Promise<{ spans: number; devices: number; days: number } | null> {
+    if (fromId === toId) return null
+    const found = await this.all('SELECT id, revoked_at FROM people WHERE id IN (?, ?)', [fromId, toId])
+    const from = found.find(r => r.id === fromId)
+    const to = found.find(r => r.id === toId)
+    if (!from || !to || to.revoked_at) return null
+    return this.db.tx(async q => {
+      const dayRows = await q.all('SELECT DISTINCT day FROM spans WHERE person_id = ?', [fromId])
+      const days = dayRows.map(r => String(r.day))
+      const traceRows = await q.all('SELECT DISTINCT trace_id FROM spans WHERE person_id = ?', [fromId])
+      const moved = await q.all('UPDATE spans SET person_id = ? WHERE person_id = ? RETURNING span_id', [toId, fromId])
+      // Rollups are derived from spans, so drop the source's and rebuild the target's affected days.
+      await q.all('DELETE FROM daily_usage WHERE person_id = ?', [fromId])
+      await q.all('DELETE FROM daily_names WHERE person_id = ?', [fromId])
+      for (const day of days) {
+        await q.all('DELETE FROM daily_usage WHERE person_id = ? AND day = ?', [toId, day])
+        await q.all(dailyUsageInsert('WHERE person_id = ? AND day = ?'), [toId, day])
+        await this.rebuildDailyNames(q, toId, day)
+      }
+      await q.all('DELETE FROM sessions WHERE person_id = ?', [fromId])
+      for (const t of traceRows) {
+        const trace = String(t.trace_id)
+        await q.all('DELETE FROM sessions WHERE person_id = ? AND trace_id = ?', [toId, trace])
+        await q.all(
+          `INSERT INTO sessions (trace_id, person_id, project, started, duration_ms, calls, cost)
+           SELECT trace_id, person_id, MAX(project), MIN(ts), COALESCE(MAX(session_duration_ms), 0), SUM(request_weight), SUM(cost_usd)
+           FROM spans WHERE person_id = ? AND trace_id = ? AND detail_level = 'sessions' GROUP BY trace_id, person_id`, [toId, trace])
+      }
+      await q.all(
+        `INSERT INTO work_sessions (person_id, trace_id, repo, project, started, ended, commit_count, pr_links)
+         SELECT ?, trace_id, repo, project, started, ended, commit_count, pr_links FROM work_sessions WHERE person_id = ? AND 1=1
+         ON CONFLICT (person_id, trace_id) DO NOTHING`, [toId, fromId])
+      await q.all('DELETE FROM work_sessions WHERE person_id = ?', [fromId])
+      await q.all(
+        `INSERT INTO work_commits (person_id, trace_id, repo, sha, ts, in_main, was_reverted)
+         SELECT ?, trace_id, repo, sha, ts, in_main, was_reverted FROM work_commits WHERE person_id = ? AND 1=1
+         ON CONFLICT (person_id, trace_id, sha) DO NOTHING`, [toId, fromId])
+      await q.all('DELETE FROM work_commits WHERE person_id = ?', [fromId])
+      await q.all(
+        `INSERT INTO findings (person_id, captured_at, json)
+         SELECT ?, captured_at, json FROM findings WHERE person_id = ? AND 1=1
+         ON CONFLICT (person_id) DO NOTHING`, [toId, fromId])
+      await q.all('DELETE FROM findings WHERE person_id = ?', [fromId])
+      const devices = await q.all('UPDATE devices SET person_id = ? WHERE person_id = ? RETURNING id', [toId, fromId])
+      await q.all('UPDATE sso_sessions SET person_id = ? WHERE person_id = ?', [toId, fromId])
+      await q.all('DELETE FROM enrollments WHERE person_id = ? AND used_at IS NULL', [fromId])
+      await q.all('UPDATE people SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', [nowIso(), fromId])
+      return { spans: moved.length, devices: devices.length, days: days.length }
+    })
+  }
+
+  /**
+   * Permanently deletes a person and every row they own. Without `force` it refuses while the person still has
+   * usage (merge them first). Deleting also frees their email, so they could register again.
+   */
+  async deletePerson(id: string, force = false): Promise<{ deleted: true; spans: number } | { deleted: false; reason: 'unknown' | 'has_usage'; spans: number }> {
+    const found = await this.all('SELECT id FROM people WHERE id = ?', [id])
+    if (found.length === 0) return { deleted: false, reason: 'unknown', spans: 0 }
+    return this.db.tx(async q => {
+      const [c] = await q.all('SELECT COUNT(*) AS n FROM spans WHERE person_id = ?', [id])
+      const spans = Number(c?.n ?? 0)
+      if (spans > 0 && !force) return { deleted: false as const, reason: 'has_usage' as const, spans }
+      for (const t of ['spans', 'daily_usage', 'daily_names', 'sessions', 'findings', 'work_sessions', 'work_commits', 'devices', 'enrollments', 'sso_sessions']) {
+        await q.all(`DELETE FROM ${t} WHERE person_id = ?`, [id])
+      }
+      await q.all('DELETE FROM people WHERE id = ?', [id])
+      return { deleted: true as const, spans }
+    })
+  }
+
   // ---- viewers ----
 
   async addViewer(name: string): Promise<{ id: string; key: string }> {

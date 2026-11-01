@@ -187,4 +187,40 @@ describe.each(BACKENDS)('store (%s)', backend => {
     expect(await ts.store.all('SELECT * FROM spans')).toEqual([])
     expect(await ts.store.all('SELECT * FROM daily_usage')).toEqual([])
   })
+  it('merges one person into another, moving spans, rollups and devices', async () => {
+    ts = await makeStore(backend)
+    const old = (await ts.store.addPerson({ name: 'Old', email: 'a@x.io', team: 'T' })).person
+    const cur = (await ts.store.addPerson({ name: 'New', email: 'b@x.io', team: 'T' })).person
+    const day = '2026-10-01T10:00:00.000Z'
+    await ts.store.ingestSpans(old.id, 'd_old', [spanRecord({ span_id: 'o1', ts: day, lines_added: 7 })], false)
+    await ts.store.ingestSpans(cur.id, 'd_new', [spanRecord({ span_id: 'n1', ts: day, lines_added: 3 })], false)
+
+    expect(await ts.store.mergePerson(old.id, old.id)).toBeNull()
+    expect(await ts.store.mergePerson('nope', cur.id)).toBeNull()
+    expect(await ts.store.mergePerson(old.id, cur.id)).toMatchObject({ spans: 1, days: 1 })
+
+    expect(await ts.store.all('SELECT person_id FROM spans ORDER BY span_id')).toEqual([{ person_id: cur.id }, { person_id: cur.id }])
+    expect(await ts.store.all('SELECT person_id FROM daily_usage WHERE person_id = ?', [old.id])).toEqual([])
+    const [row] = await ts.store.all('SELECT SUM(lines_added) AS l, SUM(calls) AS c FROM daily_usage WHERE person_id = ?', [cur.id])
+    expect(Number(row!.l)).toBe(10)
+    expect(Number(row!.c)).toBe(2)
+    const people = await ts.store.listPeople()
+    expect(people.find(p => p.id === old.id)?.revoked_at).not.toBeNull()
+    expect(await ts.store.mergePerson(cur.id, old.id)).toBeNull()
+  })
+  it('deletes a person only when they own no usage, unless forced', async () => {
+    ts = await makeStore(backend)
+    const a = (await ts.store.addPerson({ name: 'A', email: '', team: '' })).person
+    const b = (await ts.store.addPerson({ name: 'B', email: '', team: '' })).person
+    await ts.store.ingestSpans(a.id, 'd', [spanRecord({ span_id: 'a1', ts: new Date().toISOString() })], false)
+    expect(await ts.store.deletePerson('nope')).toMatchObject({ deleted: false, reason: 'unknown' })
+    expect(await ts.store.deletePerson(a.id)).toMatchObject({ deleted: false, reason: 'has_usage', spans: 1 })
+    await ts.store.mergePerson(a.id, b.id)
+    expect(await ts.store.deletePerson(a.id)).toEqual({ deleted: true, spans: 0 })
+    expect((await ts.store.listPeople()).map(p => p.id)).toEqual([b.id])
+    expect(await ts.store.all('SELECT * FROM spans')).toHaveLength(1)
+    expect(await ts.store.deletePerson(b.id, true)).toEqual({ deleted: true, spans: 1 })
+    expect(await ts.store.all('SELECT * FROM spans')).toEqual([])
+    expect(await ts.store.all('SELECT * FROM daily_usage')).toEqual([])
+  })
 })
