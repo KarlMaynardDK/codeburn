@@ -542,4 +542,88 @@ describe.each(BACKENDS)('team server (%s)', backend => {
       expect(await t.store.all('SELECT day FROM daily_usage')).toHaveLength(1)
     })
   })
+
+  describe('member profile', () => {
+    const asMember = async (personId: string, name = 'Ann') => {
+      const token = await t.store.loginSso({ name, role: 'member', personId, subject: '1' })
+      const headers = { cookie: `cb_team_session=${token}`, origin: `http://${t.host}`, 'content-type': 'application/json' }
+      const get = async (path: string) => {
+        const res = await fetch(t.base + path, { headers })
+        return { status: res.status, json: (await res.json().catch(() => null)) as any }
+      }
+      const save = async (body: unknown) => {
+        const res = await fetch(t.base + '/api/team/profile', { method: 'POST', headers, body: JSON.stringify(body) })
+        return { status: res.status, json: (await res.json().catch(() => null)) as any }
+      }
+      return { get, save, token }
+    }
+
+    it('lets a member read and change their name, team and hidden projects, and hides them from admins', async () => {
+      t = await startServer(backend)
+      const a = await enrollPerson(t, 'Ann', 'Platform')
+      await enrollPerson(t, 'Bob', 'Web')
+      await send(t, a.cred, [span({ id: 's1', project: 'secret', cost: 2 }), span({ id: 's2', project: 'app', cost: 3 })])
+      const m = await asMember(a.person.id)
+
+      const before = await m.get('/api/team/profile')
+      expect(before.json).toMatchObject({ name: 'Ann', email: 'ann@example.com', team: 'Platform', teams: ['Platform', 'Web'] })
+      expect(before.json.projects).toEqual([{ project: 'app', hidden: false, cost: 3 }, { project: 'secret', hidden: false, cost: 2 }].sort((x, y) => y.cost - x.cost))
+
+      const saved = await m.save({ name: 'Ann Lee', team: 'web', hidden_projects: ['secret'] })
+      expect(saved.status).toBe(200)
+      expect(saved.json).toMatchObject({ name: 'Ann Lee', team: 'Web', email: 'ann@example.com' })
+      expect(saved.json.projects).toContainEqual({ project: 'secret', hidden: true, cost: 2 })
+
+      // Admins (viewer key) only ever see "unknown".
+      const admin = await viewerClient(t)
+      const projects = (await admin.get('/api/team/projects')).json.projects.map((p: any) => p.project).sort()
+      expect(projects).toEqual(['app', 'unknown'])
+      expect(JSON.stringify((await admin.get('/api/team/people')).json)).not.toContain('secret')
+      expect((await admin.get('/api/team/meta')).json.people.find((p: any) => p.id === a.person.id)).toMatchObject({ name: 'Ann Lee', team: 'Web' })
+      expect((await m.get('/api/team/meta')).json.viewer.name).toBe('Ann Lee')
+
+      // New usage for a hidden project is hidden on arrival; unhiding restores the names.
+      await send(t, a.cred, [span({ id: 's3', project: 'secret', cost: 1 })])
+      expect((await admin.get('/api/team/projects')).json.projects.map((p: any) => p.project).sort()).toEqual(['app', 'unknown'])
+      await m.save({ hidden_projects: [] })
+      expect((await admin.get('/api/team/projects')).json.projects.map((p: any) => p.project).sort()).toEqual(['app', 'secret'])
+    })
+
+    it('rejects invalid input without changing anything', async () => {
+      t = await startServer(backend)
+      const a = await enrollPerson(t, 'Ann', 'Platform')
+      await send(t, a.cred, [span({ id: 's1', project: 'secret' })])
+      const m = await asMember(a.person.id)
+      expect((await m.save({ name: '   ' })).json.error).toBe('invalid_name')
+      expect((await m.save({ team: '' })).json.error).toBe('invalid_team')
+      expect((await m.save({ name: 5 })).json.error).toBe('invalid_name')
+      expect((await m.save({ hidden_projects: 'secret' })).json.error).toBe('invalid_projects')
+      expect((await m.save({ hidden_projects: ['unknown'] })).json.error).toBe('invalid_projects')
+      // A bad field means nothing else in the same request is applied.
+      expect((await m.save({ hidden_projects: ['secret', ''], name: 'Changed' })).status).toBe(400)
+      expect((await m.save({ name: 'Changed', team: '' })).status).toBe(400)
+      const p = (await m.get('/api/team/profile')).json
+      expect(p.name).toBe('Ann')
+      expect(p.projects).toContainEqual({ project: 'secret', hidden: false, cost: 0.5 })
+    })
+
+    it('only edits the signed-in member; admins and registrants have no profile', async () => {
+      t = await startServer(backend)
+      const a = await enrollPerson(t, 'Ann')
+      const b = await enrollPerson(t, 'Bob')
+      const m = await asMember(a.person.id)
+      // The body cannot name another person: identity comes from the session.
+      await m.save({ name: 'Mallory', person_id: b.person.id, id: b.person.id })
+      expect((await t.store.getPerson(b.person.id))!.name).toBe('Bob')
+      expect((await t.store.getPerson(a.person.id))!.name).toBe('Mallory')
+
+      const admin = await viewerClient(t)
+      expect((await admin.get('/api/team/profile')).status).toBe(404)
+      const reg = await t.store.loginSso({ name: 'New', role: 'registrant', email: 'new@example.com', subject: '9' })
+      const r = await fetch(t.base + '/api/team/profile', { headers: { cookie: `cb_team_session=${reg}`, origin: `http://${t.host}` } })
+      expect(r.status).toBe(403)
+      const anon = await fetch(t.base + '/api/team/profile', { headers: { origin: `http://${t.host}` } })
+      expect(anon.status).toBe(401)
+    })
+  })
 })

@@ -26,7 +26,7 @@ export function newId(prefix: string): string {
   return prefix + randomBytes(8).toString('hex')
 }
 
-export const SCHEMA_VERSION = 3
+export const SCHEMA_VERSION = 4
 
 /**
  * Span columns added in schema v2, with their defaults. Spans stored before v2 read as zero, empty or
@@ -81,6 +81,18 @@ function migrationV2(real: string, int: string): string[] {
   ]
 }
 
+/**
+ * Statements that move a v3 database to v4: the real project name of spans a member hid (the visible name is
+ * 'unknown'), and a flag on git attribution rows whose project is hidden. hidden_projects comes from schemaStatements.
+ * work_sessions only exists before v4 from v2 on; on a v1 database schemaStatements has just created it with the column.
+ */
+function migrationV4(int: string, from: number): string[] {
+  return [
+    `ALTER TABLE spans ADD COLUMN real_project TEXT`,
+    ...(from >= 2 ? [`ALTER TABLE work_sessions ADD COLUMN hidden ${int} NOT NULL DEFAULT 0`] : []),
+  ]
+}
+
 /** Statements that move a v2 database to v3: the CLI version each device last reported. */
 function migrationV3(): string[] {
   return [`ALTER TABLE devices ADD COLUMN client_version TEXT`]
@@ -96,7 +108,7 @@ export function schemaStatements(real: string, int: string): string[] {
     `CREATE TABLE IF NOT EXISTS viewers (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, revoked_at TEXT)`,
     `CREATE TABLE IF NOT EXISTS viewer_sessions (token_hash TEXT PRIMARY KEY, viewer_id TEXT NOT NULL, expires_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS sso_sessions (token_hash TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, person_id TEXT, subject TEXT NOT NULL, email TEXT, expires_at TEXT NOT NULL)`,
-    `CREATE TABLE IF NOT EXISTS spans (span_id TEXT PRIMARY KEY, person_id TEXT NOT NULL, device_id TEXT NOT NULL, trace_id TEXT NOT NULL, ts TEXT NOT NULL, day TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, project TEXT NOT NULL, category TEXT NOT NULL, input ${int} NOT NULL, output ${int} NOT NULL, cache_read ${int} NOT NULL, cache_write ${int} NOT NULL, cost_usd ${real} NOT NULL, detail_level TEXT NOT NULL, work_unit_id TEXT, session_role TEXT, call_count ${int}, session_duration_ms ${int}, ${spanV2Columns(real, int).join(', ')})`,
+    `CREATE TABLE IF NOT EXISTS spans (span_id TEXT PRIMARY KEY, person_id TEXT NOT NULL, device_id TEXT NOT NULL, trace_id TEXT NOT NULL, ts TEXT NOT NULL, day TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, project TEXT NOT NULL, category TEXT NOT NULL, input ${int} NOT NULL, output ${int} NOT NULL, cache_read ${int} NOT NULL, cache_write ${int} NOT NULL, cost_usd ${real} NOT NULL, detail_level TEXT NOT NULL, work_unit_id TEXT, session_role TEXT, call_count ${int}, session_duration_ms ${int}, ${spanV2Columns(real, int).join(', ')}, real_project TEXT)`,
     `CREATE INDEX IF NOT EXISTS spans_person_day ON spans (person_id, day)`,
     `CREATE INDEX IF NOT EXISTS spans_trace ON spans (person_id, trace_id)`,
     dailyUsageTable(real, int),
@@ -107,7 +119,9 @@ export function schemaStatements(real: string, int: string): string[] {
     `CREATE TABLE IF NOT EXISTS sessions (trace_id TEXT NOT NULL, person_id TEXT NOT NULL, project TEXT NOT NULL, started TEXT NOT NULL, duration_ms ${int} NOT NULL, calls ${int} NOT NULL, cost ${real} NOT NULL, PRIMARY KEY (person_id, trace_id))`,
     `CREATE TABLE IF NOT EXISTS findings (person_id TEXT PRIMARY KEY, captured_at TEXT NOT NULL, json TEXT NOT NULL)`,
     // Git attribution (`codeburn sync push --attribution`): which repo and PRs a session worked on, and its commits.
-    `CREATE TABLE IF NOT EXISTS work_sessions (person_id TEXT NOT NULL, trace_id TEXT NOT NULL, repo TEXT NOT NULL, project TEXT NOT NULL, started TEXT NOT NULL, ended TEXT NOT NULL, commit_count ${int} NOT NULL, pr_links TEXT NOT NULL, PRIMARY KEY (person_id, trace_id))`,
+    `CREATE TABLE IF NOT EXISTS work_sessions (person_id TEXT NOT NULL, trace_id TEXT NOT NULL, repo TEXT NOT NULL, project TEXT NOT NULL, started TEXT NOT NULL, ended TEXT NOT NULL, commit_count ${int} NOT NULL, pr_links TEXT NOT NULL, hidden ${int} NOT NULL DEFAULT 0, PRIMARY KEY (person_id, trace_id))`,
+    // Projects a member chose to hide: their spans show as 'unknown' to everyone, admins included.
+    `CREATE TABLE IF NOT EXISTS hidden_projects (person_id TEXT NOT NULL, project TEXT NOT NULL, PRIMARY KEY (person_id, project))`,
     `CREATE TABLE IF NOT EXISTS work_commits (person_id TEXT NOT NULL, trace_id TEXT NOT NULL, repo TEXT NOT NULL, sha TEXT NOT NULL, ts TEXT NOT NULL, in_main ${int} NOT NULL, was_reverted ${int} NOT NULL, PRIMARY KEY (person_id, trace_id, sha))`,
   ]
 }
@@ -127,9 +141,37 @@ export async function migrate(db: Db): Promise<void> {
     for (const stmt of schemaStatements(real, int)) await q.all(stmt)
     if (from < 2) for (const stmt of migrationV2(real, int)) await q.all(stmt)
     if (from < 3) for (const stmt of migrationV3()) await q.all(stmt)
+    if (from < 4) for (const stmt of migrationV4(int, from)) await q.all(stmt)
     if (!stored) await q.all('INSERT INTO schema_version (version) VALUES (?)', [SCHEMA_VERSION])
     else if (from < SCHEMA_VERSION) await q.all('UPDATE schema_version SET version = ?', [SCHEMA_VERSION])
   })
+}
+
+/** What a hidden project is called in every rollup. A project can't be hidden under this name. */
+export const HIDDEN_PROJECT = 'unknown'
+export const PROJECT_MAX_LENGTH = 128
+export const NAME_MAX_LENGTH = 100
+
+async function hiddenProjectSet(q: Querier, personId: string): Promise<Set<string>> {
+  return new Set((await q.all('SELECT project FROM hidden_projects WHERE person_id = ?', [personId])).map(r => String(r.project)))
+}
+
+/** Validates a display name: trimmed, 1-100 characters, no control characters. Null when invalid. */
+export function cleanName(input: string): string | null {
+  const name = input.trim()
+  // eslint-disable-next-line no-control-regex
+  return !name || name.length > NAME_MAX_LENGTH || /[\u0000-\u001f\u007f]/.test(name) ? null : name
+}
+
+/** Trims and de-duplicates project names to hide. Null when any is empty, too long or the reserved 'unknown'. */
+export function cleanProjectNames(input: string[]): string[] | null {
+  const out = new Set<string>()
+  for (const raw of input) {
+    const name = raw.trim()
+    if (!name || name.length > PROJECT_MAX_LENGTH || name === HIDDEN_PROJECT) return null
+    out.add(name)
+  }
+  return [...out]
 }
 
 export interface Person { id: string; name: string; email: string; team: string; revoked_at: string | null }
@@ -156,6 +198,8 @@ export function canonicalTeam(input: string, existing: string[]): string | null 
 
 export interface SpanRecord {
   span_id: string
+  /** Set by the store when the owner hid this project: the real name, while `project` reads 'unknown'. */
+  real_project?: string | null
   trace_id: string
   ts: string
   provider: string
@@ -229,7 +273,7 @@ const SPAN_COLUMNS = [
   'detail_level', 'work_unit_id', 'session_role', 'call_count', 'session_duration_ms', 'speed', 'route', 'billing', 'cost_estimated',
   'subscription_covered', 'reasoning', 'web_search', 'cache_write_1h', 'savings_usd', 'nano_aiu', 'request_weight', 'lines_added',
   'lines_removed', 'tool_errors', 'interrupted', 'user_modified', 'active_ms', 'tool_wait_ms', 'turn_start', 'turn_has_edits',
-  'turn_retries', 'plan_mode', 'mcp_tools', 'skills', 'subagent_types',
+  'turn_retries', 'plan_mode', 'mcp_tools', 'skills', 'subagent_types', 'real_project',
 ] as const
 
 const bit = (b: boolean) => (b ? 1 : 0)
@@ -241,7 +285,7 @@ function spanValues(s: SpanRecord, day: string): unknown[] {
     s.detail_level, s.work_unit_id, s.session_role, s.call_count, s.session_duration_ms, s.speed, s.route, s.billing, bit(s.cost_estimated),
     bit(s.subscription_covered), s.reasoning, s.web_search, s.cache_write_1h, s.savings_usd, s.nano_aiu, s.request_weight, s.lines_added,
     s.lines_removed, s.tool_errors, bit(s.interrupted), bit(s.user_modified), s.active_ms, s.tool_wait_ms, bit(s.turn_start), bit(s.turn_has_edits),
-    s.turn_retries, bit(s.plan_mode), nameList(s.mcp_tools), nameList(s.skills), nameList(s.subagent_types),
+    s.turn_retries, bit(s.plan_mode), nameList(s.mcp_tools), nameList(s.skills), nameList(s.subagent_types), s.real_project ?? null,
   ]
 }
 
@@ -439,10 +483,15 @@ export class Store {
            FROM spans WHERE person_id = ? AND trace_id = ? AND detail_level = 'sessions' GROUP BY trace_id, person_id`, [toId, trace])
       }
       await q.all(
-        `INSERT INTO work_sessions (person_id, trace_id, repo, project, started, ended, commit_count, pr_links)
-         SELECT ?, trace_id, repo, project, started, ended, commit_count, pr_links FROM work_sessions WHERE person_id = ? AND 1=1
+        `INSERT INTO work_sessions (person_id, trace_id, repo, project, started, ended, commit_count, pr_links, hidden)
+         SELECT ?, trace_id, repo, project, started, ended, commit_count, pr_links, hidden FROM work_sessions WHERE person_id = ? AND 1=1
          ON CONFLICT (person_id, trace_id) DO NOTHING`, [toId, fromId])
       await q.all('DELETE FROM work_sessions WHERE person_id = ?', [fromId])
+      // Spans keep their real_project when they move, so the target must hide the same projects.
+      await q.all(
+        `INSERT INTO hidden_projects (person_id, project) SELECT ?, project FROM hidden_projects WHERE person_id = ? AND 1=1
+         ON CONFLICT (person_id, project) DO NOTHING`, [toId, fromId])
+      await q.all('DELETE FROM hidden_projects WHERE person_id = ?', [fromId])
       await q.all(
         `INSERT INTO work_commits (person_id, trace_id, repo, sha, ts, in_main, was_reverted)
          SELECT ?, trace_id, repo, sha, ts, in_main, was_reverted FROM work_commits WHERE person_id = ? AND 1=1
@@ -472,12 +521,104 @@ export class Store {
       const [c] = await q.all('SELECT COUNT(*) AS n FROM spans WHERE person_id = ?', [id])
       const spans = Number(c?.n ?? 0)
       if (spans > 0 && !force) return { deleted: false as const, reason: 'has_usage' as const, spans }
-      for (const t of ['spans', 'daily_usage', 'daily_names', 'sessions', 'findings', 'work_sessions', 'work_commits', 'devices', 'enrollments', 'sso_sessions']) {
+      for (const t of ['spans', 'daily_usage', 'daily_names', 'sessions', 'findings', 'work_sessions', 'work_commits', 'hidden_projects', 'devices', 'enrollments', 'sso_sessions']) {
         await q.all(`DELETE FROM ${t} WHERE person_id = ?`, [id])
       }
       await q.all('DELETE FROM people WHERE id = ?', [id])
       return { deleted: true as const, spans }
     })
+  }
+
+  // ---- member profile ----
+
+  /**
+   * Changes a person's own name and/or team. A team that differs from an existing one only in case or spacing takes
+   * the existing spelling. The name also updates their open sign-in sessions, so the header shows it at once.
+   */
+  async updateProfile(personId: string, change: { name?: string; team?: string }): Promise<{ name: string; team: string } | { error: 'invalid_name' | 'invalid_team' | 'not_found' }> {
+    const person = await this.getPerson(personId)
+    if (!person || person.revoked_at) return { error: 'not_found' }
+    let name = person.name
+    let team = person.team
+    if (change.name !== undefined) {
+      const cleaned = cleanName(change.name)
+      if (!cleaned) return { error: 'invalid_name' }
+      name = cleaned
+    }
+    if (change.team !== undefined) {
+      const cleaned = canonicalTeam(change.team, await this.distinctTeams())
+      if (!cleaned) return { error: 'invalid_team' }
+      team = cleaned
+    }
+    await this.db.tx(async q => {
+      await q.all('UPDATE people SET name = ?, team = ? WHERE id = ?', [name, team, personId])
+      await q.all(`UPDATE sso_sessions SET name = ? WHERE person_id = ? AND role = 'member'`, [name, personId])
+    })
+    return { name, team }
+  }
+
+  /** Every project a person has sent usage for (real names, hidden or not) plus any they hid ahead of time. Owner view only. */
+  async memberProjects(personId: string): Promise<Array<{ project: string; hidden: boolean; cost: number }>> {
+    const rows = await this.all(
+      `SELECT COALESCE(real_project, project) AS name, SUM(cost_usd) AS cost FROM spans WHERE person_id = ? GROUP BY COALESCE(real_project, project)`, [personId])
+    const hidden = await hiddenProjectSet(this, personId)
+    const out = new Map<string, { project: string; hidden: boolean; cost: number }>()
+    for (const r of rows) {
+      const project = String(r.name)
+      if (project === HIDDEN_PROJECT) continue
+      out.set(project, { project, hidden: hidden.has(project), cost: Number(r.cost) })
+    }
+    for (const project of hidden) if (!out.has(project)) out.set(project, { project, hidden: true, cost: 0 })
+    return [...out.values()].sort((a, b) => b.cost - a.cost || a.project.localeCompare(b.project))
+  }
+
+  /**
+   * Replaces the set of projects a person hides. Newly hidden projects are renamed to 'unknown' in everything
+   * already stored (spans, daily totals, names, sessions, git attribution); projects no longer hidden get their
+   * real names back. Returns false when a name is invalid.
+   */
+  async setHiddenProjects(personId: string, names: string[]): Promise<boolean> {
+    const cleaned = cleanProjectNames(names)
+    if (!cleaned) return false
+    const next = new Set(cleaned)
+    await this.db.tx(async q => {
+      const current = await hiddenProjectSet(q, personId)
+      const days = new Set<string>()
+      const traces = new Set<string>()
+      const note = async (where: string, params: unknown[]) => {
+        for (const r of await q.all(`SELECT DISTINCT day, trace_id FROM spans WHERE person_id = ? AND ${where}`, [personId, ...params])) {
+          days.add(String(r.day))
+          traces.add(String(r.trace_id))
+        }
+      }
+      for (const project of next) {
+        if (current.has(project)) continue
+        await note('project = ? AND real_project IS NULL', [project])
+        await q.all(`UPDATE spans SET real_project = project, project = ? WHERE person_id = ? AND project = ? AND real_project IS NULL`, [HIDDEN_PROJECT, personId, project])
+        await q.all('UPDATE work_sessions SET hidden = 1 WHERE person_id = ? AND project = ?', [personId, project])
+        await q.all('INSERT INTO hidden_projects (person_id, project) VALUES (?, ?) ON CONFLICT (person_id, project) DO NOTHING', [personId, project])
+      }
+      for (const project of current) {
+        if (next.has(project)) continue
+        await note('real_project = ?', [project])
+        await q.all('UPDATE spans SET project = real_project, real_project = NULL WHERE person_id = ? AND real_project = ?', [personId, project])
+        await q.all('UPDATE work_sessions SET hidden = 0 WHERE person_id = ? AND project = ?', [personId, project])
+        await q.all('DELETE FROM hidden_projects WHERE person_id = ? AND project = ?', [personId, project])
+      }
+      for (const day of days) {
+        await q.all('DELETE FROM daily_usage WHERE person_id = ? AND day = ?', [personId, day])
+        await q.all(dailyUsageInsert('WHERE person_id = ? AND day = ?'), [personId, day])
+        await this.rebuildDailyNames(q, personId, day)
+      }
+      for (const trace of traces) {
+        await q.all('DELETE FROM sessions WHERE person_id = ? AND trace_id = ?', [personId, trace])
+        await q.all(
+          `INSERT INTO sessions (trace_id, person_id, project, started, duration_ms, calls, cost)
+           SELECT trace_id, person_id, MAX(project), MIN(ts), COALESCE(MAX(session_duration_ms), 0), SUM(request_weight), SUM(cost_usd)
+           FROM spans WHERE person_id = ? AND trace_id = ? AND detail_level = 'sessions' GROUP BY trace_id, person_id`, [personId, trace])
+      }
+    })
+    return true
   }
 
   // ---- viewers ----
@@ -552,7 +693,10 @@ export class Store {
       }
       let stored = 0
       let conflicts = 0
-      for (const s of spans) {
+      const hidden = await hiddenProjectSet(q, personId)
+      for (const incoming of spans) {
+        // A project the owner hid is stored as 'unknown'; the real name stays on the row so it can be restored.
+        const s = hidden.has(incoming.project) ? { ...incoming, project: HIDDEN_PROJECT, real_project: incoming.project } : incoming
         const prev = existing.get(s.span_id)
         if (prev && prev.person_id !== personId) { conflicts++; continue }
         if (prev) { days.add(prev.day); traces.add(prev.trace_id) }
@@ -613,12 +757,13 @@ export class Store {
   async ingestAttribution(personId: string, sessions: WorkSessionRecord[], commits: WorkCommitRecord[]): Promise<void> {
     if (sessions.length === 0 && commits.length === 0) return
     await this.db.tx(async q => {
+      const hidden = await hiddenProjectSet(q, personId)
       for (const s of sessions) {
         await q.all(
-          `INSERT INTO work_sessions (person_id, trace_id, repo, project, started, ended, commit_count, pr_links) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO work_sessions (person_id, trace_id, repo, project, started, ended, commit_count, pr_links, hidden) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (person_id, trace_id) DO UPDATE SET repo = excluded.repo, project = excluded.project, started = excluded.started,
-             ended = excluded.ended, commit_count = excluded.commit_count, pr_links = excluded.pr_links`,
-          [personId, s.trace_id, s.repo, s.project, s.started, s.ended, s.commit_count, JSON.stringify(s.pr_links)])
+             ended = excluded.ended, commit_count = excluded.commit_count, pr_links = excluded.pr_links, hidden = excluded.hidden`,
+          [personId, s.trace_id, s.repo, s.project, s.started, s.ended, s.commit_count, JSON.stringify(s.pr_links), hidden.has(s.project) ? 1 : 0])
       }
       for (const c of commits) {
         await q.all(

@@ -14,9 +14,10 @@ import { Tools } from './pages/Tools'
 import { Work } from './pages/Work'
 import { Sessions } from './pages/Sessions'
 import { Insights } from './pages/Insights'
+import { Profile } from './pages/Profile'
 import { Register } from './Register'
 
-type Page = 'overview' | 'people' | 'models' | 'tools' | 'projects' | 'work' | 'sessions' | 'insights'
+type Page = 'overview' | 'people' | 'models' | 'tools' | 'projects' | 'work' | 'sessions' | 'insights' | 'profile'
 const PAGES: Array<{ key: Page; label: string }> = [
   { key: 'overview', label: 'Overview' },
   { key: 'people', label: 'People' },
@@ -26,6 +27,8 @@ const PAGES: Array<{ key: Page; label: string }> = [
   { key: 'work', label: 'Repos & PRs' },
   { key: 'sessions', label: 'Sessions' },
   { key: 'insights', label: 'Insights' },
+  // Members only: edit your own name, team and hidden projects.
+  { key: 'profile', label: 'My profile' },
 ]
 
 /** Hash route: #/page or #/people/<id>. */
@@ -191,9 +194,9 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
   const range = useMemo(() => computeRange(period, new Date(), custom), [period, custom])
   const filters: Filters = { ...range, team: team || undefined, person: person || undefined }
   const hasSessions = meta.detail_levels?.includes('sessions') ?? false
-  const pages = PAGES.filter((p) => (p.key !== 'sessions' && p.key !== 'work') || hasSessions)
-  const page = pages.some((p) => p.key === route.page) ? route.page : 'overview'
   const member = meta.viewer?.role === 'member'
+  const pages = PAGES.filter((p) => ((p.key !== 'sessions' && p.key !== 'work') || hasSessions) && (p.key !== 'profile' || member))
+  const page = pages.some((p) => p.key === route.page) ? route.page : 'overview'
   const people = (meta.people ?? []).filter((p) => !team || p.team === team)
 
   return (
@@ -228,7 +231,7 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
           </button>
         ))}
       </nav>
-      <div className="flex flex-wrap items-center gap-3 px-5 py-3 text-xs">
+      {page === 'profile' ? null : <div className="flex flex-wrap items-center gap-3 px-5 py-3 text-xs">
         <select className={selectCls} value={period} onChange={(e) => setPeriod(e.target.value as PeriodKey)} aria-label="Period">
           {PERIOD_OPTIONS.map((o) => (
             <option key={o.key} value={o.key}>{o.label}</option>
@@ -265,7 +268,7 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
             Compare to previous period
           </label>
         ) : null}
-      </div>
+      </div>}
       <main className="px-5 pb-10">
         {page === 'overview' && <Overview filters={filters} compare={compare} />}
         {page === 'people' &&
@@ -282,6 +285,7 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
         {page === 'work' && <Work filters={filters} />}
         {page === 'sessions' && <Sessions filters={filters} />}
         {page === 'insights' && <Insights filters={filters} />}
+        {page === 'profile' && <Profile />}
       </main>
     </div>
   )

@@ -70,6 +70,20 @@ export const getRegistration = () => request<Registration>('GET', '/api/team/reg
 export const register = (team: string) => request<InstallInfo>('POST', '/api/team/registration', undefined, { team })
 export const newInstallToken = () => request<InstallInfo>('POST', '/api/team/registration/token', undefined, {})
 
+// ---- Member profile --------------------------------------------------------
+export type Profile = {
+  name: string
+  email: string
+  team: string
+  /** Teams already in use, for the picker. */
+  teams: string[]
+  /** Every project the member has sent usage for, under its real name. Only the member ever sees these. */
+  projects: Array<{ project: string; hidden: boolean; cost: number }>
+}
+export type ProfileChange = { name?: string; team?: string; hidden_projects?: string[] }
+export const getProfile = () => request<Profile>('GET', '/api/team/profile')
+export const saveProfile = (change: ProfileChange) => request<Profile>('POST', '/api/team/profile', undefined, change)
+
 // ---- Types -----------------------------------------------------------------
 export type Role = 'admin' | 'member' | 'registrant'
 export type Breakdown = { name: string; cost: number; tokens: number; calls?: number }

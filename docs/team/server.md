@@ -365,6 +365,28 @@ Registrations are logged to stderr. A revoked person can't register again with t
 
 GitLab sign-in sessions last 12 hours, the same as viewer-key sessions; after that, users sign in again.
 
+### Member profile and hidden projects
+
+A signed-in member (not an admin viewer key) gets a **My profile** tab in the viewer. It edits only their own record:
+
+- **Name.** Free text, 1-100 characters. The header and the people lists show the new name at once.
+- **Team.** Pick an existing team or type a new one, with the same rules as registration (a name that differs from an
+  existing team only in case or spacing takes the existing spelling).
+- **Email.** Read only. It is what links the GitLab login to the person.
+- **Hidden projects.** The tab lists every project the member has sent usage for. A hidden project's usage still counts
+  in their totals, but every other view (admins included) shows it as `unknown`: the daily totals, models and tools,
+  sessions, and the repo and pull-request list on **Repos & PRs** (the repo reads `unknown` and PR links are dropped).
+  Hiding applies to usage already stored and to anything that arrives later, even if it is sent after a re-sync.
+  Unhiding restores the real names. Only the member sees the real names, in their own profile.
+
+Who can see what: the real project names are kept in the database so unhiding can restore them, and are exposed only by
+the member's own profile endpoint. A server operator with direct database access can still read them (`spans.real_project`
+and the `hidden_projects` table); hiding is a privacy control inside the viewer, not encryption.
+
+`codeburn team admin merge-person` moves a person's hidden projects along with their usage, and `delete-person` removes
+them. Admins have no profile page (`/api/team/profile` is 404 for a viewer key and 403 for a not-yet-registered GitLab
+user).
+
 ### Troubleshooting
 
 The server logs the reason for every failed GitLab sign-in to stderr. The browser only sees one of two messages:
@@ -504,7 +526,8 @@ docker exec codeburn-team node dist/cli.js team admin add-viewer --name "Manager
 - `GET /auth/gitlab/login`, `GET /auth/gitlab/callback`: GitLab sign-in, only when it is configured (404 otherwise).
 - `/register`: the self-registration page (part of the viewer).
 - `/api/team/*`: viewer API (auth-methods, login, logout, meta, overview, people, models, tools, projects, sessions,
-  work, insights, and `registration` / `registration/token` for self-registration). "Tokens" in these
+  work, insights, `registration` / `registration/token` for self-registration, and `profile` for a member's own details:
+  `GET` reads them and `POST {name?, team?, hidden_projects?}` changes them, with identity taken from the session). "Tokens" in these
   responses are input + output + cache read + cache write; `cache_read_ratio` is cache reads / (input + cache reads).
   `calls` counts requests: accounting-only records add cost but no call. `one_shot_rate` is edit prompts that needed
   no retry / edit prompts, and is null until a client sends turn outcomes. `tools` returns MCP tools, skills and

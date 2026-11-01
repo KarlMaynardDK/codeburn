@@ -235,6 +235,11 @@ function parseLinks(json: unknown): string[] {
   }
 }
 
+/** Attribution rows of a project the owner hid read as 'unknown', with no PR links. */
+const WS_REPO = `CASE WHEN ws.hidden = 1 THEN 'unknown' ELSE ws.repo END`
+const WS_PROJECT = `CASE WHEN ws.hidden = 1 THEN 'unknown' ELSE ws.project END`
+const WS_PR_LINKS = `CASE WHEN ws.hidden = 1 THEN '[]' ELSE ws.pr_links END`
+
 /**
  * Git attribution: repos and PRs the period's sessions worked on. Spend is the session's total (from the sessions
  * table), so a session that touched two PRs counts toward both.
@@ -244,16 +249,16 @@ export async function work(store: Store, f: Filters) {
   let scope = 'ws.started >= ? AND ws.started < ?'
   if (f.person) { scope += ' AND ws.person_id = ?'; params.push(f.person) }
   if (f.team) { scope += ' AND p.team = ?'; params.push(f.team) }
-  if (f.project) { scope += ' AND ws.project = ?'; params.push(f.project) }
+  if (f.project) { scope += ` AND ${WS_PROJECT} = ?`; params.push(f.project) }
   const [sessionRows, commitRows] = await Promise.all([
-    store.all(`SELECT ws.person_id AS person_id, ws.repo AS repo, ws.pr_links AS pr_links, COALESCE(s.cost, 0) AS cost
+    store.all(`SELECT ws.person_id AS person_id, ${WS_REPO} AS repo, ${WS_PR_LINKS} AS pr_links, COALESCE(s.cost, 0) AS cost
       FROM work_sessions ws JOIN people p ON p.id = ws.person_id
       LEFT JOIN sessions s ON s.person_id = ws.person_id AND s.trace_id = ws.trace_id WHERE ${scope}`, params),
-    store.all(`SELECT wc.repo AS repo, COUNT(DISTINCT wc.sha) AS commits,
+    store.all(`SELECT ${WS_REPO} AS repo, COUNT(DISTINCT wc.sha) AS commits,
         COUNT(DISTINCT CASE WHEN wc.in_main = 1 THEN wc.sha END) AS landed,
         COUNT(DISTINCT CASE WHEN wc.was_reverted = 1 THEN wc.sha END) AS reverted
       FROM work_commits wc JOIN work_sessions ws ON ws.person_id = wc.person_id AND ws.trace_id = wc.trace_id
-      JOIN people p ON p.id = ws.person_id WHERE ${scope} GROUP BY wc.repo`, params),
+      JOIN people p ON p.id = ws.person_id WHERE ${scope} GROUP BY ${WS_REPO}`, params),
   ])
   const repos = new Map<string, { repo: string; sessions: number; cost: number; people: Set<string>; prs: Set<string> }>()
   const prs = new Map<string, { url: string; repo: string; sessions: number; cost: number; people: Set<string> }>()

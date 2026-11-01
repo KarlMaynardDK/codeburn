@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { TeamServerConfig } from './config.js'
-import type { Person, Store, Viewer } from './store.js'
+import { cleanProjectNames, type Person, type Store, type Viewer } from './store.js'
 import { FailureLimiter, SESSION_COOKIE, clearedSessionCookie, isSameOriginRequest, readCookie, sessionCookie } from './auth.js'
 import { installerLines, setupCommand } from './client-package.js'
 import { registrationEnabled } from './gitlab.js'
@@ -99,6 +99,48 @@ async function handleRegistration(ctx: ApiContext, req: IncomingMessage, res: Se
   return sendJson(res, 404, { error: 'not_found' })
 }
 
+async function profileResponse(store: Store, personId: string) {
+  const person = await store.getPerson(personId)
+  if (!person) return null
+  return { name: person.name, email: person.email, team: person.team, teams: await store.distinctTeams(), projects: await store.memberProjects(personId) }
+}
+
+/**
+ * A member's own details: GET reads them, POST changes the name, the team and/or the hidden projects. Identity comes
+ * from the session only. Hidden project names are never visible to anyone else, admins included.
+ */
+async function handleProfile(ctx: ApiContext, req: IncomingMessage, res: ServerResponse, viewer: Viewer): Promise<void> {
+  const { store } = ctx
+  if (viewer.role === 'registrant') return sendJson(res, 403, { error: 'registration_required' })
+  if (viewer.role !== 'member') return sendJson(res, 404, { error: 'not_found' })
+
+  if (req.method === 'POST') {
+    const raw = await readBody(req, 128 * 1024)
+    let body: { name?: unknown; team?: unknown; hidden_projects?: unknown }
+    try { body = raw === 'too_large' ? {} : JSON.parse(raw.toString('utf-8')) } catch { return sendJson(res, 400, { error: 'invalid_json' }) }
+    if (raw === 'too_large' || !body || typeof body !== 'object') return sendJson(res, 400, { error: 'invalid_json' })
+    if (body.name !== undefined && typeof body.name !== 'string') return sendJson(res, 400, { error: 'invalid_name' })
+    if (body.team !== undefined && typeof body.team !== 'string') return sendJson(res, 400, { error: 'invalid_team' })
+    const hidden = body.hidden_projects
+    if (hidden !== undefined && (!Array.isArray(hidden) || hidden.length > 1000 || hidden.some(h => typeof h !== 'string'))) {
+      return sendJson(res, 400, { error: 'invalid_projects' })
+    }
+    if (hidden !== undefined && !cleanProjectNames(hidden as string[])) return sendJson(res, 400, { error: 'invalid_projects' })
+    // Everything is validated before the first write, so a bad field changes nothing.
+    if (body.name !== undefined || body.team !== undefined) {
+      const r = await store.updateProfile(viewer.personId, { name: body.name as string | undefined, team: body.team as string | undefined })
+      if ('error' in r) return sendJson(res, r.error === 'not_found' ? 404 : 400, { error: r.error })
+    }
+    if (hidden !== undefined) await store.setHiddenProjects(viewer.personId, hidden as string[])
+    process.stderr.write(`team-server: profile updated for ${viewer.personId}
+`)
+  } else if (req.method !== 'GET') {
+    return sendJson(res, 405, { error: 'method_not_allowed' })
+  }
+  const profile = await profileResponse(store, viewer.personId)
+  return profile ? sendJson(res, 200, profile) : sendJson(res, 404, { error: 'not_found' })
+}
+
 function parseFilters(url: URL, now = new Date()): rollup.Filters | { error: string } {
   const to = url.searchParams.get('to') ?? rollup.dayOf(now)
   const from = url.searchParams.get('from') ?? rollup.addDays(to, -29)
@@ -155,6 +197,7 @@ export async function handleApi(ctx: ApiContext, req: IncomingMessage, res: Serv
   if (path === '/api/team/registration' || path.startsWith('/api/team/registration/')) {
     return handleRegistration(ctx, req, res, path, viewer, token!)
   }
+  if (path === '/api/team/profile') return handleProfile(ctx, req, res, viewer)
   if (req.method !== 'GET') return sendJson(res, 405, { error: 'method_not_allowed' })
 
   const base = {

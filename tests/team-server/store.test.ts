@@ -7,6 +7,7 @@ import { loadConfig } from '../../src/team-server/config.js'
 import { canonicalTeam, migrate, SCHEMA_VERSION, type SpanRecord } from '../../src/team-server/store.js'
 import { toPgSql } from '../../src/team-server/store-postgres.js'
 import { BACKENDS, makeStore, type TestStore } from './helpers.js'
+import * as rollup from '../../src/team-server/rollup.js'
 
 function spanRecord(o: Partial<SpanRecord> & { span_id: string; ts: string }): SpanRecord {
   return {
@@ -235,5 +236,111 @@ describe.each(BACKENDS)('store (%s)', backend => {
     expect((await devices())[0]!.client_version).toBe('1.2.3')
     await ts.store.authenticateDevice(enrolled.credential, '1.3.0-team.7')
     expect((await devices())[0]!.client_version).toBe('1.3.0-team.7')
+  })
+  describe('hidden projects', () => {
+    const now = new Date().toISOString()
+    const day = now.slice(0, 10)
+    const spans = (extra: Partial<SpanRecord> = {}) => [
+      spanRecord({ span_id: 'a1', ts: now, project: 'secret', cost_usd: 2, lines_added: 5, trace_id: 't1', detail_level: 'sessions', session_duration_ms: 1000, ...extra }),
+      spanRecord({ span_id: 'a2', ts: now, project: 'app', cost_usd: 3, lines_added: 7, trace_id: 't2', detail_level: 'sessions', session_duration_ms: 1000, ...extra }),
+    ]
+    const totals = async (id: string) => {
+      const [r] = await ts.store.all('SELECT SUM(cost_usd) AS cost, SUM(lines_added) AS loc FROM daily_usage WHERE person_id = ?', [id])
+      return { cost: Number(r!.cost), loc: Number(r!.loc) }
+    }
+    const projectsOf = async (id: string) => (await ts.store.all('SELECT DISTINCT project FROM daily_usage WHERE person_id = ? ORDER BY project', [id])).map(r => r.project)
+
+    it('renames a hidden project to unknown everywhere, keeps the totals, and restores it on unhide', async () => {
+      ts = await makeStore(backend)
+      const { person } = await ts.store.addPerson({ name: 'Ann', email: '', team: 'T' })
+      await ts.store.ingestSpans(person.id, 'd', spans(), true)
+      expect(await projectsOf(person.id)).toEqual(['app', 'secret'])
+
+      expect(await ts.store.setHiddenProjects(person.id, ['secret'])).toBe(true)
+      expect(await projectsOf(person.id)).toEqual(['app', 'unknown'])
+      expect(await totals(person.id)).toEqual({ cost: 5, loc: 12 })
+      expect((await ts.store.all('SELECT project FROM sessions WHERE trace_id = ?', ['t1']))[0]!.project).toBe('unknown')
+      expect(await ts.store.all(`SELECT * FROM spans WHERE project = 'secret'`)).toEqual([])
+      expect(await ts.store.memberProjects(person.id)).toEqual([
+        { project: 'app', hidden: false, cost: 3 },
+        { project: 'secret', hidden: true, cost: 2 },
+      ])
+
+      expect(await ts.store.setHiddenProjects(person.id, [])).toBe(true)
+      expect(await projectsOf(person.id)).toEqual(['app', 'secret'])
+      expect(await totals(person.id)).toEqual({ cost: 5, loc: 12 })
+      expect((await ts.store.all('SELECT project FROM sessions WHERE trace_id = ?', ['t1']))[0]!.project).toBe('secret')
+      expect((await ts.store.all('SELECT real_project FROM spans WHERE span_id = ?', ['a1']))[0]!.real_project).toBeNull()
+    })
+
+    it('hides spans that arrive after the project was hidden, including a resend', async () => {
+      ts = await makeStore(backend)
+      const { person } = await ts.store.addPerson({ name: 'Ann', email: '', team: 'T' })
+      await ts.store.setHiddenProjects(person.id, ['secret'])
+      await ts.store.ingestSpans(person.id, 'd', spans(), true)
+      await ts.store.ingestSpans(person.id, 'd', spans(), true)
+      expect(await projectsOf(person.id)).toEqual(['app', 'unknown'])
+      expect(await totals(person.id)).toEqual({ cost: 5, loc: 12 })
+      await ts.store.setHiddenProjects(person.id, [])
+      expect(await projectsOf(person.id)).toEqual(['app', 'secret'])
+    })
+
+    it('masks the repo, project filter and PR links of hidden git attribution', async () => {
+      ts = await makeStore(backend)
+      const { person } = await ts.store.addPerson({ name: 'Ann', email: '', team: 'T' })
+      await ts.store.ingestSpans(person.id, 'd', spans(), true)
+      await ts.store.ingestAttribution(person.id,
+        [{ trace_id: 't1', repo: 'acme/secret-repo', project: 'secret', started: now, ended: now, commit_count: 1, pr_links: ['https://git.example/acme/secret-repo/-/merge_requests/1'] }],
+        [{ trace_id: 't1', repo: 'acme/secret-repo', sha: 'abcdef1', ts: now, in_main: true, was_reverted: false }])
+      const filters = { from: day, to: day }
+      expect((await rollup.work(ts.store, filters)).repos.map(r => r.repo)).toEqual(['acme/secret-repo'])
+
+      await ts.store.setHiddenProjects(person.id, ['secret'])
+      const hidden = await rollup.work(ts.store, filters)
+      expect(JSON.stringify(hidden)).not.toContain('secret')
+      expect(hidden.repos).toMatchObject([{ repo: 'unknown', sessions: 1, commits: 1, prs: 0 }])
+      expect((await rollup.work(ts.store, { ...filters, project: 'unknown' })).repos).toHaveLength(1)
+
+      await ts.store.setHiddenProjects(person.id, [])
+      expect((await rollup.work(ts.store, filters)).repos.map(r => r.repo)).toEqual(['acme/secret-repo'])
+    })
+
+    it('rejects empty, overlong and reserved names without changing anything', async () => {
+      ts = await makeStore(backend)
+      const { person } = await ts.store.addPerson({ name: 'Ann', email: '', team: 'T' })
+      expect(await ts.store.setHiddenProjects(person.id, ['ok', ''])).toBe(false)
+      expect(await ts.store.setHiddenProjects(person.id, ['unknown'])).toBe(false)
+      expect(await ts.store.setHiddenProjects(person.id, ['x'.repeat(129)])).toBe(false)
+      expect(await ts.store.all('SELECT * FROM hidden_projects')).toEqual([])
+    })
+
+    it('carries hidden projects along on merge and removes them on delete', async () => {
+      ts = await makeStore(backend)
+      const a = (await ts.store.addPerson({ name: 'A', email: '', team: 'T' })).person
+      const b = (await ts.store.addPerson({ name: 'B', email: '', team: 'T' })).person
+      await ts.store.ingestSpans(a.id, 'd', spans(), true)
+      await ts.store.setHiddenProjects(a.id, ['secret'])
+      await ts.store.mergePerson(a.id, b.id)
+      expect(await projectsOf(b.id)).toEqual(['app', 'unknown'])
+      expect(await ts.store.memberProjects(b.id)).toContainEqual({ project: 'secret', hidden: true, cost: 2 })
+      await ts.store.ingestSpans(b.id, 'd', [spanRecord({ span_id: 'n1', ts: now, project: 'secret' })], false)
+      expect((await ts.store.all('SELECT project FROM spans WHERE span_id = ?', ['n1']))[0]!.project).toBe('unknown')
+      await ts.store.deletePerson(b.id, true)
+      expect(await ts.store.all('SELECT * FROM hidden_projects')).toEqual([])
+    })
+  })
+
+  it('updates a member profile: name, team spelling, and open sessions', async () => {
+    ts = await makeStore(backend)
+    const a = (await ts.store.addPerson({ name: 'Ann', email: 'a@x.io', team: 'Platform' })).person
+    const token = await ts.store.loginSso({ name: 'Ann', role: 'member', personId: a.id, subject: '1' })
+    expect(await ts.store.updateProfile(a.id, { name: '  Ann Lee ', team: 'platform' })).toEqual({ name: 'Ann Lee', team: 'Platform' })
+    expect(await ts.store.viewerForSession(token)).toMatchObject({ name: 'Ann Lee', role: 'member' })
+    expect(await ts.store.updateProfile(a.id, { team: 'New Team' })).toEqual({ name: 'Ann Lee', team: 'New Team' })
+    expect(await ts.store.updateProfile(a.id, { name: '   ' })).toEqual({ error: 'invalid_name' })
+    expect(await ts.store.updateProfile(a.id, { name: 'a\nb' })).toEqual({ error: 'invalid_name' })
+    expect(await ts.store.updateProfile(a.id, { team: '' })).toEqual({ error: 'invalid_team' })
+    expect(await ts.store.getPerson(a.id)).toMatchObject({ name: 'Ann Lee', team: 'New Team', email: 'a@x.io' })
+    expect(await ts.store.updateProfile('p_nope', { name: 'X' })).toEqual({ error: 'not_found' })
   })
 })
