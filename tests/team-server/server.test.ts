@@ -655,4 +655,118 @@ describe.each(BACKENDS)('team server (%s)', backend => {
       expect(anon.status).toBe(401)
     })
   })
+  describe('team admin', () => {
+    const asTeamAdmin = async (personId: string, teams: string[], name = 'Lead') => {
+      await t.store.setTeamAdmin(personId, teams)
+      const token = await t.store.loginSso({ name, role: 'member', personId, subject: 'ta' })
+      const headers = { cookie: `cb_team_session=${token}`, origin: `http://${t.host}`, 'content-type': 'application/json' }
+      const get = async (path: string) => {
+        const res = await fetch(t.base + path, { headers })
+        return { status: res.status, json: (await res.json().catch(() => null)) as any }
+      }
+      const postJson = async (path: string, body: unknown = {}) => {
+        const res = await fetch(t.base + path, { method: 'POST', headers, body: JSON.stringify(body) })
+        return { status: res.status, json: (await res.json().catch(() => null)) as any }
+      }
+      return { get, postJson }
+    }
+
+    const seed = async () => {
+      const lead = await enrollPerson(t, 'Lead', 'Web')
+      const ann = await enrollPerson(t, 'Ann', 'Web')
+      const bob = await enrollPerson(t, 'Bob', 'Data')
+      const cy = await enrollPerson(t, 'Cy', 'Ops')
+      for (const [who, id] of [[lead, 'l'], [ann, 'a'], [bob, 'b'], [cy, 'c']] as const) {
+        await send(t, who.cred, [span({ id, at: daysAgo(1), cost: 1 })])
+      }
+      return { lead, ann, bob, cy }
+    }
+
+    it('sees only the teams they administer, plus themselves', async () => {
+      t = await startServer(backend)
+      const { lead, ann, bob, cy } = await seed()
+      const ta = await asTeamAdmin(lead.person.id, ['Web', 'Data'])
+      const meta = (await ta.get('/api/team/meta')).json
+      expect(meta.viewer.role).toBe('team_admin')
+      expect(meta.teams).toEqual(['Data', 'Web'])
+      expect(meta.people.map((p: any) => p.name).sort()).toEqual(['Ann', 'Bob', 'Lead'])
+      const people = (await ta.get('/api/team/people')).json.people.map((p: any) => p.name).sort()
+      expect(people).toEqual(['Ann', 'Bob', 'Lead'])
+      expect((await ta.get(`/api/team/people/${bob.person.id}`)).status).toBe(200)
+      expect((await ta.get(`/api/team/people/${cy.person.id}`)).status).toBe(404)
+      expect((await ta.get(`/api/team/overview?person=${cy.person.id}`)).status).toBe(404)
+      // A team outside the scope is ignored rather than widening it.
+      const ops = (await ta.get('/api/team/people?team=Ops')).json.people.map((p: any) => p.name).sort()
+      expect(ops).toEqual(['Ann', 'Bob', 'Lead'])
+      expect((await ta.get('/api/team/people?team=Data')).json.people.map((p: any) => p.name)).toEqual(['Bob'])
+      expect((await ta.get('/api/team/overview')).json.totals.active_people).toBe(3)
+      expect((await ta.get(`/api/team/people/${ann.person.id}`)).status).toBe(200)
+    })
+
+    it('still sees their own usage when their own team is not administered', async () => {
+      t = await startServer(backend)
+      const { lead } = await seed()
+      const ta = await asTeamAdmin(lead.person.id, ['Data'])
+      expect((await ta.get('/api/team/people')).json.people.map((p: any) => p.name).sort()).toEqual(['Bob', 'Lead'])
+    })
+
+    it('adds people and issues tokens only inside their teams', async () => {
+      t = await startServer(backend)
+      const { lead, ann, cy } = await seed()
+      const ta = await asTeamAdmin(lead.person.id, ['Web'])
+      const ok = await ta.postJson('/api/team/admin/people', { name: 'Dee', email: 'dee@example.com', team: ' web ' })
+      expect(ok.status).toBe(200)
+      expect(ok.json.person.team).toBe('Web')
+      expect((await ta.postJson('/api/team/admin/people', { name: 'Eve', email: 'eve@example.com', team: 'Ops' })).status).toBe(403)
+      expect((await ta.postJson('/api/team/admin/people', { name: 'Eve', email: 'eve@example.com', team: 'Brand New' })).status).toBe(403)
+      const tok = await ta.postJson(`/api/team/admin/people/${ann.person.id}/token`)
+      expect(tok.status).toBe(200)
+      expect(tok.json.token).toMatch(/^cbe_/)
+      expect((await ta.postJson(`/api/team/admin/people/${cy.person.id}/token`)).status).toBe(404)
+    })
+
+    it('cannot grant the role, and plain members cannot use any admin endpoint', async () => {
+      t = await startServer(backend)
+      const { lead, ann } = await seed()
+      const ta = await asTeamAdmin(lead.person.id, ['Web'])
+      expect((await ta.postJson(`/api/team/admin/people/${ann.person.id}/team-admin`, { teams: ['Web'] })).status).toBe(404)
+      expect(await t.store.teamsAdministered(ann.person.id)).toEqual([])
+      const token = await t.store.loginSso({ name: 'Ann', role: 'member', personId: ann.person.id, subject: 'm' })
+      const res = await fetch(t.base + `/api/team/admin/people/${ann.person.id}/token`, {
+        method: 'POST', headers: { cookie: `cb_team_session=${token}`, origin: `http://${t.host}`, 'content-type': 'application/json' }, body: '{}',
+      })
+      expect(res.status).toBe(404)
+    })
+
+    it('lets a full admin grant and revoke, and the change applies on the next request', async () => {
+      t = await startServer(backend)
+      const { lead } = await seed()
+      const admin = await viewerClient(t)
+      const grant = (teams: string[]) => fetch(t.base + `/api/team/admin/people/${lead.person.id}/team-admin`, {
+        method: 'POST', headers: { 'content-type': 'application/json', cookie: admin.cookie, origin: `http://${t.host}` }, body: JSON.stringify({ teams }),
+      })
+      const token = await t.store.loginSso({ name: 'Lead', role: 'member', personId: lead.person.id, subject: 'x' })
+      const me = async () => (await (await fetch(t.base + '/api/team/meta', { headers: { cookie: `cb_team_session=${token}`, origin: `http://${t.host}` } })).json() as any).viewer.role
+      expect(await me()).toBe('member')
+      const r = await grant(['web', 'Data'])
+      expect(r.status).toBe(200)
+      expect((await r.json() as any).teams).toEqual(['Data', 'Web'])
+      expect(await me()).toBe('team_admin')
+      expect((await admin.get('/api/team/meta')).json.people.find((p: any) => p.id === lead.person.id).team_admin_of).toEqual(['Data', 'Web'])
+      expect((await grant([])).status).toBe(200)
+      expect(await me()).toBe('member')
+      expect((await grant(['x'.repeat(200)])).status).toBe(400)
+    })
+
+    it('drops the role when the person is deleted and moves it on merge', async () => {
+      t = await startServer(backend)
+      const { lead, ann } = await seed()
+      await t.store.setTeamAdmin(lead.person.id, ['Web'])
+      await t.store.mergePerson(lead.person.id, ann.person.id)
+      expect(await t.store.teamsAdministered(ann.person.id)).toEqual(['Web'])
+      expect(await t.store.teamsAdministered(lead.person.id)).toEqual([])
+      await t.store.deletePerson(ann.person.id, true)
+      expect(await t.store.teamsAdministered(ann.person.id)).toEqual([])
+    })
+  })
 })

@@ -59,7 +59,7 @@ export function Instructions({ info }: { info: InstallInfo }) {
   return (
     <div className="flex flex-col gap-4">
       <p className="text-sm">
-        Registered <strong>{info.person.name}</strong> ({info.person.email}) in team <strong>{info.person.team}</strong>.
+        Install token for <strong>{info.person.name}</strong> ({info.person.email}), team <strong>{info.person.team}</strong>.
       </p>
       <CopyLine label="Install token" text={info.token} />
       <p className="text-xs text-tertiary-foreground">

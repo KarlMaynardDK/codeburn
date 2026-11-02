@@ -145,8 +145,10 @@ export function registerTeamCommands(program: Command): void {
         await withStore(opts, async store => {
           const people = await store.listPeople()
           if (people.length === 0) { process.stdout.write('No people yet. Use `codeburn team admin add-person`.\n'); return }
+          const grants = await store.listTeamAdmins()
           for (const p of people) {
-            process.stdout.write(`${p.id}  ${p.name}${p.email ? ` <${p.email}>` : ''}${p.team ? `  [${p.team}]` : ''}${p.revoked_at ? '  REVOKED' : ''}\n`)
+            const admins = grants[p.id]
+            process.stdout.write(`${p.id}  ${p.name}${p.email ? ` <${p.email}>` : ''}${p.team ? `  [${p.team}]` : ''}${admins?.length ? `  TEAM ADMIN of ${admins.join(', ')}` : ''}${p.revoked_at ? '  REVOKED' : ''}\n`)
             for (const d of p.devices) {
               process.stdout.write(`    ${d.id}  ${d.label ?? '(no label)'}  last seen ${d.last_seen ?? 'never'}  client ${d.client_version ?? 'unknown'}${d.revoked_at ? '  REVOKED' : ''}\n`)
             }
@@ -213,6 +215,38 @@ export function registerTeamCommands(program: Command): void {
           process.stderr.write(r.reason === 'unknown'
             ? `codeburn team: no person with id ${id}\n`
             : `codeburn team: ${id} still owns ${r.spans} spans. Run \`codeburn team admin merge-person ${id} <to-id>\` first, or pass --force to delete them.\n`)
+        })
+      } catch (err) { fail(err) }
+    })
+
+  const collect = (v: string, prev: string[]) => [...prev, v]
+
+  storeOpts(admin
+    .command('grant-team-admin <person-id>')
+    .description('Let a person see and manage the members of one or more teams (they sign in with GitLab as a member)')
+    .requiredOption('--team <team>', 'Team to administer; repeat for several', collect, [] as string[]))
+    .action(async (personId: string, opts: StoreFlags & { team: string[] }) => {
+      try {
+        await withStore(opts, async store => {
+          const r = await store.setTeamAdmin(personId, [...await store.teamsAdministered(personId), ...opts.team])
+          if ('error' in r) { process.stderr.write(`codeburn team: ${r.error === 'not_found' ? `no active person with id ${personId}` : 'invalid team name'}\n`); process.exitCode = 1; return }
+          process.stdout.write(`${personId} is now team admin of: ${r.join(', ')}\n`)
+        })
+      } catch (err) { fail(err) }
+    })
+
+  storeOpts(admin
+    .command('revoke-team-admin <person-id>')
+    .description('Remove team-admin rights: from the given teams, or entirely when no --team is given')
+    .option('--team <team>', 'Team to remove; repeat for several', collect, [] as string[]))
+    .action(async (personId: string, opts: StoreFlags & { team: string[] }) => {
+      try {
+        await withStore(opts, async store => {
+          const drop = new Set(opts.team.map(t => t.trim().toLowerCase()))
+          const keep = drop.size === 0 ? [] : (await store.teamsAdministered(personId)).filter(t => !drop.has(t.trim().toLowerCase()))
+          const r = await store.setTeamAdmin(personId, keep)
+          if ('error' in r) { process.stderr.write(`codeburn team: no active person with id ${personId}\n`); process.exitCode = 1; return }
+          process.stdout.write(r.length ? `${personId} is team admin of: ${r.join(', ')}\n` : `${personId} is no longer a team admin.\n`)
         })
       } catch (err) { fail(err) }
     })

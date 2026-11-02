@@ -15,14 +15,39 @@ function errorText(e: unknown): string {
     if (e.code === 'invalid_email') return 'Enter a valid email address.'
     if (e.code === 'invalid_team') return 'Enter a team name of 1-64 characters.'
     if (e.code === 'email_taken') return 'Someone with that email already exists.'
+    if (e.code === 'team_not_allowed') return 'You can only add people to teams you administer.'
     if (e.code === 'too_many_attempts') return 'Too many requests. Try again later.'
   }
   return 'Something went wrong. Try again.'
 }
 
-/** Admin: add a person who cannot sign in with GitLab and show their install token and setup instructions. */
+/** A centred dialog over the page; Escape or the close button dismisses it. */
+export function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/50 p-6"
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      onKeyDown={(e) => e.key === 'Escape' && onClose()}
+    >
+      <Card className="my-6 flex w-full max-w-2xl flex-col gap-4 px-6 py-6">
+        <div className="flex items-center justify-between gap-3">
+          <h2 className="text-lg font-semibold">{title}</h2>
+          <Button onClick={onClose} aria-label="Close">
+            <X size={12} />
+          </Button>
+        </div>
+        {children}
+      </Card>
+    </div>
+  )
+}
+
+/** Admins and team admins: add a person who cannot sign in with GitLab and show their install token and setup instructions. */
 export function AddUser({ meta }: { meta: Meta }) {
   const qc = useQueryClient()
+  const restricted = meta.viewer?.role === 'team_admin'
   const [open, setOpen] = useState(false)
   const [name, setName] = useState('')
   const [email, setEmail] = useState('')
@@ -47,63 +72,60 @@ export function AddUser({ meta }: { meta: Meta }) {
     <>
       <Button onClick={() => setOpen(true)}>Add user</Button>
       {open ? (
-        <div
-          className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/50 p-6"
-          role="dialog"
-          aria-modal="true"
-          aria-label="Add user"
-          onKeyDown={(e) => e.key === 'Escape' && close()}
-        >
-          <Card className="my-6 flex w-full max-w-2xl flex-col gap-4 px-6 py-6">
-            <div className="flex items-center justify-between gap-3">
-              <h2 className="text-lg font-semibold">{add.data ? 'User added' : 'Add user'}</h2>
-              <Button onClick={close} aria-label="Close">
-                <X size={12} />
+        <Modal title={add.data ? 'User added' : 'Add user'} onClose={close}>
+          {add.data ? (
+            <>
+              <Instructions info={add.data} />
+              <Button onClick={close} className="justify-center py-2 text-sm">
+                Done
               </Button>
-            </div>
-            {add.data ? (
-              <>
-                <Instructions info={add.data} />
-                <Button onClick={close} className="justify-center py-2 text-sm">
-                  Done
-                </Button>
-              </>
-            ) : (
-              <form
-                className="flex flex-col gap-3"
-                onSubmit={(e) => {
-                  e.preventDefault()
-                  add.mutate({ name, email, team })
-                }}
-              >
-                <p className="text-xs text-tertiary-foreground">
-                  Creates the person and an install token for their machine. Use this for people who cannot sign in with GitLab.
-                </p>
-                <label className="flex flex-col gap-1 text-xs text-tertiary-foreground">
-                  Name
-                  <input autoFocus required maxLength={100} value={name} onChange={(e) => setName(e.target.value)} className={inputCls} />
-                </label>
-                <label className="flex flex-col gap-1 text-xs text-tertiary-foreground">
-                  Email
-                  <input required type="email" maxLength={254} value={email} onChange={(e) => setEmail(e.target.value)} className={inputCls} />
-                </label>
-                <label className="flex flex-col gap-1 text-xs text-tertiary-foreground">
-                  Team
+            </>
+          ) : (
+            <form
+              className="flex flex-col gap-3"
+              onSubmit={(e) => {
+                e.preventDefault()
+                add.mutate({ name, email, team })
+              }}
+            >
+              <p className="text-xs text-tertiary-foreground">
+                Creates the person and an install token for their machine. Use this for people who cannot sign in with GitLab.
+              </p>
+              <label className="flex flex-col gap-1 text-xs text-tertiary-foreground">
+                Name
+                <input autoFocus required maxLength={100} value={name} onChange={(e) => setName(e.target.value)} className={inputCls} />
+              </label>
+              <label className="flex flex-col gap-1 text-xs text-tertiary-foreground">
+                Email
+                <input required type="email" maxLength={254} value={email} onChange={(e) => setEmail(e.target.value)} className={inputCls} />
+              </label>
+              <label className="flex flex-col gap-1 text-xs text-tertiary-foreground">
+                Team
+                {restricted ? (
+                  <select required value={team} onChange={(e) => setTeam(e.target.value)} className={inputCls}>
+                    <option value="">Choose a team</option>
+                    {(meta.teams ?? []).map((t) => (
+                      <option key={t} value={t}>
+                        {t}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
                   <input required list="cb-add-teams" maxLength={64} value={team} onChange={(e) => setTeam(e.target.value)} className={inputCls} />
-                </label>
-                <datalist id="cb-add-teams">
-                  {(meta.teams ?? []).map((t) => (
-                    <option key={t} value={t} />
-                  ))}
-                </datalist>
-                {add.error ? <div className="text-xs text-red-500">{errorText(add.error)}</div> : null}
-                <Button type="submit" disabled={add.isPending || !name.trim() || !email.trim() || !team.trim()} className="justify-center py-2 text-sm">
-                  {add.isPending ? 'Creating...' : 'Add user and create install token'}
-                </Button>
-              </form>
-            )}
-          </Card>
-        </div>
+                )}
+              </label>
+              <datalist id="cb-add-teams">
+                {(meta.teams ?? []).map((t) => (
+                  <option key={t} value={t} />
+                ))}
+              </datalist>
+              {add.error ? <div className="text-xs text-red-500">{errorText(add.error)}</div> : null}
+              <Button type="submit" disabled={add.isPending || !name.trim() || !email.trim() || !team.trim()} className="justify-center py-2 text-sm">
+                {add.isPending ? 'Creating...' : 'Add user and create install token'}
+              </Button>
+            </form>
+          )}
+        </Modal>
       ) : null}
     </>
   )

@@ -28,7 +28,9 @@ collector and `/api/team/*` still work.
 | --- | --- |
 | `codeburn team serve [--port 8787] [--host 127.0.0.1] [--data-dir] [--database-url] [--tls-cert --tls-key]` | Run the server. |
 | `codeburn team admin add-person --name N [--email E] [--team T] [--url U]` | Create a person, print a 7-day single-use enrollment token. |
-| `codeburn team admin list` | People, their devices and last-seen time. |
+| `codeburn team admin list` | People, their devices, last-seen time and any team-admin teams. |
+| `codeburn team admin grant-team-admin <person-id> --team T [--team T2]` | Let a person see and manage those teams. |
+| `codeburn team admin revoke-team-admin <person-id> [--team T]` | Remove those teams, or the whole role without `--team`. |
 | `codeburn team admin revoke <person-id\|device-id>` | Revoke a person (all devices) or one device. Its credential gets 401 immediately. |
 | `codeburn team admin merge-person <from-id> <to-id>` | Move all usage, sessions, git attribution and devices from one person to another, then revoke the first. Use it when someone ends up with two accounts. |
 | `codeburn team admin delete-person <id> [--force]` | Permanently delete a person and their devices. Refuses while they still own usage (merge first) unless `--force`. Frees their email for registration. |
@@ -329,6 +331,14 @@ Rules are checked in this order:
 - **Member**: a user whose **verified** GitLab email matches exactly one active person's enrolled email
   (case-insensitive). Sees only their own data: no team or person pickers, and the People tab shows just them.
   Revoking the person ends their GitLab session immediately.
+- **Team admin**: a member who an admin has also made administrator of one or more teams. Sees every person in those
+  teams (plus themselves) across overview, people, models, projects, sessions, work and insights, and can add people to
+  those teams and issue install tokens for their members. The scope is set by the server from the `team_admins` table on
+  every request, so granting or revoking takes effect at once; a `team` or `person` outside it is ignored or 404. They
+  cannot revoke, merge or delete people, create new teams, or grant the role. Hidden project names stay private to their
+  owner. Team admins sign in with GitLab like any member, so the person must have a verified GitLab email.
+  Grant with `codeburn team admin grant-team-admin <person-id> --team <t> [--team <t2>]` (or the **Team admin** button on
+  the People page) and remove with `revoke-team-admin <person-id> [--team <t>]`.
 - **Registrant**: a user with a verified email that no person has (active **or** revoked), who is in a
   `register_groups` group. See below.
 - Anyone else is told their account isn't authorised.
@@ -539,6 +549,10 @@ docker exec codeburn-team node dist/cli.js team admin add-viewer --name "Manager
   exactly as `add-person` does, for people who cannot sign in with GitLab, and returns the same install object as
   registration. Errors: `invalid_name`, `invalid_email`, `invalid_team` (400), `email_taken` (409). The viewer's
   **People** page has an **Add user** button that calls it and shows the token and install steps in a dialog.
+- `POST /api/team/admin/people` also works for team admins, limited to their teams (`403 team_not_allowed` otherwise).
+  `POST /api/team/admin/people/:id/token` issues a fresh install token for a person (full admins: anyone; team admins:
+  people in their teams; 404 otherwise) and returns the same install object. `POST /api/team/admin/people/:id/team-admin`
+  with `{ teams: [...] }` sets the teams a person administers (full admins only; an empty list revokes).
 - `GET /help`: a public, server-rendered help page for members: install and connect, finish setup, what is sent, changing
   it, checking it, upgrading, another machine, logging out, uninstalling and troubleshooting. It shows the install
   one-liners only when a client package is served and only the options this server accepts. It uses `public_url` (or

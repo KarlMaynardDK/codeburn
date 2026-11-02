@@ -8,6 +8,28 @@ export interface Filters {
   person?: string
   team?: string
   project?: string
+  /** Hard limit set by the server for a team admin: only these teams, plus the viewer's own person. Never read from the request. */
+  scope?: { teams: string[]; personId: string }
+}
+
+/** SQL for the team filter and the server-set scope. `p` is the joined people table. */
+export function teamClause(f: Filters, teamCol = 'p.team', idCol = 'p.id'): { sql: string; params: unknown[] } {
+  let sql = ''
+  const params: unknown[] = []
+  if (f.team) { sql += ` AND ${teamCol} = ?`; params.push(f.team) }
+  if (f.scope) {
+    const marks = f.scope.teams.map(() => '?').join(', ')
+    sql += f.scope.teams.length ? ` AND (${teamCol} IN (${marks}) OR ${idCol} = ?)` : ` AND ${idCol} = ?`
+    params.push(...f.scope.teams, f.scope.personId)
+  }
+  return { sql, params }
+}
+
+/** The same rule for rows already in memory. */
+export function inScope(f: Filters, p: { id?: unknown; team?: unknown }): boolean {
+  if (f.team && p.team !== f.team) return false
+  if (f.scope && !(f.scope.teams.includes(String(p.team)) || String(p.id) === f.scope.personId)) return false
+  return true
 }
 
 const DAY_MS = 86_400_000
@@ -41,7 +63,9 @@ function where(f: Filters, extra?: { from?: string; to?: string }, alias = 'du')
   const params: unknown[] = [extra?.from ?? f.from, extra?.to ?? f.to]
   let sql = `${alias}.day >= ? AND ${alias}.day <= ?`
   if (f.person) { sql += ` AND ${alias}.person_id = ?`; params.push(f.person) }
-  if (f.team) { sql += ' AND p.team = ?'; params.push(f.team) }
+  const t = teamClause(f)
+  sql += t.sql
+  params.push(...t.params)
   if (f.project) { sql += ` AND ${alias}.project = ?`; params.push(f.project) }
   return { sql, params }
 }
@@ -138,7 +162,7 @@ export async function people(store: Store, f: Filters) {
     dayCost.get(r.id)!.set(String(r.day), n(r.cost))
   }
   return roster
-    .filter(p => (!f.person || p.id === f.person) && (!f.team || p.team === f.team) && (!f.project || aggBy.has(p.id)))
+    .filter(p => (!f.person || p.id === f.person) && inScope(f, p) && (!f.project || aggBy.has(p.id)))
     .map(p => {
       const a = aggBy.get(p.id) ?? {}
       const row = { cost: n(a.cost), input: n(a.input), output: n(a.output), cache_read: n(a.cache_read), cache_write: n(a.cache_write), calls: n(a.calls) }
@@ -199,7 +223,7 @@ export async function sessions(store: Store, f: Filters) {
   const params: unknown[] = [f.from, addDays(f.to, 1)]
   let sql = 'SELECT s.trace_id, p.name AS person, s.project, s.started, s.duration_ms, s.calls, s.cost FROM sessions s JOIN people p ON p.id = s.person_id WHERE s.started >= ? AND s.started < ?'
   if (f.person) { sql += ' AND s.person_id = ?'; params.push(f.person) }
-  if (f.team) { sql += ' AND p.team = ?'; params.push(f.team) }
+  { const t = teamClause(f); sql += t.sql; params.push(...t.params) }
   if (f.project) { sql += ' AND s.project = ?'; params.push(f.project) }
   sql += ' ORDER BY s.started DESC LIMIT 500'
   const rows = await store.all(sql, params)
@@ -248,7 +272,7 @@ export async function work(store: Store, f: Filters) {
   const params: unknown[] = [f.from, addDays(f.to, 1)]
   let scope = 'ws.started >= ? AND ws.started < ?'
   if (f.person) { scope += ' AND ws.person_id = ?'; params.push(f.person) }
-  if (f.team) { scope += ' AND p.team = ?'; params.push(f.team) }
+  { const t = teamClause(f); scope += t.sql; params.push(...t.params) }
   if (f.project) { scope += ` AND ${WS_PROJECT} = ?`; params.push(f.project) }
   const [sessionRows, commitRows] = await Promise.all([
     store.all(`SELECT ws.person_id AS person_id, ${WS_REPO} AS repo, ${WS_PR_LINKS} AS pr_links, COALESCE(s.cost, 0) AS cost

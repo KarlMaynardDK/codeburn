@@ -1,5 +1,5 @@
 import type { Store } from './store.js'
-import { addDays, cacheReadRatio, type Filters } from './rollup.js'
+import { addDays, cacheReadRatio, teamClause, type Filters } from './rollup.js'
 import { parseCoaching, type CoachingSnapshot } from './coaching.js'
 
 /** Models whose lowercase name contains any of these count as premium. */
@@ -99,7 +99,7 @@ function scope(f: Filters, alias = 'du'): { sql: string; params: unknown[] } {
   let sql = ''
   const params: unknown[] = []
   if (f.person) { sql += ` AND ${alias}.person_id = ?`; params.push(f.person) }
-  if (f.team) { sql += ' AND p.team = ?'; params.push(f.team) }
+  { const t = teamClause(f); sql += t.sql; params.push(...t.params) }
   if (f.project) { sql += ` AND ${alias}.project = ?`; params.push(f.project) }
   return { sql, params }
 }
@@ -186,7 +186,7 @@ async function loadSnapshots(store: Store, f: Filters): Promise<Map<string, { at
   let sql = 'SELECT c.person_id AS person_id, c.captured_at AS captured_at, c.json AS json FROM coaching c JOIN people p ON p.id = c.person_id WHERE 1 = 1'
   const params: unknown[] = []
   if (f.person) { sql += ' AND c.person_id = ?'; params.push(f.person) }
-  if (f.team) { sql += ' AND p.team = ?'; params.push(f.team) }
+  { const t = teamClause(f); sql += t.sql; params.push(...t.params) }
   for (const r of await store.all(sql, params)) {
     let snap: CoachingSnapshot | null = null
     try { snap = parseCoaching(JSON.parse(String(r.json))) } catch { /* ignore a corrupt row */ }
@@ -560,7 +560,7 @@ export async function aggregateFindings(store: Store, f: Filters): Promise<Findi
   const params: unknown[] = []
   let sql = 'SELECT fi.person_id AS person_id, p.name AS name, fi.json AS json FROM findings fi JOIN people p ON p.id = fi.person_id WHERE 1 = 1'
   if (f.person) { sql += ' AND fi.person_id = ?'; params.push(f.person) }
-  if (f.team) { sql += ' AND p.team = ?'; params.push(f.team) }
+  { const t = teamClause(f); sql += t.sql; params.push(...t.params) }
   const rows = await store.all(sql, params)
   const groups = new Map<string, { title: string; people: Map<string, string>; savings: number }>()
   for (const r of rows) {

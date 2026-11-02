@@ -77,6 +77,10 @@ export const newInstallToken = () => request<InstallInfo>('POST', '/api/team/reg
 // ---- Admin: add a person without GitLab sign-in ----------------------------
 export type NewPerson = { name: string; email: string; team: string }
 export const addPerson = (p: NewPerson) => request<InstallInfo>('POST', '/api/team/admin/people', undefined, p).then(withSteps)
+export const newTokenFor = (personId: string) =>
+  request<InstallInfo>('POST', `/api/team/admin/people/${encodeURIComponent(personId)}/token`, undefined, {}).then(withSteps)
+export const setTeamAdmin = (personId: string, teams: string[]) =>
+  request<{ teams: string[] }>('POST', `/api/team/admin/people/${encodeURIComponent(personId)}/team-admin`, undefined, { teams })
 
 // ---- Member profile --------------------------------------------------------
 export type Profile = {
@@ -93,7 +97,7 @@ export const getProfile = () => request<Profile>('GET', '/api/team/profile')
 export const saveProfile = (change: ProfileChange) => request<Profile>('POST', '/api/team/profile', undefined, change)
 
 // ---- Types -----------------------------------------------------------------
-export type Role = 'admin' | 'member' | 'registrant'
+export type Role = 'admin' | 'team_admin' | 'member' | 'registrant'
 export type Breakdown = { name: string; cost: number; tokens: number; calls?: number }
 export type Meta = {
   org_name?: string
@@ -105,7 +109,8 @@ export type Meta = {
   person_id?: string
   registration?: boolean
   teams?: string[]
-  people?: Array<{ id: string; name: string; team?: string | null }>
+  /** team_admin_of is sent to full admins only. */
+  people?: Array<{ id: string; name: string; team?: string | null; team_admin_of?: string[] }>
 }
 export type DailyRow = { day: string; cost: number; input: number; output: number; cache_read: number; cache_write: number; calls: number }
 /** Counts newer clients send per call. Zero when every client in the period predates them. */

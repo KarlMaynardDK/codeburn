@@ -3,7 +3,8 @@ import { useQuery } from '@tanstack/react-query'
 import { MetricCard } from '@/components/MetricCard'
 import { BarList } from '@/components/BarList'
 import { fmtNum, fmtTokens, label, usd } from '@/lib/utils'
-import { getPeople, getPerson, type Breakdown, type Filters, type PersonRow } from '../lib/api'
+import { getPeople, getPerson, type Breakdown, type Filters, type Meta, type PersonRow } from '../lib/api'
+import { PersonActions } from '../PersonActions'
 import { DailyChart, Spark } from '../DailyChart'
 import { Button, CsvButton, Empty, ErrorNote, Loading, Panel, TablePanel } from '../ui'
 
@@ -11,7 +12,7 @@ const tok = (p: PersonRow) => p.input + p.output + p.cache_read + p.cache_write
 const pct = (r: number | undefined) => (r == null ? '-' : (r * 100).toFixed(0) + '%')
 const when = (s?: string | null) => (s ? s.slice(0, 16).replace('T', ' ') : '-')
 
-export function People({ filters, onOpen }: { filters: Filters; onOpen: (id: string) => void }) {
+export function People({ filters, onOpen, meta }: { filters: Filters; onOpen: (id: string) => void; meta?: Meta }) {
   const q = useQuery({ queryKey: ['people', filters], queryFn: () => getPeople(filters) })
   if (q.isLoading) return <Loading />
   if (q.error) return <ErrorNote error={q.error} />
@@ -34,6 +35,7 @@ export function People({ filters, onOpen }: { filters: Filters; onOpen: (id: str
         { key: 'trend', label: 'Trend' },
         { key: 'seen', label: 'Last seen' },
         { key: 'through', label: 'Data through' },
+        ...(meta ? [{ key: 'actions', label: '' }] : []),
       ]}
       rows={people.map((p) => ({
         name: (
@@ -52,6 +54,7 @@ export function People({ filters, onOpen }: { filters: Filters; onOpen: (id: str
         trend: <Spark values={p.trend} />,
         seen: when(p.last_seen),
         through: p.data_through ?? '-',
+        actions: meta ? <PersonActions meta={meta} personId={p.id} name={p.name} /> : null,
       }))}
       csv={people.map((p) => [p.name, p.email, p.team, p.cost, p.input, p.output, p.cache_read, p.cache_write, p.calls, p.cache_read_ratio, p.one_shot_rate, p.lines_added, p.lines_removed, p.top_model, p.last_seen, p.data_through])}
     />

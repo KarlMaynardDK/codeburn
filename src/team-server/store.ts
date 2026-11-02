@@ -105,6 +105,8 @@ export function schemaStatements(real: string, int: string): string[] {
     `CREATE TABLE IF NOT EXISTS people (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, team TEXT NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT)`,
     `CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, person_id TEXT NOT NULL, cred_hash TEXT NOT NULL UNIQUE, label TEXT, client_device_id TEXT, created_at TEXT NOT NULL, last_seen TEXT, revoked_at TEXT, coverage_through TEXT, client_version TEXT)`,
     `CREATE TABLE IF NOT EXISTS enrollments (token_hash TEXT PRIMARY KEY, person_id TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT)`,
+    // Teams a person may see and manage as a team admin. Additive: older servers ignore it.
+    `CREATE TABLE IF NOT EXISTS team_admins (person_id TEXT NOT NULL, team TEXT NOT NULL, PRIMARY KEY (person_id, team))`,
     `CREATE TABLE IF NOT EXISTS viewers (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, revoked_at TEXT)`,
     `CREATE TABLE IF NOT EXISTS viewer_sessions (token_hash TEXT PRIMARY KEY, viewer_id TEXT NOT NULL, expires_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS sso_sessions (token_hash TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, person_id TEXT, subject TEXT NOT NULL, email TEXT, expires_at TEXT NOT NULL)`,
@@ -182,6 +184,7 @@ export interface Person { id: string; name: string; email: string; team: string;
 export type Viewer =
   | { name: string; role: 'admin' }
   | { name: string; role: 'member'; personId: string }
+  | { name: string; role: 'team_admin'; personId: string; teams: string[] }
   | { name: string; role: 'registrant'; email: string }
 
 export const TEAM_MAX_LENGTH = 64
@@ -391,6 +394,42 @@ export class Store {
     return r ? { id: r.id, name: r.name, email: r.email, team: r.team, revoked_at: r.revoked_at ?? null } : null
   }
 
+  // ---- team admins ----
+
+  /** Teams a person administers, sorted. */
+  async teamsAdministered(personId: string): Promise<string[]> {
+    const rows = await this.all('SELECT team FROM team_admins WHERE person_id = ? ORDER BY team', [personId])
+    return rows.map(r => r.team as string)
+  }
+
+  /** Every grant, for the admin People page: person id to teams. */
+  async listTeamAdmins(): Promise<Record<string, string[]>> {
+    const out: Record<string, string[]> = {}
+    for (const r of await this.all('SELECT person_id, team FROM team_admins ORDER BY team')) (out[r.person_id as string] ??= []).push(r.team as string)
+    return out
+  }
+
+  /**
+   * Replaces the teams a person administers; an empty list revokes. Team spelling follows an existing team. Null when
+   * the person is unknown or revoked, or a team name is invalid.
+   */
+  async setTeamAdmin(personId: string, teams: string[]): Promise<string[] | { error: 'not_found' | 'invalid_team' }> {
+    const person = await this.getPerson(personId)
+    if (!person || person.revoked_at) return { error: 'not_found' }
+    const known = await this.distinctTeams()
+    const clean = new Set<string>()
+    for (const t of teams) {
+      const c = canonicalTeam(t, known)
+      if (!c) return { error: 'invalid_team' }
+      clean.add(c)
+    }
+    await this.db.tx(async q => {
+      await q.all('DELETE FROM team_admins WHERE person_id = ?', [personId])
+      for (const t of clean) await q.all('INSERT INTO team_admins (person_id, team) VALUES (?, ?)', [personId, t])
+    })
+    return [...clean].sort()
+  }
+
   /**
    * Turns a registrant session into a person with a fresh enrollment token, and upgrades the session to member.
    * Atomic: a double submit or a concurrent registration for the same email cannot create two people.
@@ -538,6 +577,10 @@ export class Store {
          SELECT ?, captured_at, json FROM coaching WHERE person_id = ? AND 1=1
          ON CONFLICT (person_id) DO NOTHING`, [toId, fromId])
       await q.all('DELETE FROM coaching WHERE person_id = ?', [fromId])
+      await q.all(
+        `INSERT INTO team_admins (person_id, team) SELECT ?, team FROM team_admins WHERE person_id = ? AND 1=1
+         ON CONFLICT (person_id, team) DO NOTHING`, [toId, fromId])
+      await q.all('DELETE FROM team_admins WHERE person_id = ?', [fromId])
       const devices = await q.all('UPDATE devices SET person_id = ? WHERE person_id = ? RETURNING id', [toId, fromId])
       await q.all('UPDATE sso_sessions SET person_id = ? WHERE person_id = ?', [toId, fromId])
       await q.all('DELETE FROM enrollments WHERE person_id = ? AND used_at IS NULL', [fromId])
@@ -557,7 +600,7 @@ export class Store {
       const [c] = await q.all('SELECT COUNT(*) AS n FROM spans WHERE person_id = ?', [id])
       const spans = Number(c?.n ?? 0)
       if (spans > 0 && !force) return { deleted: false as const, reason: 'has_usage' as const, spans }
-      for (const t of ['spans', 'daily_usage', 'daily_names', 'sessions', 'findings', 'coaching', 'work_sessions', 'work_commits', 'hidden_projects', 'devices', 'enrollments', 'sso_sessions']) {
+      for (const t of ['spans', 'daily_usage', 'daily_names', 'sessions', 'findings', 'coaching', 'work_sessions', 'work_commits', 'hidden_projects', 'team_admins', 'devices', 'enrollments', 'sso_sessions']) {
         await q.all(`DELETE FROM ${t} WHERE person_id = ?`, [id])
       }
       await q.all('DELETE FROM people WHERE id = ?', [id])
@@ -699,7 +742,12 @@ export class Store {
     const r = sso[0]
     if (!r) return null
     if (r.role === 'admin') return { name: r.name, role: 'admin' }
-    if (r.role === 'member') return { name: r.name, role: 'member', personId: r.person_id }
+    if (r.role === 'member') {
+      const teams = await this.teamsAdministered(r.person_id)
+      return teams.length > 0
+        ? { name: r.name, role: 'team_admin', personId: r.person_id, teams }
+        : { name: r.name, role: 'member', personId: r.person_id }
+    }
     if (r.role === 'registrant') return { name: r.name, role: 'registrant', email: r.email }
     return null
   }

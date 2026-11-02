@@ -178,7 +178,7 @@ export function App() {
     setExpired(false)
   }
   const role = meta.data.viewer?.role ?? 'admin'
-  if (role === 'registrant' || (role === 'member' && meta.data.registration && location.pathname === '/register')) {
+  if (role === 'registrant' || ((role === 'member' || role === 'team_admin') && meta.data.registration && location.pathname === '/register')) {
     return <Register meta={meta.data} onLogout={onLogout} />
   }
   return <Shell meta={meta.data} onLogout={onLogout} />
@@ -196,7 +196,10 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
   const filters: Filters = { ...range, team: team || undefined, person: person || undefined }
   const hasSessions = meta.detail_levels?.includes('sessions') ?? false
   const member = meta.viewer?.role === 'member'
-  const pages = PAGES.filter((p) => ((p.key !== 'sessions' && p.key !== 'work') || hasSessions) && (p.key !== 'profile' || member))
+  const teamAdmin = meta.viewer?.role === 'team_admin'
+  const hasPerson = member || teamAdmin
+  const manager = meta.viewer?.role === 'admin' || teamAdmin
+  const pages = PAGES.filter((p) => ((p.key !== 'sessions' && p.key !== 'work') || hasSessions) && (p.key !== 'profile' || hasPerson))
   const page = pages.some((p) => p.key === route.page) ? route.page : 'overview'
   const people = (meta.people ?? []).filter((p) => !team || p.team === team)
 
@@ -208,7 +211,7 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
           {meta.org_name ? <span className="text-sm text-tertiary-foreground">{meta.org_name}</span> : null}
         </div>
         <div className="flex items-center gap-3 text-xs text-tertiary-foreground">
-          {member && meta.registration ? (
+          {hasPerson && meta.registration ? (
             <a href="/register" className="text-primary hover:underline">
               Set up another machine
             </a>
@@ -282,12 +285,12 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
             <PersonDetail id={route.id} filters={{ ...filters, person: undefined }} onBack={() => go('people')} />
           ) : (
             <div className="flex flex-col gap-3">
-              {meta.viewer?.role === 'admin' ? (
+              {manager ? (
                 <div className="flex justify-end">
                   <AddUser meta={meta} />
                 </div>
               ) : null}
-              <People filters={{ ...filters, person: undefined }} onOpen={(id) => go('people', id)} />
+              <People filters={{ ...filters, person: undefined }} onOpen={(id) => go('people', id)} meta={manager ? meta : undefined} />
             </div>
           ))}
         {page === 'models' && <Models filters={filters} />}

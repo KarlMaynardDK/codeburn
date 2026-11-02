@@ -89,7 +89,7 @@ async function handleRegistration(ctx: ApiContext, req: IncomingMessage, res: Se
 
   if (path === '/api/team/registration/token') {
     if (req.method !== 'POST') return sendJson(res, 405, { error: 'method_not_allowed' })
-    if (viewer.role !== 'member') return sendJson(res, 403, { error: 'registration_required' })
+    if (viewer.role !== 'member' && viewer.role !== 'team_admin') return sendJson(res, 403, { error: 'registration_required' })
     if (ctx.tokenLimiter.blocked(token)) return sendJson(res, 429, { error: 'too_many_attempts' })
     ctx.tokenLimiter.fail(token)
     const person = await store.getPerson(viewer.personId)
@@ -101,11 +101,51 @@ async function handleRegistration(ctx: ApiContext, req: IncomingMessage, res: Se
   return sendJson(res, 404, { error: 'not_found' })
 }
 
-/** Admin-only: create a person without GitLab sign-in and return their install token and instructions. */
-async function handleAdminPeople(ctx: ApiContext, req: IncomingMessage, res: ServerResponse, viewer: Viewer, token: string): Promise<void> {
-  if (viewer.role !== 'admin') return sendJson(res, 404, { error: 'not_found' })
+/** The spelling of `team` among a team admin's teams, compared ignoring case and spacing; null when it is not one of theirs. */
+function managedTeam(viewer: Viewer, team: string): string | null {
+  if (viewer.role === 'admin') return team
+  if (viewer.role !== 'team_admin') return null
+  const key = team.trim().toLowerCase()
+  return viewer.teams.find(t => t.trim().toLowerCase() === key) ?? null
+}
+
+/**
+ * Manage people. Full admins: create anyone, issue any token, grant team-admin. Team admins: create people in, and issue
+ * tokens for people in, only the teams they administer. Everyone else gets 404.
+ */
+async function handleAdmin(ctx: ApiContext, req: IncomingMessage, res: ServerResponse, path: string, viewer: Viewer, token: string): Promise<void> {
+  if (viewer.role !== 'admin' && viewer.role !== 'team_admin') return sendJson(res, 404, { error: 'not_found' })
+  const { store } = ctx
+  const sub = /^\/api\/team\/admin\/people\/([^/]+)\/(token|team-admin)$/.exec(path)
+  if (path !== '/api/team/admin/people' && !sub) return sendJson(res, 404, { error: 'not_found' })
   if (req.method !== 'POST') return sendJson(res, 405, { error: 'method_not_allowed' })
+
+  if (sub?.[2] === 'team-admin') {
+    if (viewer.role !== 'admin') return sendJson(res, 404, { error: 'not_found' })
+    const raw = await readBody(req, 4096)
+    let body: { teams?: unknown }
+    try { body = raw === 'too_large' ? {} : JSON.parse(raw.toString('utf-8')) } catch { return sendJson(res, 400, { error: 'invalid_json' }) }
+    const teams = body?.teams
+    if (!Array.isArray(teams) || teams.length > 100 || teams.some(t => typeof t !== 'string')) return sendJson(res, 400, { error: 'invalid_team' })
+    const id = decodeURIComponent(sub[1]!)
+    const r = await store.setTeamAdmin(id, teams as string[])
+    if ('error' in r) return sendJson(res, r.error === 'not_found' ? 404 : 400, { error: r.error })
+    process.stderr.write(`team-server: team admin of ${r.join(', ') || '(none)'} set for ${id} by ${viewer.name}\n`)
+    return sendJson(res, 200, { teams: r })
+  }
+
   if (ctx.tokenLimiter.blocked(token)) return sendJson(res, 429, { error: 'too_many_attempts' })
+
+  if (sub) {
+    const person = await store.getPerson(decodeURIComponent(sub[1]!))
+    if (!person || person.revoked_at || (viewer.role === 'team_admin' && !viewer.teams.includes(person.team))) return sendJson(res, 404, { error: 'not_found' })
+    ctx.tokenLimiter.fail(token)
+    const fresh = await store.rotateEnrollment(person.id)
+    if (!fresh) return sendJson(res, 404, { error: 'not_found' })
+    process.stderr.write(`team-server: ${viewer.name} issued a new install token for ${person.name} <${person.email}> (${person.id})\n`)
+    return sendJson(res, 200, installResponse(ctx, person, fresh, new Date(Date.now() + 7 * 86_400_000).toISOString()))
+  }
+
   const raw = await readBody(req, 4096)
   let body: { name?: unknown; email?: unknown; team?: unknown }
   try { body = raw === 'too_large' ? {} : JSON.parse(raw.toString('utf-8')) } catch { return sendJson(res, 400, { error: 'invalid_json' }) }
@@ -113,10 +153,12 @@ async function handleAdminPeople(ctx: ApiContext, req: IncomingMessage, res: Ser
   if (typeof body.name !== 'string') return sendJson(res, 400, { error: 'invalid_name' })
   if (typeof body.email !== 'string') return sendJson(res, 400, { error: 'invalid_email' })
   if (typeof body.team !== 'string') return sendJson(res, 400, { error: 'invalid_team' })
+  const team = managedTeam(viewer, body.team)
+  if (team === null) return sendJson(res, 403, { error: 'team_not_allowed' })
   ctx.tokenLimiter.fail(token)
-  const r = await ctx.store.createPerson({ name: body.name, email: body.email, team: body.team })
+  const r = await store.createPerson({ name: body.name, email: body.email, team })
   if ('error' in r) return sendJson(res, r.error === 'email_taken' ? 409 : 400, { error: r.error })
-  process.stderr.write(`team-server: admin created ${r.person.name} <${r.person.email}> team=${r.person.team} (${r.person.id})\n`)
+  process.stderr.write(`team-server: ${viewer.name} created ${r.person.name} <${r.person.email}> team=${r.person.team} (${r.person.id})\n`)
   return sendJson(res, 200, installResponse(ctx, r.person, r.enrollmentToken, r.expiresAt))
 }
 
@@ -133,7 +175,7 @@ async function profileResponse(store: Store, personId: string) {
 async function handleProfile(ctx: ApiContext, req: IncomingMessage, res: ServerResponse, viewer: Viewer): Promise<void> {
   const { store } = ctx
   if (viewer.role === 'registrant') return sendJson(res, 403, { error: 'registration_required' })
-  if (viewer.role !== 'member') return sendJson(res, 404, { error: 'not_found' })
+  if (viewer.role !== 'member' && viewer.role !== 'team_admin') return sendJson(res, 404, { error: 'not_found' })
 
   if (req.method === 'POST') {
     const raw = await readBody(req, 128 * 1024)
@@ -160,6 +202,13 @@ async function handleProfile(ctx: ApiContext, req: IncomingMessage, res: ServerR
   }
   const profile = await profileResponse(store, viewer.personId)
   return profile ? sendJson(res, 200, profile) : sendJson(res, 404, { error: 'not_found' })
+}
+
+/** True when the person is the viewer or belongs to one of the viewer's administered teams. */
+async function personInScope(store: Store, personId: string, viewer: Extract<Viewer, { role: 'team_admin' }>): Promise<boolean> {
+  if (personId === viewer.personId) return true
+  const p = await store.getPerson(personId)
+  return !!p && viewer.teams.includes(p.team)
 }
 
 function parseFilters(url: URL, now = new Date()): rollup.Filters | { error: string } {
@@ -219,7 +268,7 @@ export async function handleApi(ctx: ApiContext, req: IncomingMessage, res: Serv
     return handleRegistration(ctx, req, res, path, viewer, token!)
   }
   if (path === '/api/team/profile') return handleProfile(ctx, req, res, viewer)
-  if (path === '/api/team/admin/people') return handleAdminPeople(ctx, req, res, viewer, token!)
+  if (path === '/api/team/admin' || path.startsWith('/api/team/admin/')) return handleAdmin(ctx, req, res, path, viewer, token!)
   if (req.method !== 'GET') return sendJson(res, 405, { error: 'method_not_allowed' })
 
   const base = {
@@ -242,17 +291,28 @@ export async function handleApi(ctx: ApiContext, req: IncomingMessage, res: Serv
     filters.person = viewer.personId
     delete filters.team
   }
+  // Team admins are limited to their teams (and themselves): the scope is set here and never read from the request.
+  let scopeTeams: string[] = []
+  if (viewer.role === 'team_admin') {
+    scopeTeams = viewer.teams
+    filters.scope = { teams: viewer.teams, personId: viewer.personId }
+    if (filters.team && !scopeTeams.includes(filters.team)) delete filters.team
+    if (filters.person && !(await personInScope(store, filters.person, viewer))) return sendJson(res, 404, { error: 'not_found' })
+  }
 
   if (path === '/api/team/meta') {
     if (viewer.role === 'member') {
       const me = await store.getPerson(viewer.personId)
       return sendJson(res, 200, { ...base, person_id: viewer.personId, teams: [], people: me ? [{ id: me.id, name: me.name, team: me.team }] : [] })
     }
-    const roster = await store.all('SELECT id, name, team FROM people WHERE revoked_at IS NULL ORDER BY name, id')
+    const roster = (await store.all('SELECT id, name, team FROM people WHERE revoked_at IS NULL ORDER BY name, id'))
+      .filter(p => viewer.role !== 'team_admin' || rollup.inScope(filters, p))
+    const grants = viewer.role === 'admin' ? await store.listTeamAdmins() : undefined
     return sendJson(res, 200, {
       ...base,
-      teams: [...new Set(roster.map(p => String(p.team)).filter(Boolean))].sort(),
-      people: roster.map(p => ({ id: p.id, name: p.name, team: p.team })),
+      ...(viewer.role === 'team_admin' ? { person_id: viewer.personId } : {}),
+      teams: viewer.role === 'team_admin' ? scopeTeams : [...new Set(roster.map(p => String(p.team)).filter(Boolean))].sort(),
+      people: roster.map(p => ({ id: p.id, name: p.name, team: p.team, ...(grants ? { team_admin_of: grants[p.id as string] ?? [] } : {}) })),
     })
   }
   if (path === '/api/team/overview') {
@@ -264,6 +324,7 @@ export async function handleApi(ctx: ApiContext, req: IncomingMessage, res: Serv
   const personMatch = /^\/api\/team\/people\/([^/]+)$/.exec(path)
   if (personMatch) {
     if (viewer.role === 'member' && decodeURIComponent(personMatch[1]!) !== viewer.personId) return sendJson(res, 404, { error: 'not_found' })
+    if (viewer.role === 'team_admin' && !(await personInScope(store, decodeURIComponent(personMatch[1]!), viewer))) return sendJson(res, 404, { error: 'not_found' })
     const detail = await rollup.personDetail(store, decodeURIComponent(personMatch[1]!), filters)
     return detail ? sendJson(res, 200, detail) : sendJson(res, 404, { error: 'not_found' })
   }
