@@ -74,6 +74,10 @@ const withSteps = (info: InstallInfo): InstallInfo => ({ ...info, steps: info.st
 export const register = (team: string) => request<InstallInfo>('POST', '/api/team/registration', undefined, { team }).then(withSteps)
 export const newInstallToken = () => request<InstallInfo>('POST', '/api/team/registration/token', undefined, {}).then(withSteps)
 
+// ---- Admin: add a person without GitLab sign-in ----------------------------
+export type NewPerson = { name: string; email: string; team: string }
+export const addPerson = (p: NewPerson) => request<InstallInfo>('POST', '/api/team/admin/people', undefined, p).then(withSteps)
+
 // ---- Member profile --------------------------------------------------------
 export type Profile = {
   name: string

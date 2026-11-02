@@ -331,6 +331,35 @@ export class Store {
     return { person: { id, ...p, revoked_at: null }, enrollmentToken }
   }
 
+  /**
+   * Admin-created person: validates the fields the way self-registration does (team spelling reuses an existing team),
+   * refuses an email already in use, and issues the first enrollment token.
+   */
+  async createPerson(input: { name: string; email: string; team: string }, ttlMs = WEEK_MS):
+    Promise<{ person: Person; enrollmentToken: string; expiresAt: string } | { error: 'invalid_name' | 'invalid_email' | 'invalid_team' | 'email_taken' }> {
+    const name = cleanName(input.name)
+    if (!name) return { error: 'invalid_name' }
+    const email = input.email.trim()
+    if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { error: 'invalid_email' }
+    const team = canonicalTeam(input.team, await this.distinctTeams())
+    if (!team) return { error: 'invalid_team' }
+    try {
+      return await this.db.tx(async q => {
+        if (this.db.kind === 'postgres') await q.all('SELECT pg_advisory_xact_lock(7204)')
+        if ((await q.all('SELECT id FROM people WHERE lower(email) = ?', [email.toLowerCase()])).length > 0) throw new RegisterFailure('email_taken')
+        const id = newId('p_')
+        await q.all('INSERT INTO people (id, name, email, team, created_at) VALUES (?, ?, ?, ?, ?)', [id, name, email, team, nowIso()])
+        const enrollmentToken = newSecret('cbe_')
+        const expiresAt = new Date(Date.now() + ttlMs).toISOString()
+        await q.all('INSERT INTO enrollments (token_hash, person_id, expires_at) VALUES (?, ?, ?)', [sha256hex(enrollmentToken), id, expiresAt])
+        return { person: { id, name, email, team, revoked_at: null }, enrollmentToken, expiresAt }
+      })
+    } catch (err) {
+      if (err instanceof RegisterFailure) return { error: 'email_taken' }
+      throw err
+    }
+  }
+
   async createEnrollment(personId: string, ttlMs = WEEK_MS): Promise<string> {
     const token = newSecret('cbe_')
     await this.all('INSERT INTO enrollments (token_hash, person_id, expires_at) VALUES (?, ?, ?)',

@@ -16,6 +16,7 @@ import { Sessions } from './pages/Sessions'
 import { Insights } from './pages/Insights'
 import { Profile } from './pages/Profile'
 import { Register } from './Register'
+import { AddUser } from './AddUser'
 
 type Page = 'overview' | 'people' | 'models' | 'tools' | 'projects' | 'work' | 'sessions' | 'insights' | 'profile'
 const PAGES: Array<{ key: Page; label: string }> = [
@@ -280,7 +281,14 @@ function Shell({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
           ) : route.id ? (
             <PersonDetail id={route.id} filters={{ ...filters, person: undefined }} onBack={() => go('people')} />
           ) : (
-            <People filters={{ ...filters, person: undefined }} onOpen={(id) => go('people', id)} />
+            <div className="flex flex-col gap-3">
+              {meta.viewer?.role === 'admin' ? (
+                <div className="flex justify-end">
+                  <AddUser meta={meta} />
+                </div>
+              ) : null}
+              <People filters={{ ...filters, person: undefined }} onOpen={(id) => go('people', id)} />
+            </div>
           ))}
         {page === 'models' && <Models filters={filters} />}
         {page === 'tools' && <Tools filters={filters} />}

@@ -55,7 +55,7 @@ function Note({ note }: { note: string }) {
   )
 }
 
-function Instructions({ info }: { info: InstallInfo }) {
+export function Instructions({ info }: { info: InstallInfo }) {
   return (
     <div className="flex flex-col gap-4">
       <p className="text-sm">

@@ -535,6 +535,10 @@ docker exec codeburn-team node dist/cli.js team admin add-viewer --name "Manager
   setup (choose what to send, `sync auto enable --accept`, `sync status`, `sync push --since all`), limited to the
   options this server accepts (`accept_session_detail`, `accept_findings`, `accept_coaching`). `codeburn team admin
   add-person` and `rotate-enrollment` print the same steps.
+- `POST /api/team/admin/people` (admin viewers only, 404 for anyone else): body `{ name, email, team }`. Creates the person
+  exactly as `add-person` does, for people who cannot sign in with GitLab, and returns the same install object as
+  registration. Errors: `invalid_name`, `invalid_email`, `invalid_team` (400), `email_taken` (409). The viewer's
+  **People** page has an **Add user** button that calls it and shows the token and install steps in a dialog.
 - `GET /help`: a public, server-rendered help page for members: install and connect, finish setup, what is sent, changing
   it, checking it, upgrading, another machine, logging out, uninstalling and troubleshooting. It shows the install
   one-liners only when a client package is served and only the options this server accepts. It uses `public_url` (or

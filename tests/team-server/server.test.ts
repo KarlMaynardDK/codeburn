@@ -607,6 +607,35 @@ describe.each(BACKENDS)('team server (%s)', backend => {
       expect(p.projects).toContainEqual({ project: 'secret', hidden: false, cost: 0.5 })
     })
 
+    it('lets an admin add a person and returns an install token that enrolls', async () => {
+      t = await startServer(backend)
+      const admin = await viewerClient(t)
+      const add = (body: unknown) => fetch(t.base + '/api/team/admin/people', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: admin.cookie, origin: `http://${t.host}` },
+        body: JSON.stringify(body),
+      })
+      const ok = await add({ name: 'Dana', email: 'dana@example.com', team: 'Core' })
+      expect(ok.status).toBe(200)
+      const json = await ok.json() as any
+      expect(json.token).toMatch(/^cbe_/)
+      expect(json.person).toMatchObject({ name: 'Dana', email: 'dana@example.com', team: 'Core' })
+      expect((await add({ name: 'Dana 2', email: 'DANA@example.com', team: 'core' })).status).toBe(409)
+      expect((await add({ name: 'X', email: 'nope', team: 'core' })).status).toBe(400)
+      expect((await add({ name: '', email: 'x@example.com', team: 'core' })).status).toBe(400)
+      const enrolled = await post(t.base, '/v1/enroll', { token: json.token })
+      expect(enrolled.status).toBe(200)
+
+      const a = await enrollPerson(t, 'Ann')
+      const m = await asMember(a.person.id)
+      const denied = await fetch(t.base + '/api/team/admin/people', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: `cb_team_session=${m.token}`, origin: `http://${t.host}` },
+        body: JSON.stringify({ name: 'E', email: 'e@example.com', team: 'x' }),
+      })
+      expect(denied.status).toBe(404)
+    })
+
     it('only edits the signed-in member; admins and registrants have no profile', async () => {
       t = await startServer(backend)
       const a = await enrollPerson(t, 'Ann')

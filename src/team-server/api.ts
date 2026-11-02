@@ -101,6 +101,25 @@ async function handleRegistration(ctx: ApiContext, req: IncomingMessage, res: Se
   return sendJson(res, 404, { error: 'not_found' })
 }
 
+/** Admin-only: create a person without GitLab sign-in and return their install token and instructions. */
+async function handleAdminPeople(ctx: ApiContext, req: IncomingMessage, res: ServerResponse, viewer: Viewer, token: string): Promise<void> {
+  if (viewer.role !== 'admin') return sendJson(res, 404, { error: 'not_found' })
+  if (req.method !== 'POST') return sendJson(res, 405, { error: 'method_not_allowed' })
+  if (ctx.tokenLimiter.blocked(token)) return sendJson(res, 429, { error: 'too_many_attempts' })
+  const raw = await readBody(req, 4096)
+  let body: { name?: unknown; email?: unknown; team?: unknown }
+  try { body = raw === 'too_large' ? {} : JSON.parse(raw.toString('utf-8')) } catch { return sendJson(res, 400, { error: 'invalid_json' }) }
+  if (raw === 'too_large' || !body || typeof body !== 'object') return sendJson(res, 400, { error: 'invalid_json' })
+  if (typeof body.name !== 'string') return sendJson(res, 400, { error: 'invalid_name' })
+  if (typeof body.email !== 'string') return sendJson(res, 400, { error: 'invalid_email' })
+  if (typeof body.team !== 'string') return sendJson(res, 400, { error: 'invalid_team' })
+  ctx.tokenLimiter.fail(token)
+  const r = await ctx.store.createPerson({ name: body.name, email: body.email, team: body.team })
+  if ('error' in r) return sendJson(res, r.error === 'email_taken' ? 409 : 400, { error: r.error })
+  process.stderr.write(`team-server: admin created ${r.person.name} <${r.person.email}> team=${r.person.team} (${r.person.id})\n`)
+  return sendJson(res, 200, installResponse(ctx, r.person, r.enrollmentToken, r.expiresAt))
+}
+
 async function profileResponse(store: Store, personId: string) {
   const person = await store.getPerson(personId)
   if (!person) return null
@@ -200,6 +219,7 @@ export async function handleApi(ctx: ApiContext, req: IncomingMessage, res: Serv
     return handleRegistration(ctx, req, res, path, viewer, token!)
   }
   if (path === '/api/team/profile') return handleProfile(ctx, req, res, viewer)
+  if (path === '/api/team/admin/people') return handleAdminPeople(ctx, req, res, viewer, token!)
   if (req.method !== 'GET') return sendJson(res, 405, { error: 'method_not_allowed' })
 
   const base = {
