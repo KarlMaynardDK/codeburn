@@ -2,11 +2,20 @@ import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 
+export type InstallMode = 'manual' | 'all'
+const isInstallMode = (v: unknown): v is InstallMode => v === 'manual' || v === 'all'
+
 export interface TeamServerConfig {
   accept_session_detail: boolean
   accept_findings: boolean
   /** Accept the daily coaching snapshot (prompt, correction and rework counts) clients send with `sync coaching on`. */
   accept_coaching: boolean
+  /**
+   * What the install scripts do once the machine is connected. 'manual' (default) leaves the person to choose what to
+   * send and to accept automatic sync themselves. 'all' turns on everything this server accepts, accepts automatic
+   * sync and pushes history, for a rollout where the organisation has already decided.
+   */
+  install_mode: InstallMode
   retention_days: number
   org_name: string
   /** Optional; the --database-url flag and CODEBURN_TEAM_DATABASE_URL take precedence. */
@@ -87,6 +96,7 @@ export const DEFAULT_CONFIG: TeamServerConfig = {
   accept_session_detail: false,
   accept_findings: false,
   accept_coaching: false,
+  install_mode: 'manual',
   retention_days: 400,
   org_name: '',
 }
@@ -106,7 +116,7 @@ function envBool(name: string): boolean | undefined {
 
 /**
  * Environment overrides (CODEBURN_TEAM_ACCEPT_SESSION_DETAIL, CODEBURN_TEAM_ACCEPT_FINDINGS, CODEBURN_TEAM_ACCEPT_COACHING,
- * CODEBURN_TEAM_RETENTION_DAYS, CODEBURN_TEAM_ORG_NAME, CODEBURN_TEAM_PUBLIC_URL, CODEBURN_TEAM_GITLAB_*) win over
+ * CODEBURN_TEAM_INSTALL_MODE, CODEBURN_TEAM_RETENTION_DAYS, CODEBURN_TEAM_ORG_NAME, CODEBURN_TEAM_PUBLIC_URL, CODEBURN_TEAM_GITLAB_*) win over
  * team-server.json, so container deployments can be configured without editing a file inside the data volume.
  */
 function applyEnv(cfg: TeamServerConfig, rawGitlab?: unknown): TeamServerConfig {
@@ -116,6 +126,8 @@ function applyEnv(cfg: TeamServerConfig, rawGitlab?: unknown): TeamServerConfig 
   if (findings !== undefined) cfg.accept_findings = findings
   const coaching = envBool('CODEBURN_TEAM_ACCEPT_COACHING')
   if (coaching !== undefined) cfg.accept_coaching = coaching
+  const mode = process.env.CODEBURN_TEAM_INSTALL_MODE?.trim().toLowerCase()
+  if (isInstallMode(mode)) cfg.install_mode = mode
   const days = Number(process.env.CODEBURN_TEAM_RETENTION_DAYS)
   if (Number.isFinite(days) && days > 0) cfg.retention_days = Math.floor(days)
   const org = process.env.CODEBURN_TEAM_ORG_NAME
@@ -144,6 +156,7 @@ export function loadConfig(dataDir: string): TeamServerConfig {
   if (typeof raw.accept_session_detail === 'boolean') cfg.accept_session_detail = raw.accept_session_detail
   if (typeof raw.accept_findings === 'boolean') cfg.accept_findings = raw.accept_findings
   if (typeof raw.accept_coaching === 'boolean') cfg.accept_coaching = raw.accept_coaching
+  if (isInstallMode(raw.install_mode)) cfg.install_mode = raw.install_mode
   if (typeof raw.retention_days === 'number' && raw.retention_days > 0) cfg.retention_days = Math.floor(raw.retention_days)
   if (typeof raw.org_name === 'string') cfg.org_name = raw.org_name
   if (typeof raw.database_url === 'string' && raw.database_url) cfg.database_url = raw.database_url

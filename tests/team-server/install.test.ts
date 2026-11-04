@@ -42,7 +42,7 @@ function rawGet(t: TestServer, path: string, headers: Record<string, string>): P
 
 describe('client package distribution', () => {
   let t: TestServer
-  afterEach(async () => { await t?.cleanup() })
+  afterEach(async () => { await t?.cleanup(); t = undefined as unknown as TestServer })
 
   it('loads version and sha from the tarball when there is no sidecar', async () => {
     const { pkg, bytes } = await makePackage('2.0.0-rc.1', false)
@@ -80,6 +80,24 @@ describe('client package distribution', () => {
     const cond = await fetch(t.base + '/install/codeburn.tgz', { headers: { 'if-none-match': `"${pkg.sha256}"` } })
     expect(cond.status).toBe(304)
     expect((await fetch(t.base + '/install/codeburn-team-9.9.9.tgz')).status).toBe(404)
+  })
+
+  it('install_mode all makes both scripts share everything, accept and push; manual does not', async () => {
+    const { pkg } = await makePackage()
+    const { installShScript, installPs1Script } = await import('../../src/team-server/client-package.js')
+    const sh = installShScript('https://cb.example.com', pkg, 'all')
+    expect(sh).toContain('"$CB" sync config all on')
+    expect(sh).toContain('"$CB" sync auto enable --accept </dev/null')
+    expect(sh).toContain('"$CB" sync push --since all')
+    const ps1 = installPs1Script('https://cb.example.com', pkg, 'all')
+    expect(ps1).toContain('& $Cb sync config all on')
+    expect(ps1).toContain('& $Cb sync auto enable --accept')
+    expect(ps1).toContain('& $Cb sync push --since all')
+    for (const manual of [installShScript('https://cb.example.com', pkg), installPs1Script('https://cb.example.com', pkg, 'manual')]) {
+      expect(manual).not.toContain('config all on')
+      expect(manual).not.toContain('auto enable --accept </dev/null')
+      expect(manual).not.toContain('& $Cb sync auto enable --accept')
+    }
   })
 
   it('generates scripts with the derived URL and versioned path, with no accept flag', async () => {

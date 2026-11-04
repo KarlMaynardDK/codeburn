@@ -50,6 +50,7 @@ Created in the data dir with these defaults on first start (restart after editin
   "accept_session_detail": false,
   "accept_findings": false,
   "accept_coaching": false,
+  "install_mode": "manual",
   "retention_days": 400,
   "org_name": ""
 }
@@ -64,6 +65,11 @@ Created in the data dir with these defaults on first start (restart after editin
   findings section of the Insights page.
 - `accept_coaching`: enables `POST /v1/coaching` (see "Coaching snapshots" below), the coaching insights that need it
   and the extra columns of the "Who might need coaching" table. Env: `CODEBURN_TEAM_ACCEPT_COACHING`.
+- `install_mode`: `manual` (default) or `all`. With `all`, the generated `/install.sh` and `/install.ps1` finish the
+  setup without asking: `codeburn sync config all on` (everything this server accepts), `codeburn sync auto enable
+  --accept` and `codeburn sync push --since all`. Use it for a rollout where the organisation has already decided; the
+  script says what it is doing and how to undo it (`codeburn sync config all off`). With `manual` each person chooses
+  what to send and accepts automatic sync themselves. Env: `CODEBURN_TEAM_INSTALL_MODE`.
 - `retention_days`: raw spans, rollups and sessions older than this are pruned on startup and every 24 hours.
 - `org_name`: shown in the viewer and in the discovery document.
 - `database_url`: optional PostgreSQL URL (see below).

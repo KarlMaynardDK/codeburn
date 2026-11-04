@@ -147,7 +147,7 @@ export function createTeamServer(opts: TeamServerOptions): Server {
         const origin = config.public_url
           ?? originFromRequest(req.headers.host, Array.isArray(fwd) ? fwd[0] : fwd, tls)
         if (!origin) return sendJson(res, 400, { error: 'invalid_host' })
-        const body = path === '/install.sh' ? installShScript(origin, pkg) : installPs1Script(origin, pkg)
+        const body = path === '/install.sh' ? installShScript(origin, pkg, config.install_mode) : installPs1Script(origin, pkg, config.install_mode)
         res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' })
         return void res.end(method === 'HEAD' ? undefined : body)
       }

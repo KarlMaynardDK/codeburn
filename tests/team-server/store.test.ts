@@ -24,7 +24,7 @@ function spanRecord(o: Partial<SpanRecord> & { span_id: string; ts: string }): S
 describe('config', () => {
   it('writes defaults when team-server.json is absent and reads overrides', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'codeburn-team-cfg-'))
-    expect(loadConfig(dir)).toEqual({ accept_session_detail: false, accept_findings: false, accept_coaching: false, retention_days: 400, org_name: '' })
+    expect(loadConfig(dir)).toEqual({ accept_session_detail: false, accept_findings: false, accept_coaching: false, install_mode: 'manual', retention_days: 400, org_name: '' })
     expect(JSON.parse(await readFile(join(dir, 'team-server.json'), 'utf-8')).retention_days).toBe(400)
     const { writeFile } = await import('node:fs/promises')
     await writeFile(join(dir, 'team-server.json'), JSON.stringify({ accept_session_detail: true, retention_days: 30, org_name: 'Acme', accept_findings: 'yes' }))

@@ -8,7 +8,7 @@ export interface SetupStep {
   commands: string[]
 }
 
-type Accepts = Pick<TeamServerConfig, 'accept_session_detail' | 'accept_findings' | 'accept_coaching' | 'org_name'>
+type Accepts = Pick<TeamServerConfig, 'accept_session_detail' | 'accept_findings' | 'accept_coaching' | 'org_name'> & { install_mode?: TeamServerConfig['install_mode'] }
 
 /**
  * What to run after `codeburn sync setup`. Setup writes a fresh config, which drops the automatic-sync acceptance, so
@@ -16,16 +16,14 @@ type Accepts = Pick<TeamServerConfig, 'accept_session_detail' | 'accept_findings
  * server accepts are offered.
  */
 export function postSetupSteps(config: Accepts): SetupStep[] {
-  const choose: string[] = []
-  if (config.accept_session_detail) choose.push('codeburn sync config detail sessions')
-  if (config.accept_findings) choose.push('codeburn sync config findings on')
-  if (config.accept_coaching) choose.push('codeburn sync config coaching on')
   const steps: SetupStep[] = []
-  if (choose.length) {
+  if (config.accept_session_detail || config.accept_findings || config.accept_coaching) {
     steps.push({
       title: 'Choose what to send',
-      note: 'Optional. Until you run these only daily usage totals are sent. Each line adds one thing; see "What is sent" on the help page.',
-      commands: choose,
+      note: config.install_mode === 'all'
+        ? 'The installer already does this, and the next two steps, for you. Run them only if you set up by hand. It turns on everything this server accepts; see "What is sent" on the help page, where each item can also be set on its own.'
+        : 'Until you run this only daily usage totals are sent. It turns on everything this server accepts; see "What is sent" on the help page, where each item can also be set on its own.',
+      commands: ['codeburn sync config all on'],
     })
   }
   steps.push(

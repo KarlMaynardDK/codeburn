@@ -31,7 +31,7 @@ describe('team server config env overrides', () => {
     vi.stubEnv('CODEBURN_TEAM_RETENTION_DAYS', '-5')
     vi.stubEnv('CODEBURN_TEAM_ORG_NAME', '')
     expect(loadConfig(dir)).toEqual({
-      accept_session_detail: true, accept_findings: false, accept_coaching: false, retention_days: 400, org_name: '',
+      accept_session_detail: true, accept_findings: false, accept_coaching: false, install_mode: 'manual', retention_days: 400, org_name: '',
     })
   })
 
@@ -101,5 +101,19 @@ describe('team server GitLab config', () => {
     const cfg = loadConfig(await withFile({ gitlab: { client_id: 'cid', client_secret: 'sec' } }))
     expect(() => assertServeConfig(cfg)).toThrow(/public_url/)
     expect(() => assertServeConfig({ ...cfg, public_url: 'https://cb.example.com' })).not.toThrow()
+  })
+})
+
+describe('team server install_mode', () => {
+  it('defaults to manual, reads the file and lets the env override it', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cb-mode-'))
+    expect(loadConfig(dir).install_mode).toBe('manual')
+    await writeFile(join(dir, 'team-server.json'), JSON.stringify({ install_mode: 'all' }))
+    expect(loadConfig(dir).install_mode).toBe('all')
+    await writeFile(join(dir, 'team-server.json'), JSON.stringify({ install_mode: 'bogus' }))
+    expect(loadConfig(dir).install_mode).toBe('manual')
+    vi.stubEnv('CODEBURN_TEAM_INSTALL_MODE', 'all')
+    expect(loadConfig(dir).install_mode).toBe('all')
+    vi.unstubAllEnvs()
   })
 })

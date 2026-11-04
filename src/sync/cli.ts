@@ -538,6 +538,38 @@ export function registerSyncCommands(program: Command): void {
       }
     })
 
+  configCmd
+    .command('all <state>')
+    .description('Turn everything the server accepts on (session detail, findings, coaching stats) or off (summary only)')
+    .action((state: string) => {
+      const config = readSyncConfig()
+      if (!config) {
+        process.stderr.write('Sync not configured. Run `codeburn sync setup <url>` first.\n')
+        process.exit(1)
+      }
+      if (state !== 'on' && state !== 'off') {
+        process.stderr.write('Invalid value. Use: on or off\n')
+        process.exit(1)
+      }
+      const on = state === 'on'
+      config.detailLevel = on ? 'sessions' : 'summary'
+      config.shareFindings = on
+      config.shareCoaching = on
+      writeSyncConfig(config)
+      process.stdout.write(`Detail level: ${effectiveLevelFor(config)}. Findings sharing ${state}. Coaching stats sharing ${state}.\n`)
+      if (on) {
+        const skipped = [
+          effectiveLevelFor(config) !== 'sessions' ? 'session detail' : '',
+          !config.findingsPath ? 'findings' : '',
+          !config.coachingPath ? 'coaching stats' : '',
+        ].filter(Boolean)
+        if (skipped.length) process.stderr.write(`Note: this server does not accept ${skipped.join(', ')}, so those are not sent.\n`)
+      }
+      if (config.auto?.accepted) {
+        process.stderr.write('Automatic sync will pause until you accept the changed disclosure: codeburn sync auto enable --accept\n')
+      }
+    })
+
   // --- logout ---
   sync
     .command('logout')

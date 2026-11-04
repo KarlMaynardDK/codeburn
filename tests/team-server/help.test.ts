@@ -18,9 +18,7 @@ describe('post-setup steps', () => {
     const steps = postSetupSteps(all)
     expect(steps.map(s => s.title)).toEqual(['Choose what to send', 'Turn automatic sync on', 'Check it', 'Push your history'])
     expect(cmds(steps)).toEqual([
-      'codeburn sync config detail sessions',
-      'codeburn sync config findings on',
-      'codeburn sync config coaching on',
+      'codeburn sync config all on',
       'codeburn sync auto enable --accept',
       'codeburn sync status',
       'codeburn sync push --since all',
@@ -28,10 +26,9 @@ describe('post-setup steps', () => {
     expect(steps[2]!.note).toContain('Auth: enrollment (team server: Acme)')
   })
 
-  it('offers only what the server accepts, and no choice step when it accepts nothing', () => {
+  it('offers the choice step only when the server accepts something', () => {
     const some = cmds(postSetupSteps({ ...all, accept_session_detail: false, accept_findings: false }))
-    expect(some).toContain('codeburn sync config coaching on')
-    expect(some).not.toContain('codeburn sync config findings on')
+    expect(some).toContain('codeburn sync config all on')
     const none = postSetupSteps({ ...DEFAULT_CONFIG })
     expect(none.map(s => s.title)).toEqual(['Turn automatic sync on', 'Check it', 'Push your history'])
     expect(none[1]!.note).toContain('Auth: enrollment (team server).')

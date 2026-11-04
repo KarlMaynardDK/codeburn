@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { gunzipSync } from 'node:zlib'
+import type { InstallMode } from './config.js'
 
 /** The CLI build this server distributes to team members (an `npm pack` tarball). */
 export interface ClientPackage {
@@ -81,7 +82,7 @@ export function originFromRequest(host: string | undefined, forwardedProto: stri
 const MIN_NODE = '22.13'
 
 /** `origin` must already be validated (scheme://safe-host[:port]); nothing else is interpolated. */
-export function installShScript(origin: string, pkg: ClientPackage): string {
+export function installShScript(origin: string, pkg: ClientPackage, installMode: InstallMode = 'manual'): string {
   const pkgUrl = `${origin}${pkg.path}`
   return `#!/bin/sh
 # CodeBurn team client installer, served by ${origin}
@@ -135,10 +136,15 @@ main() {
     else
       "$CB" sync setup "$BASE_URL" --token "$TOKEN" </dev/null
     fi
-    # No accept flag here: automatic sync needs the person's own consent.
+${installMode === 'all' ? `    printf '\\nThis server is set to share everything it accepts and to sync automatically. Turning that on now.\\n'
+    "$CB" sync config all on </dev/null
+    "$CB" sync auto enable --accept </dev/null
+    "$CB" sync status </dev/null
+    "$CB" sync push --since all </dev/null
+    printf '\\nTo change this later: codeburn sync config all off, or see %s/help\\n' "$BASE_URL"` : `    # No accept flag here: automatic sync needs the person's own consent.
     if ! "$CB" sync auto enable </dev/null; then
       printf '\\nAutomatic sync is NOT enabled yet. Read the disclosure above and, if you agree, run:\\n  codeburn sync auto enable --accept\\n'
-    fi
+    fi`}
   else
     printf '\\nInstalled. To connect this machine, ask your admin for an enrollment token and run:\\n  codeburn sync setup %s --token <token>\\n' "$BASE_URL"
   fi
@@ -149,7 +155,7 @@ main "$@"
 `
 }
 
-export function installPs1Script(origin: string, pkg: ClientPackage): string {
+export function installPs1Script(origin: string, pkg: ClientPackage, installMode: InstallMode = 'manual'): string {
   const pkgUrl = `${origin}${pkg.path}`
   return `# CodeBurn team client installer, served by ${origin}
 # Usage: & ([scriptblock]::Create((irm ${origin}/install.ps1))) [-Token cbe_...] [-Detail summary|sessions]
@@ -202,13 +208,22 @@ if ($Token -ne '') {
   if ($Detail -ne '') { $setupArgs += @('--detail', $Detail) }
   & $Cb @setupArgs
   if ($LASTEXITCODE -ne 0) { Fail 'codeburn sync setup failed.' }
-  # No accept flag here: automatic sync needs the person's own consent.
+${installMode === 'all' ? `  Write-Host ''
+  Write-Host 'This server is set to share everything it accepts and to sync automatically. Turning that on now.'
+  & $Cb sync config all on
+  if ($LASTEXITCODE -ne 0) { Fail 'codeburn sync config all on failed.' }
+  & $Cb sync auto enable --accept
+  if ($LASTEXITCODE -ne 0) { Fail 'codeburn sync auto enable failed.' }
+  & $Cb sync status
+  & $Cb sync push --since all
+  Write-Host ''
+  Write-Host "To change this later: codeburn sync config all off, or see $BaseUrl/help"` : `  # No accept flag here: automatic sync needs the person's own consent.
   & $Cb sync auto enable
   if ($LASTEXITCODE -ne 0) {
     Write-Host ''
     Write-Host 'Automatic sync is NOT enabled yet. Read the disclosure above and, if you agree, run:'
     Write-Host '  codeburn sync auto enable --accept'
-  }
+  }`}
 } else {
   Write-Host ''
   Write-Host 'Installed. To connect this machine, ask your admin for an enrollment token and run:'
