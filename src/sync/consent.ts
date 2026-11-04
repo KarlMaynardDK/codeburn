@@ -15,7 +15,7 @@ export const CORE_SYNC_FIELD_MEANINGS: ReadonlyMap<string, string> = new Map([
   ['ai.input_tokens', 'tokens sent to the model'],
   ['ai.output_tokens', 'tokens returned by the model'],
   ['ai.cost_usd', 'the cost of the call in US dollars'],
-  ['ai.speed', 'how many output tokens per second'],
+  ['ai.speed', 'the service tier of the call (standard, fast or flex)'],
   ['ai.project', 'directory name of the project'],
   ['ai.tools', 'tools available to the model'],
   ['ai.cost_estimated', 'whether cost was estimated or billed'],
@@ -26,6 +26,8 @@ export const CORE_SYNC_FIELD_MEANINGS: ReadonlyMap<string, string> = new Map([
   ['ai.cache_write_tokens', 'tokens written to cache'],
   ['ai.call_count', 'how many API requests in the session'],
   ['ai.session_duration_ms', 'how long the session lasted in milliseconds'],
+  ['ai.category', 'the kind of task (coding, debugging, testing, ...)'],
+  ['codeburn.detail_level', 'whether per-session detail (summary or sessions) is sent'],
   ['ai.subscription_covered', 'whether usage is covered by subscription'],
   ['codeburn.device_id', 'a stable random identifier for this device'],
   ['codeburn.coverage_through', 'date through which usage has been analyzed'],
@@ -36,6 +38,28 @@ export const CORE_SYNC_FIELD_MEANINGS: ReadonlyMap<string, string> = new Map([
   ['git.in_main', 'whether commits were to the main branch (only when work matching is on)'],
   ['git.was_reverted', 'whether work was reverted (only when work matching is on)'],
   ['git.pr_links', 'pull request URLs (only when work matching is on)'],
+  ['ai.reasoning_tokens', 'reasoning tokens the provider recorded'],
+  ['ai.web_search_requests', 'how many web searches the call made'],
+  ['ai.cache_write_1h_tokens', 'tokens written to the one-hour cache'],
+  ['ai.savings_usd', 'what a local model call would have cost on a paid model, in US dollars'],
+  ['ai.billing_route', 'the billing route (for example bedrock or vertex)'],
+  ['ai.billing_mode', 'whether the call was metered or subscription-billed'],
+  ['ai.nano_aiu', 'GitHub Copilot credits used, in nano-units'],
+  ['ai.request_weight', 'how many requests the record stands for, when not one'],
+  ['ai.lines_added', 'how many lines the call added'],
+  ['ai.lines_removed', 'how many lines the call removed'],
+  ['ai.tool_errors', 'how many tool calls failed'],
+  ['ai.interrupted', 'whether you interrupted the call'],
+  ['ai.user_modified', 'whether you changed an edit the call proposed'],
+  ['ai.active_duration_ms', 'how long the model was generating, in milliseconds'],
+  ['ai.tool_wait_ms', 'how long tools ran, in milliseconds'],
+  ['ai.turn_start', 'marks the first call of a prompt'],
+  ['ai.turn_has_edits', 'whether the prompt led to file edits'],
+  ['ai.turn_retries', 'how many retries the prompt needed'],
+  ['ai.mcp_tools', 'names of the MCP tools the call used'],
+  ['ai.skills', 'names of the skills the call used'],
+  ['ai.subagent_types', 'types of subagents the call started'],
+  ['ai.plan_mode', 'whether the call used plan mode'],
 ])
 
 export interface FingerprintInput {
@@ -45,6 +69,17 @@ export interface FingerprintInput {
   workMatching: boolean
   scopeSinceDays: number | null
   cadence: 'daily' | 'hourly'
+  /**
+   * Effective wire detail level (client setting clamped to the server).
+   * Absent means the legacy wire from before detail levels existed: the full
+   * span set with no codeburn.detail_level stamp. Acceptances stored before
+   * this field existed have it absent for that reason.
+   */
+  detailLevel?: 'summary' | 'sessions'
+  /** Whether optimize findings are uploaded after a push. Default false. */
+  shareFindings?: boolean
+  /** Whether coaching stats (counts only) are uploaded after a push. Default false. */
+  shareCoaching?: boolean
 }
 
 export function computeAcceptanceFingerprint(input: FingerprintInput): string {
@@ -57,6 +92,16 @@ export function computeAcceptanceFingerprint(input: FingerprintInput): string {
     scopeSinceDays: input.scopeSinceDays,
     cadence: input.cadence,
   }
+  // The legacy wire with findings off hashes exactly as before these fields
+  // existed, so acceptances stored by older versions keep matching.
+  if (input.detailLevel !== undefined || input.shareFindings) {
+    Object.assign(canonical, {
+      detailLevel: input.detailLevel,
+      shareFindings: input.shareFindings ?? false,
+    })
+  }
+  // Added only when on, so every acceptance stored before coaching existed keeps matching.
+  if (input.shareCoaching) Object.assign(canonical, { shareCoaching: true })
   const json = JSON.stringify(canonical)
   return createHash('sha256').update(json).digest('hex')
 }
@@ -68,6 +113,9 @@ export interface DisclosureInput {
   outboundFields: Array<{ key: string; disclosure: string }>
   workMatching: boolean
   scopeSinceDays: number | null
+  detailLevel?: 'summary' | 'sessions'
+  shareFindings?: boolean
+  shareCoaching?: boolean
 }
 
 export function buildDisclosure(input: DisclosureInput): string {
@@ -79,6 +127,19 @@ export function buildDisclosure(input: DisclosureInput): string {
       : `last ${input.scopeSinceDays} days`
   const workMatchingText = input.workMatching
     ? 'on - session-to-commit links are sent'
+    : 'off'
+
+  const detailText = input.detailLevel === undefined
+    ? 'full - calls carry session ids, durations, call counts and tools, exact timestamps'
+    : input.detailLevel === 'sessions'
+      ? 'sessions - calls carry session ids, durations, call counts and tools, exact timestamps'
+      : 'summary - usage, counts and MCP tool, skill and subagent names only: per-day buckets, hour-rounded times, no session grouping'
+  const findingsText = input.shareFindings
+    ? 'on - a daily snapshot of `codeburn optimize` findings is uploaded: finding id, title, severity, trend, estimated savings (tokens and USD) and period totals only; never file paths, file names, commands, snippets or explanations'
+    : 'off'
+
+  const coachingText = input.shareCoaching
+    ? 'on - a daily snapshot is uploaded, counts only: number of prompts, number of times you corrected the assistant, number of sessions with edits, median time to first edit, and how many files were reworked across sessions; never prompt text, file names or paths'
     : 'off'
 
   const fieldsList = input.outboundFields.length > 0
@@ -93,6 +154,9 @@ export function buildDisclosure(input: DisclosureInput): string {
     `Cadence: ${cadenceText}`,
     `Scope: ${scopeText}`,
     `Work matching: ${workMatchingText}`,
+    `Detail level: ${detailText}`,
+    `Share findings: ${findingsText}`,
+    `Share coaching stats: ${coachingText}`,
     '',
     'Data sent to the endpoint:',
     fieldsList,
@@ -130,6 +194,8 @@ export type ReceiptResult =
   | { result: 'not-accepted' }
   | { result: 'acceptance-required'; changed: string[] }
   | { result: 'pushed'; spans: number }
+  | { result: 'updated'; from: string; to: string }
+  | { result: 'update-failed'; from: string; to: string; reason: string }
   | { result: 'error'; reason: string }
 
 export interface Receipt {
@@ -168,6 +234,18 @@ export function detectFingerprintChanges(stored: FingerprintInput | undefined, c
     changes.push('work matching')
   }
 
+  if (stored.detailLevel !== current.detailLevel) {
+    changes.push('detail level')
+  }
+
+  if ((stored.shareFindings ?? false) !== (current.shareFindings ?? false)) {
+    changes.push('findings sharing')
+  }
+
+  if ((stored.shareCoaching ?? false) !== (current.shareCoaching ?? false)) {
+    changes.push('coaching sharing')
+  }
+
   const storedFields = new Set(stored.outboundFields)
   const currentFields = new Set(current.outboundFields)
   const added = Array.from(currentFields).filter(f => !storedFields.has(f)).sort()
@@ -181,4 +259,24 @@ export function detectFingerprintChanges(stored: FingerprintInput | undefined, c
   }
 
   return changes.length > 0 ? changes : ['unknown']
+}
+
+/**
+ * True when `current` differs from `stored` only by sending LESS: a lower
+ * detail level and/or findings or coaching turned off. Such a change needs no new consent.
+ */
+export function isReductionOnly(stored: FingerprintInput | undefined, current: FingerprintInput): boolean {
+  if (!stored) return false
+  // Absent is the legacy full span set, which sends as much as sessions.
+  const rank = (l: 'summary' | 'sessions' | undefined): number => (l === 'summary' ? 0 : 1)
+  if (rank(current.detailLevel) > rank(stored.detailLevel)) return false
+  if ((current.shareFindings ?? false) && !(stored.shareFindings ?? false)) return false
+  if ((current.shareCoaching ?? false) && !(stored.shareCoaching ?? false)) return false
+  const same: FingerprintInput = {
+    ...current,
+    detailLevel: stored.detailLevel,
+    shareFindings: stored.shareFindings,
+    shareCoaching: stored.shareCoaching,
+  }
+  return computeAcceptanceFingerprint(same) === computeAcceptanceFingerprint(stored)
 }

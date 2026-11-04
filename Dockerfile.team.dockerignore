@@ -1,0 +1,16 @@
+# Build context for Dockerfile.team only (BuildKit picks up <Dockerfile>.dockerignore).
+# Allowlist: the image needs the CLI sources and the dash viewer, nothing else.
+# Host node_modules must never leak in — they hold platform-specific binaries.
+*
+!package.json
+!package-lock.json
+!tsconfig.json
+!tsup.config.ts
+!src
+!dash
+# npm pack needs these (README/LICENSE are always packed; the notices are in package.json files)
+!README.md
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+dash/node_modules
+**/node_modules

@@ -1,0 +1,55 @@
+# CodeBurn team server with PostgreSQL.
+#   docker compose -f docker-compose.team.yml up -d --build
+#   docker compose -f docker-compose.team.yml exec server \
+#     node dist/cli.js team admin add-person --name "Ada" --email ada@example.com --team platform --url https://codeburn.example.com
+# Put a TLS reverse proxy in front (see docs/team/server.md); clients require https off loopback.
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.team
+      args:
+        # Build stamp: version becomes <base>-team.<TEAM_BUILD>. Empty = current UTC time (YYYYMMDDHHmm) at build.
+        TEAM_BUILD: ${TEAM_BUILD:-}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CODEBURN_TEAM_DATABASE_URL: postgres://codeburn:${POSTGRES_PASSWORD:-codeburn}@postgres:5432/codeburn_team
+      # These override team-server.json in the data volume.
+      CODEBURN_TEAM_ORG_NAME: ${CODEBURN_TEAM_ORG_NAME:-}
+      # Public base URL used in /install.sh and /install.ps1 (set it to your https URL; empty derives it from the request Host).
+      # The image already sets CODEBURN_TEAM_CLIENT_PACKAGE=/app/client/codeburn-team.tgz.
+      CODEBURN_TEAM_PUBLIC_URL: ${CODEBURN_TEAM_PUBLIC_URL:-}
+      CODEBURN_TEAM_ACCEPT_SESSION_DETAIL: ${CODEBURN_TEAM_ACCEPT_SESSION_DETAIL:-false}
+      CODEBURN_TEAM_ACCEPT_FINDINGS: ${CODEBURN_TEAM_ACCEPT_FINDINGS:-false}
+      CODEBURN_TEAM_RETENTION_DAYS: ${CODEBURN_TEAM_RETENTION_DAYS:-400}
+      # Optional GitLab sign-in (docs/team/server.md#gitlab-sign-in). Empty values leave the team-server.json settings in place.
+      CODEBURN_TEAM_GITLAB_URL: ${CODEBURN_TEAM_GITLAB_URL:-}
+      CODEBURN_TEAM_GITLAB_CLIENT_ID: ${CODEBURN_TEAM_GITLAB_CLIENT_ID:-}
+      CODEBURN_TEAM_GITLAB_CLIENT_SECRET: ${CODEBURN_TEAM_GITLAB_CLIENT_SECRET:-}
+      CODEBURN_TEAM_GITLAB_ADMIN_GROUPS: ${CODEBURN_TEAM_GITLAB_ADMIN_GROUPS:-}
+      CODEBURN_TEAM_GITLAB_REGISTER_GROUPS: ${CODEBURN_TEAM_GITLAB_REGISTER_GROUPS:-}
+      CODEBURN_TEAM_GITLAB_REGISTER_NOTE: ${CODEBURN_TEAM_GITLAB_REGISTER_NOTE:-}
+    ports:
+      - "127.0.0.1:${CODEBURN_TEAM_PORT:-8787}:8787"
+    volumes:
+      - team-data:/data
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: codeburn
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-codeburn}
+      POSTGRES_DB: codeburn_team
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codeburn -d codeburn_team"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+volumes:
+  team-data:
+  pg-data:

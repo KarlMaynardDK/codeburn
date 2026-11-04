@@ -1,0 +1,37 @@
+# CodeBurn team collector + report viewer.
+#   docker build -f Dockerfile.team -t codeburn-team .
+#   docker run -p 8787:8787 -v codeburn-team:/data codeburn-team
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY . .
+# Team builds are versioned <base>-team.<stamp>; the base is package.json's version without any prerelease.
+# TEAM_BUILD empty means "now" (UTC YYYYMMDDHHmm), computed in the same RUN as the build.
+ARG TEAM_BUILD=
+RUN STAMP="${TEAM_BUILD:-$(date -u +%Y%m%d%H%M)}" \
+    && node -e 'const f=require("node:fs"),p=JSON.parse(f.readFileSync("package.json","utf8"));p.version=p.version.replace(/[-+].*$/,"")+"-team."+process.argv[1];f.writeFileSync("package.json",JSON.stringify(p,null,2))' "$STAMP" \
+    && npm run build
+# Package this exact build so the server can hand it to team members (/install.sh, /install.ps1).
+RUN npm pack --ignore-scripts --silent --pack-destination /tmp >/dev/null \
+    && mkdir -p /out && mv /tmp/codeburn-team-*.tgz /out/codeburn-team.tgz \
+    && node -e "const c=require('node:crypto'),f=require('node:fs');const t=f.readFileSync('/out/codeburn-team.tgz');f.writeFileSync('/out/codeburn-team.json',JSON.stringify({version:require('./package.json').version,sha256:c.createHash('sha256').update(t).digest('hex')})+'\n')"
+
+FROM node:22-alpine
+ENV NODE_ENV=production \
+    NODE_OPTIONS=--disable-warning=ExperimentalWarning \
+    CODEBURN_TEAM_DATA_DIR=/data \
+    CODEBURN_TEAM_CLIENT_PACKAGE=/app/client/codeburn-team.tgz
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
+COPY --from=build /app/dist ./dist
+COPY --from=build /out/ ./client/
+RUN mkdir -p /data && chown node:node /data
+USER node
+VOLUME /data
+EXPOSE 8787
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+  CMD wget -qO- http://127.0.0.1:8787/.well-known/codeburn-export.json >/dev/null || exit 1
+ENTRYPOINT ["node", "dist/cli.js", "team"]
+CMD ["serve", "--host", "0.0.0.0", "--port", "8787"]

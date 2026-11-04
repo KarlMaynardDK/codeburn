@@ -4,7 +4,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 import { createServer, type Server } from 'http'
 
-import { parseDiscoveryDoc, DiscoveryError } from '../src/sync/discovery.js'
+import { parseDiscoveryDoc, DiscoveryError, effectiveDetailLevel } from '../src/sync/discovery.js'
 import {
   generatePkce,
   buildAuthUrl,
@@ -33,6 +33,33 @@ describe('parseDiscoveryDoc', () => {
     expect(doc.scopes).toEqual(['openid', 'codeburn:write'])
     expect(doc.traces_path).toBe('/v1/traces')
     expect(doc.max_batch_size).toBe(500)
+  })
+
+  it('parses an enrollment doc without issuer/client_id', () => {
+    const doc = parseDiscoveryDoc({
+      version: 1, auth: 'enrollment', enroll_path: '/v1/enroll', traces_path: '/v1/traces',
+      max_batch_size: 1000, detail_levels: ['summary', 'sessions'], findings_path: '/v1/findings', org_name: 'Acme',
+    })
+    expect(doc.auth).toBe('enrollment')
+    expect(doc.enroll_path).toBe('/v1/enroll')
+    expect(doc.detail_levels).toEqual(['summary', 'sessions'])
+    expect(doc.findings_path).toBe('/v1/findings')
+    expect(doc.org_name).toBe('Acme')
+    expect(doc.issuer).toBe('')
+  })
+
+  it('enrollment doc defaults detail_levels to summary and requires enroll_path', () => {
+    expect(parseDiscoveryDoc({ auth: 'enrollment', enroll_path: '/v1/enroll' }).detail_levels).toEqual(['summary'])
+    expect(() => parseDiscoveryDoc({ auth: 'enrollment' })).toThrow('enroll_path')
+  })
+
+  it('still requires issuer/client_id when auth is not enrollment', () => {
+    expect(() => parseDiscoveryDoc({ version: 1, auth: 'oidc', client_id: 'y' })).toThrow('issuer')
+  })
+
+  it('ignores unknown detail levels', () => {
+    expect(parseDiscoveryDoc({ auth: 'enrollment', enroll_path: '/e', detail_levels: ['bogus', 'sessions'] }).detail_levels)
+      .toEqual(['sessions'])
   })
 
   it('rejects version > 1', () => {
@@ -275,5 +302,41 @@ describe('renderCallbackPage', () => {
     const html = renderCallbackPage(true, 'Login successful', 'You can close this tab.')
     expect(html).toContain('Login successful')
     expect(html).toContain('You can close this tab.')
+  })
+})
+
+
+describe('effectiveDetailLevel', () => {
+  it('clamps the client setting to the server-advertised levels', () => {
+    expect(effectiveDetailLevel('sessions', ['summary'])).toBe('summary')
+    expect(effectiveDetailLevel('sessions', ['summary', 'sessions'])).toBe('sessions')
+    expect(effectiveDetailLevel('summary', ['summary', 'sessions'])).toBe('summary')
+  })
+
+  it('defaults to summary', () => {
+    expect(effectiveDetailLevel(undefined, undefined)).toBe('summary')
+    expect(effectiveDetailLevel('sessions', undefined)).toBe('summary')
+  })
+})
+
+describe('parseDiscoveryDoc client_package', () => {
+  const sha = 'a'.repeat(64)
+  const base = { version: 1, auth: 'enrollment', enroll_path: '/v1/enroll' }
+
+  it('parses a valid client_package on enrollment servers', () => {
+    const doc = parseDiscoveryDoc({ ...base, client_package: { version: '1.2.3', sha256: sha, path: '/install/codeburn-team-1.2.3.tgz' } })
+    expect(doc.client_package).toEqual({ version: '1.2.3', sha256: sha, path: '/install/codeburn-team-1.2.3.tgz' })
+  })
+
+  it('drops malformed or unsafe client_package values', () => {
+    const good = { version: '1.2.3', sha256: sha, path: '/install/codeburn-team-1.2.3.tgz' }
+    for (const bad of [
+      { ...good, version: 'latest' }, { ...good, version: '1.2.3; rm -rf /' }, { ...good, sha256: 'abc' },
+      { ...good, sha256: 'A'.repeat(64) }, { ...good, path: '/other/x.tgz' }, { ...good, path: '/install/../x' },
+      { ...good, path: 'https://evil.example/x.tgz' }, 'nope', null,
+    ]) {
+      expect(parseDiscoveryDoc({ ...base, client_package: bad }).client_package).toBeUndefined()
+    }
+    expect(parseDiscoveryDoc(base).client_package).toBeUndefined()
   })
 })

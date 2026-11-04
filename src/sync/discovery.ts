@@ -11,7 +11,24 @@ export interface CodeburnDiscoveryDoc {
   scopes: string[]
   traces_path: string
   max_batch_size: number
+  /** "enrollment" = self-hosted team server (no IdP); otherwise OIDC. */
+  auth?: 'enrollment' | 'oidc'
+  enroll_path?: string
+  /** Where an enrolled device revokes its own credential (team servers that support it). */
+  revoke_path?: string
+  /** Detail levels the server accepts. Defaults to ["summary"]. */
+  detail_levels: DetailLevel[]
+  findings_path?: string
+  /** Where a coaching snapshot (counts only) is uploaded, when the server accepts it. */
+  coaching_path?: string
+  org_name?: string
+  /** The CLI build a team server distributes (self-hosted team servers only). */
+  client_package?: ClientPackageInfo
 }
+
+export interface ClientPackageInfo { version: string; sha256: string; path: string }
+
+export type DetailLevel = 'summary' | 'sessions'
 
 export class DiscoveryError extends Error {
   constructor(message: string) {
@@ -44,6 +61,18 @@ export function assertHttps(url: string, label: string): void {
 
 const SUPPORTED_VERSION = 1
 
+const PKG_VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/
+
+/** Validates an advertised client package; anything malformed is dropped rather than trusted. */
+export function parseClientPackage(raw: unknown): ClientPackageInfo | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const p = raw as Record<string, unknown>
+  if (typeof p.version !== 'string' || p.version.length > 64 || !PKG_VERSION_RE.test(p.version)) return undefined
+  if (typeof p.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(p.sha256)) return undefined
+  if (typeof p.path !== 'string' || !p.path.startsWith('/install/') || p.path.length > 200 || !/^[A-Za-z0-9._/-]+$/.test(p.path) || p.path.includes('..')) return undefined
+  return { version: p.version, sha256: p.sha256, path: p.path }
+}
+
 export function parseDiscoveryDoc(raw: unknown): CodeburnDiscoveryDoc {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new DiscoveryError('Discovery doc must be a JSON object')
@@ -59,19 +88,29 @@ export function parseDiscoveryDoc(raw: unknown): CodeburnDiscoveryDoc {
     )
   }
 
-  // Required fields
-  const issuer = doc.issuer
-  if (typeof issuer !== 'string' || !issuer) {
-    throw new DiscoveryError('Discovery doc missing required field: issuer')
-  }
+  const enrollment = doc.auth === 'enrollment'
 
-  const client_id = doc.client_id
-  if (typeof client_id !== 'string' || !client_id) {
-    throw new DiscoveryError('Discovery doc missing required field: client_id')
-  }
+  // Required fields (OIDC only: enrollment servers have no IdP)
+  let issuer = ''
+  let client_id = ''
+  if (!enrollment) {
+    if (typeof doc.issuer !== 'string' || !doc.issuer) {
+      throw new DiscoveryError('Discovery doc missing required field: issuer')
+    }
+    issuer = doc.issuer
 
-  // Format validation after presence checks (clearer errors)
-  assertHttps(issuer, 'Issuer')
+    if (typeof doc.client_id !== 'string' || !doc.client_id) {
+      throw new DiscoveryError('Discovery doc missing required field: client_id')
+    }
+    client_id = doc.client_id
+
+    // Format validation after presence checks (clearer errors)
+    assertHttps(issuer, 'Issuer')
+  } else {
+    if (typeof doc.enroll_path !== 'string' || !doc.enroll_path.startsWith('/')) {
+      throw new DiscoveryError('Discovery doc missing required field: enroll_path')
+    }
+  }
 
   // Optional with defaults
   const scopes = Array.isArray(doc.scopes)
@@ -84,7 +123,25 @@ export function parseDiscoveryDoc(raw: unknown): CodeburnDiscoveryDoc {
     ? doc.max_batch_size
     : 1000
 
-  return { version, issuer, client_id, scopes, traces_path, max_batch_size }
+  const levels = Array.isArray(doc.detail_levels)
+    ? doc.detail_levels.filter((l): l is DetailLevel => l === 'summary' || l === 'sessions')
+    : []
+  const detail_levels: DetailLevel[] = levels.length > 0
+    ? Array.from(new Set(levels))
+    // Legacy OIDC endpoints predate detail levels and always received the full span set.
+    : enrollment ? ['summary'] : ['summary', 'sessions']
+
+  const client_package = enrollment ? parseClientPackage(doc.client_package) : undefined
+
+  return {
+    version, issuer, client_id, scopes, traces_path, max_batch_size, detail_levels,
+    ...(enrollment ? { auth: 'enrollment' as const, enroll_path: doc.enroll_path as string } : {}),
+    ...(enrollment && typeof doc.revoke_path === 'string' && doc.revoke_path.startsWith('/') ? { revoke_path: doc.revoke_path } : {}),
+    ...(typeof doc.findings_path === 'string' && doc.findings_path.startsWith('/') ? { findings_path: doc.findings_path } : {}),
+    ...(typeof doc.coaching_path === 'string' && doc.coaching_path.startsWith('/') ? { coaching_path: doc.coaching_path } : {}),
+    ...(typeof doc.org_name === 'string' && doc.org_name ? { org_name: doc.org_name.slice(0, 200) } : {}),
+    ...(client_package ? { client_package } : {}),
+  }
 }
 
 export async function fetchDiscoveryDoc(baseUrl: string): Promise<CodeburnDiscoveryDoc> {
@@ -116,4 +173,14 @@ export async function fetchDiscoveryDoc(baseUrl: string): Promise<CodeburnDiscov
   }
 
   return parseDiscoveryDoc(body)
+}
+
+/**
+ * Effective detail level: the client setting clamped to what the server
+ * advertises. A server that accepts only "summary" always gets summary.
+ */
+export function effectiveDetailLevel(clientLevel: DetailLevel | undefined, serverLevels: readonly DetailLevel[] | undefined): DetailLevel {
+  const allowed = serverLevels && serverLevels.length > 0 ? serverLevels : ['summary' as DetailLevel]
+  const wanted = clientLevel ?? 'summary'
+  return allowed.includes(wanted) ? wanted : 'summary'
 }

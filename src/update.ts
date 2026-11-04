@@ -1,10 +1,13 @@
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
-import { access, link, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
-import { homedir, platform as osPlatform } from 'node:os'
+import { createHash } from 'node:crypto'
+import { access, link, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { homedir, platform as osPlatform, tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
 
 import { getCodeburnCacheDir } from './cache-dir.js'
+import { readSyncConfig } from './sync/config.js'
+import { assertHttps, parseDiscoveryDoc, type ClientPackageInfo } from './sync/discovery.js'
 import {
   RELEASE_DOWNLOAD_BASE,
   compareMenubarVersions,
@@ -57,10 +60,17 @@ export type UpdateDeps = {
   platform: NodeJS.Platform
   /// This process's own version: the menubar target, and the --local target.
   cliVersion: string
+  /// npm package name of the running CLI (from its package.json); `codeburn-team` is the team build.
+  packageName?: string
   findGlobalCli: () => Promise<GlobalCli | null>
   findExecutable: (name: string, near?: string) => Promise<string | null>
   run: (command: string, args: string[], options: RunOptions) => Promise<RunResult>
   fetchText: (url: string) => Promise<string>
+  /// Sync config of this machine; a team-server enrollment makes `update` install the server's build.
+  teamSync?: () => { baseUrl: string; authMode?: string } | null
+  /// Downloads the team build to a local file, verifying it against the sha256 the server advertised.
+  /// Throws ChecksumMismatchError when the bytes differ; `cleanup` removes the downloaded file.
+  downloadTeamPackage?: (url: string, sha256: string) => Promise<{ path: string; cleanup: () => Promise<void> }>
   menubar: () => Promise<InstalledApp | null>
   installMenubar: (cliVersion: string) => Promise<void>
   desktop: () => Promise<InstalledApp | null>
@@ -99,12 +109,12 @@ export function detectCliMethod(resolvedPath: string): CliMethod {
   if (p.includes('/.volta/')) return 'volta'
   if (p.includes('/.pnpm/') || p.includes('/pnpm/global/')) return 'pnpm'
   if (p.includes('/.bun/')) return 'bun'
-  if (p.includes('/node_modules/codeburn/')) return 'npm'
+  if (p.includes('/node_modules/codeburn/') || p.includes('/node_modules/codeburn-team/')) return 'npm'
   return 'unknown'
 }
 
 export function packageRootOf(resolvedPath: string): string | null {
-  return /^(.*[\\/]node_modules[\\/]codeburn)[\\/]/.exec(resolvedPath)?.[1] ?? null
+  return /^(.*[\\/]node_modules[\\/]codeburn(?:-team)?)[\\/]/.exec(resolvedPath)?.[1] ?? null
 }
 
 export function classifyCommandFailure(result: RunResult, fallback: StepCode): StepCode {
@@ -238,9 +248,39 @@ export async function runUpdate(options: UpdateOptions, deps: UpdateDeps): Promi
       finish('cli', 'skipped', 'not_installed', 'No global codeburn command is installed.', { installed: null, latest: null })
       return null
     }
-    const base = { installed: cli.version, method: cli.method, command: MANUAL_COMMAND[cli.method] }
+    let base = { installed: cli.version, method: cli.method, command: MANUAL_COMMAND[cli.method] }
     if (cli.method === 'managed') {
       finish('cli', 'skipped', 'managed', `${cli.launcher} is bundled with another app and updates with it.`, { ...base, latest: null })
+      return null
+    }
+
+    // A team-server enrollment owns the CLI build: never replace it with the upstream release.
+    let team: { pkg: ClientPackageInfo; url: string } | null = null
+    const sync = options.local ? null : deps.teamSync?.() ?? null
+    if (sync?.authMode === 'enrollment' && sync.baseUrl) {
+      const origin = sync.baseUrl.replace(/\/$/, '')
+      try {
+        assertHttps(origin, 'Team server URL')
+        const doc = parseDiscoveryDoc(JSON.parse(await deps.fetchText(`${origin}/.well-known/codeburn-export.json`)))
+        if (doc.client_package) team = { pkg: doc.client_package, url: `${origin}${doc.client_package.path}` }
+      } catch (err) {
+        finish('cli', 'error', 'download_fail',
+          `Could not read the team build from ${origin} (${(err as Error).message}). Not falling back to the public release.`, { ...base, latest: null })
+        return null
+      }
+      if (team) {
+        base = { ...base, command: `npm install -g ${team.url}` }
+        if (cli.method !== 'npm') {
+          finish('cli', 'skipped', 'managed',
+            `Your team build is installed from the team server with npm (${base.command}); ${cli.method === 'unknown' ? 'this install' : cli.method} cannot update it.`, { ...base, latest: team.pkg.version })
+          return null
+        }
+      }
+    }
+
+    if (!team && !options.local && deps.packageName === 'codeburn-team') {
+      finish('cli', 'skipped', 'managed',
+        'This is a team build of CodeBurn; updates come from your team server (codeburn sync setup <url> --token …).', { ...base, latest: null })
       return null
     }
 
@@ -252,16 +292,19 @@ export async function runUpdate(options: UpdateOptions, deps: UpdateDeps): Promi
         finish('cli', 'error', 'no_manager', 'npm was not found, so the latest version cannot be checked.', { ...base, latest: null })
         return null
       }
-      const view = await runNpm(npm, ['view', 'codeburn@latest', 'version', '--fetch-retries=1', '--fetch-timeout=15000', '--fetch-retry-mintimeout=2000'], VIEW_TIMEOUT_MS)
-      const viewed = view.code === 0 ? view.stdout.trim().split(/\s+/).pop() ?? '' : ''
-      if (!/^\d+\.\d+\.\d+$/.test(viewed)) {
-        const code = view.code === 0 ? 'download_fail' : classifyCommandFailure(view, 'download_fail')
-        finish('cli', 'error', code, code === 'timeout'
-          ? 'The npm registry did not answer in time.'
-          : 'Could not read the latest version from the npm registry.', { ...base, latest: null })
-        return null
+      if (team) latest = team.pkg.version
+      else {
+        const view = await runNpm(npm, ['view', 'codeburn@latest', 'version', '--fetch-retries=1', '--fetch-timeout=15000', '--fetch-retry-mintimeout=2000'], VIEW_TIMEOUT_MS)
+        const viewed = view.code === 0 ? view.stdout.trim().split(/\s+/).pop() ?? '' : ''
+        if (!/^\d+\.\d+\.\d+$/.test(viewed)) {
+          const code = view.code === 0 ? 'download_fail' : classifyCommandFailure(view, 'download_fail')
+          finish('cli', 'error', code, code === 'timeout'
+            ? 'The npm registry did not answer in time.'
+            : 'Could not read the latest version from the npm registry.', { ...base, latest: null })
+          return null
+        }
+        latest = viewed
       }
-      latest = viewed
     }
 
     let brew: string | null = null
@@ -283,7 +326,8 @@ export async function runUpdate(options: UpdateOptions, deps: UpdateDeps): Promi
       }
       latest = formula
     }
-    if (versionAtLeast(cli.version, latest)) {
+    // The team server is the source of truth: any different version installs (this also allows rollback).
+    if (team ? cli.version === latest : versionAtLeast(cli.version, latest)) {
       finish('cli', 'skipped', 'up_to_date', `CLI ${cli.version} is up to date.`, { ...base, latest })
       return null
     }
@@ -305,12 +349,32 @@ export async function runUpdate(options: UpdateOptions, deps: UpdateDeps): Promi
       return null
     }
     emit({ type: 'step', component: 'cli', state: 'start', from: cli.version ?? undefined, to: latest, message: `Updating CLI to ${latest} with npm...` })
-    const install = await runNpm(npm, ['install', '-g', `codeburn@${latest}`, '--force', '--prefer-online', '--no-fund', '--no-audit'], INSTALL_TIMEOUT_MS)
-    return afterInstall(cli, install, latest, latest)
+    if (!team) {
+      const install = await runNpm(npm, ['install', '-g', `codeburn@${latest}`, '--force', '--prefer-online', '--no-fund', '--no-audit'], INSTALL_TIMEOUT_MS)
+      return afterInstall(cli, install, latest, latest, base.command)
+    }
+    // npm would install whatever bytes the URL returns, so fetch and verify the team build first
+    // and hand npm the checked local file.
+    let pkg: { path: string; cleanup: () => Promise<void> }
+    try {
+      pkg = await (deps.downloadTeamPackage ?? downloadTeamPackage)(team.url, team.pkg.sha256)
+    } catch (err) {
+      const mismatch = err instanceof ChecksumMismatchError
+      finish('cli', 'error', mismatch ? 'verify_fail' : 'download_fail', mismatch
+        ? `The team build from ${team.url} does not match the checksum the server advertised; nothing was installed.`
+        : `Could not download the team build from ${team.url} (${(err as Error).message}).`, { ...base, latest })
+      return null
+    }
+    try {
+      const install = await runNpm(npm, ['install', '-g', pkg.path, '--force', '--no-fund', '--no-audit'], INSTALL_TIMEOUT_MS)
+      return await afterInstall(cli, install, latest, latest, base.command, true)
+    } finally {
+      await pkg.cleanup()
+    }
   }
 
-  async function afterInstall(before: GlobalCli, result: RunResult, target: string, latest: string): Promise<string | null> {
-    const base = { installed: before.version, latest, method: before.method, command: MANUAL_COMMAND[before.method] }
+  async function afterInstall(before: GlobalCli, result: RunResult, target: string, latest: string, command = MANUAL_COMMAND[before.method], exact = false): Promise<string | null> {
+    const base = { installed: before.version, latest, method: before.method, command }
     if (result.code !== 0) {
       const code = classifyCommandFailure(result, 'install_fail')
       const messages: Record<string, string> = {
@@ -324,7 +388,7 @@ export async function runUpdate(options: UpdateOptions, deps: UpdateDeps): Promi
       return null
     }
     const after = await deps.findGlobalCli()
-    if (!after || !versionAtLeast(after.version, target)) {
+    if (!after || (exact ? after.version !== target : !versionAtLeast(after.version, target))) {
       finish('cli', 'error', 'install_fail', `The update finished, but ${before.launcher} is still ${after?.version ?? 'missing'}.`, base)
       return null
     }
@@ -480,8 +544,12 @@ function runCapture(command: string, args: string[], options: RunOptions): Promi
 async function analyzeLauncher(launcher: string): Promise<GlobalCli> {
   let resolved = await realpath(launcher).catch(() => launcher)
   // A Windows npm shim (`codeburn.cmd`) is a file, not a link; the package sits beside it.
-  const shimTarget = join(dirname(launcher), 'node_modules', 'codeburn', 'dist', 'cli.js')
-  if (!packageRootOf(resolved) && await exists(shimTarget)) resolved = shimTarget
+  if (!packageRootOf(resolved)) {
+    for (const name of ['codeburn', 'codeburn-team']) {
+      const shimTarget = join(dirname(launcher), 'node_modules', name, 'dist', 'cli.js')
+      if (await exists(shimTarget)) { resolved = shimTarget; break }
+    }
+  }
   const root = packageRootOf(resolved)
   let version: string | null = null
   if (root) {
@@ -519,6 +587,31 @@ async function fetchText(url: string): Promise<string> {
   })
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
   return response.text()
+}
+
+export class ChecksumMismatchError extends Error {
+  constructor(readonly expected: string, readonly actual: string) {
+    super(`sha256 ${actual} does not match the advertised ${expected}`)
+    this.name = 'ChecksumMismatchError'
+  }
+}
+
+const TEAM_PACKAGE_MAX_BYTES = 100 * 1024 * 1024
+
+async function downloadTeamPackage(url: string, sha256: string): Promise<{ path: string; cleanup: () => Promise<void> }> {
+  const response = await fetchWithProxy(url, {
+    headers: { 'User-Agent': 'codeburn-update' },
+    signal: AbortSignal.timeout(INSTALL_TIMEOUT_MS),
+  })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  const bytes = Buffer.from(await response.arrayBuffer())
+  if (bytes.length > TEAM_PACKAGE_MAX_BYTES) throw new Error(`package is larger than ${TEAM_PACKAGE_MAX_BYTES} bytes`)
+  const actual = createHash('sha256').update(bytes).digest('hex')
+  if (actual !== sha256.toLowerCase()) throw new ChecksumMismatchError(sha256, actual)
+  const dir = await mkdtemp(join(tmpdir(), 'codeburn-update-'))
+  const path = join(dir, 'codeburn-team.tgz')
+  await writeFile(path, bytes)
+  return { path, cleanup: () => rm(dir, { recursive: true, force: true }) }
 }
 
 async function findDesktop(): Promise<InstalledApp | null> {
@@ -563,14 +656,17 @@ function reexec(entry: string, args: string[], onLine: (line: string) => void): 
   })
 }
 
-export function defaultUpdateDeps(cliVersion: string): UpdateDeps {
+export function defaultUpdateDeps(cliVersion: string, packageName?: string): UpdateDeps {
   return {
     platform: osPlatform(),
     cliVersion,
+    packageName,
     findGlobalCli,
     findExecutable,
     run: runCapture,
     fetchText,
+    downloadTeamPackage,
+    teamSync: () => { const c = readSyncConfig(); return c ? { baseUrl: c.baseUrl, authMode: c.authMode } : null },
     menubar: async () => {
       const { installedPath } = await resolveMacInstallTarget()
       return installedPath ? { path: installedPath, version: await readBundleVersion(installedPath) } : null

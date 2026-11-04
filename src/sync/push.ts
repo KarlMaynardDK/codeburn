@@ -8,9 +8,11 @@
 import type { ProjectSummary } from '../types.js'
 import type { PlanMap, PlanProvider } from '../config.js'
 import { isProxiedPath } from '../models.js'
+import { isBehavioralCall, isBehavioralTurn } from '../behavioral-weight.js'
 import { inferSessionProvider } from '../session-output.js'
 import { resolveWorkUnits, workUnitSessionKey } from '../work-units.js'
 import { assertHttps } from './discovery.js'
+import { currentCliVersion } from '../plugins/loader.js'
 import { ledgerKeySet, appendToLedger, type LedgerEntry } from './ledger.js'
 import {
   buildOtlpPayload,
@@ -269,14 +271,21 @@ export function collectUnsentCalls(projects: ProjectSummary[], now: number = Dat
         ...lineageContext(session, provider, resolution, unitById),
       }
       for (const turn of session.turns) {
+        // The turn's outcome rides on its first behavioral call only, so a
+        // receiver counts turns the way the local reports do.
+        let turnPending = isBehavioralTurn(turn)
         for (const call of turn.assistantCalls) {
           const covered = subscriptionCoveredFor(plans, call.provider, session.workingDirectory)
+          const startsTurn = turnPending && isBehavioralCall(call)
+          if (startsTurn) turnPending = false
           allCalls.push({
             call,
             sessionId: session.sessionId,
             project: project.project,
             workingDirectory: session.workingDirectory,
+            category: turn.category,
             session: covered !== undefined ? { ...sessionContext, subscriptionCovered: covered } : sessionContext,
+            ...(startsTurn ? { turn: { hasEdits: turn.hasEdits, retries: turn.retries } } : {}),
           })
         }
       }
@@ -362,6 +371,8 @@ export interface SendBatchesOptions {
     perCall: Map<string, import('./otlp.js').OtlpAttribute[]>
     extraSpans: import('./otlp.js').OtlpSpan[]
   }
+  /** Wire detail level stamped on every batch (codeburn.detail_level). Omit for the legacy full span set. */
+  detailLevel?: 'summary' | 'sessions'
   /** Injectable sleep for tests. Defaults to real setTimeout. */
   sleep?: (ms: number) => Promise<void>
   /** Max wait per 429 (caps Retry-After). Default 120s. */
@@ -396,6 +407,7 @@ export async function sendBatches(opts: SendBatchesOptions): Promise<PushResult>
   return sendBatchesCore({
     ...opts,
     buildPayload: batch => buildOtlpPayload(batch, {
+      ...(opts.detailLevel ? { detailLevel: opts.detailLevel } : {}),
       ...(opts.coverageThrough ? { coverageThrough: opts.coverageThrough } : {}),
       ...(opts.pluginAttributes
         ? { pluginAttributes: opts.pluginAttributes.values, pluginAttributeKeys: opts.pluginAttributes.keys }
@@ -439,6 +451,7 @@ async function sendBatchesCore<T>(opts: SendBatchesCoreOptions<T>): Promise<Push
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${opts.accessToken}`,
+          'X-Codeburn-Client-Version': currentCliVersion(),
         },
         body: JSON.stringify(payload),
       })

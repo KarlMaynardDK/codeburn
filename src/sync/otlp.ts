@@ -10,7 +10,8 @@ import { hostname, userInfo } from 'os'
 import { posix, win32 } from 'path'
 import { isTrustedAbsoluteWorkingDirectory } from '../path-privacy.js'
 import type { ParsedApiCall } from '../types.js'
-import { billableOutputTokens } from '../models.js'
+import { billableOutputTokens, callBillingMode, effectiveRouteId } from '../models.js'
+import { behavioralCallWeight } from '../behavioral-weight.js'
 import type { SessionAttributionRecord } from '../yield.js'
 
 export interface OtlpSpan {
@@ -78,6 +79,18 @@ export function wireProjectName(projectPath: string, fallback: string): string {
   return normalized.split('/').filter(Boolean).pop() ?? fallback
 }
 
+/**
+ * Summary-level trace id: one bucket per device per UTC day, so a receiver can
+ * never reconstruct individual sessions from it.
+ */
+export function deriveDayBucketTraceId(deviceId: string, isoTimestamp: string): string {
+  const ms = new Date(isoTimestamp).getTime()
+  const day = isNaN(ms) ? 'unknown' : new Date(ms).toISOString().slice(0, 10)
+  return createHash('sha256').update(`${deviceId}:${day}`).digest('hex').slice(0, 32)
+}
+
+const HOUR_MS = 3_600_000
+
 // --- Timestamp conversion ---
 
 function toUnixNano(isoTimestamp: string): string {
@@ -97,6 +110,16 @@ export interface CallWithSession {
   workingDirectory?: string
   /** Session-level wire context (CB-3). Absent on callers that predate it. */
   session?: SessionWireContext
+  /** Task category of the turn this call belongs to (ClassifiedTurn.category). Sent as ai.category. */
+  category?: string
+  /** Set only on the first behavioral call of a behavioral turn, so a receiver counts each turn once. */
+  turn?: TurnWireContext
+}
+
+/** Turn outcome facts (ClassifiedTurn.hasEdits / retries), sent as ai.turn_* on a detail-level wire. */
+export interface TurnWireContext {
+  hasEdits: boolean
+  retries: number
 }
 
 /**
@@ -198,7 +221,78 @@ function safeProjectAttribute(project: string | undefined): OtlpAttribute | null
   return { key: 'ai.project', value: { stringValue: project } }
 }
 
+export type WireDetailLevel = 'summary' | 'sessions'
+
+const positiveInt = (key: string, value: number | undefined): OtlpAttribute[] =>
+  value !== undefined && Number.isFinite(value) && value > 0 ? [{ key, value: { intValue: String(Math.round(value)) } }] : []
+
+function identifierList(key: string, values: readonly string[]): OtlpAttribute[] {
+  const safe = sanitizeToolIdentifiers([...new Set(values)])
+  return safe.length > 0 ? [{ key, value: { arrayValue: { values: safe.map(v => ({ stringValue: v })) } } }] : []
+}
+
+/**
+ * Per-call counts, flags and names carried only on a detail-level wire (summary
+ * and sessions alike). Numbers and identifiers only: never prompts, paths,
+ * commands or titles. Zero and false values are omitted; a receiver reads a
+ * missing key as zero, false or (for ai.request_weight) one.
+ */
+function detailLevelCallAttributes(call: ParsedApiCall, turn: TurnWireContext | undefined): OtlpAttribute[] {
+  const attributes: OtlpAttribute[] = [
+    ...positiveInt('ai.reasoning_tokens', call.usage.reasoningTokens),
+    ...positiveInt('ai.web_search_requests', call.usage.webSearchRequests),
+    ...positiveInt('ai.cache_write_1h_tokens', call.cacheCreationOneHourTokens),
+    ...positiveInt('ai.nano_aiu', call.nanoAiu),
+    ...positiveInt('ai.lines_added', call.locAdded),
+    ...positiveInt('ai.lines_removed', call.locRemoved),
+    ...positiveInt('ai.tool_errors', call.toolErrors),
+    ...positiveInt('ai.active_duration_ms', call.activeDurationMs),
+    ...positiveInt('ai.tool_wait_ms', call.toolWaitMs),
+  ]
+  if (call.savingsUSD !== undefined && Number.isFinite(call.savingsUSD) && call.savingsUSD > 0) {
+    attributes.push({ key: 'ai.savings_usd', value: { doubleValue: call.savingsUSD } })
+  }
+  const route = effectiveRouteId(call.model, call.route)
+  const safeRoute = route ? sanitizeIdentifier(route, 32) : undefined
+  if (safeRoute) attributes.push({ key: 'ai.billing_route', value: { stringValue: safeRoute } })
+  const billing = callBillingMode(call)
+  if (billing) attributes.push({ key: 'ai.billing_mode', value: { stringValue: billing } })
+  // Supplementary accounting rows weigh 0 and daily-aggregate rows weigh N, so
+  // a receiver counting requests agrees with the local reports.
+  const weight = behavioralCallWeight(call)
+  if (weight !== 1) attributes.push({ key: 'ai.request_weight', value: { intValue: String(weight) } })
+  if (call.interrupted) attributes.push({ key: 'ai.interrupted', value: { boolValue: true } })
+  if (call.userModified) attributes.push({ key: 'ai.user_modified', value: { boolValue: true } })
+  if (turn) {
+    attributes.push({ key: 'ai.turn_start', value: { boolValue: true } })
+    if (turn.hasEdits) attributes.push({ key: 'ai.turn_has_edits', value: { boolValue: true } })
+    attributes.push(...positiveInt('ai.turn_retries', turn.retries))
+  }
+  attributes.push(
+    ...identifierList('ai.mcp_tools', call.mcpTools),
+    ...identifierList('ai.skills', call.skills),
+    ...identifierList('ai.subagent_types', call.subagentTypes),
+  )
+  if (call.hasPlanMode) attributes.push({ key: 'ai.plan_mode', value: { boolValue: true } })
+  return attributes
+}
+
+/** Task categories are a closed vocabulary; anything else ships as nothing. */
+function safeCategory(category: string | undefined): string | undefined {
+  if (!category) return undefined
+  if (!/^[a-z][a-z/_-]{0,31}$/.test(category)) return undefined
+  return category
+}
+
 export interface BuildOtlpOptions {
+  /**
+   * Detail level stamped as the codeburn.detail_level resource attribute.
+   * 'summary' drops every session-correlating field (see buildOtlpPayload).
+   * When omitted the legacy full span set is built exactly as before detail
+   * levels existed: no codeburn.detail_level and no ai.category, so OIDC
+   * receivers set up before team servers see an unchanged wire.
+   */
+  detailLevel?: WireDetailLevel
   /**
    * ISO date the local corpus is complete through (daily-cache watermark),
    * stamped on the export batch as a resource attribute. Omit when the
@@ -228,16 +322,36 @@ export interface BuildOtlpOptions {
   }
 }
 
+/// Per-call keys written by detailLevelCallAttributes, on both detail levels.
+const DETAIL_CALL_KEYS = [
+  'ai.reasoning_tokens', 'ai.web_search_requests', 'ai.cache_write_1h_tokens', 'ai.savings_usd',
+  'ai.billing_route', 'ai.billing_mode', 'ai.nano_aiu', 'ai.request_weight', 'ai.lines_added', 'ai.lines_removed',
+  'ai.tool_errors', 'ai.interrupted', 'ai.user_modified', 'ai.active_duration_ms', 'ai.tool_wait_ms',
+  'ai.turn_start', 'ai.turn_has_edits', 'ai.turn_retries',
+  'ai.mcp_tools', 'ai.skills', 'ai.subagent_types', 'ai.plan_mode',
+]
+
 /// Attribute keys the core emitter writes. Plugins add fields; they never
 /// overwrite these, so a plugin cannot lie about cost, tokens, or lineage.
 export const CORE_SYNC_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
   'ai.provider', 'ai.model', 'ai.input_tokens', 'ai.output_tokens', 'ai.cost_usd', 'ai.speed',
   'ai.project', 'ai.tools', 'ai.cost_estimated', 'ai.work_unit_id', 'ai.session_role',
   'ai.lineage_evidence', 'ai.cache_read_tokens', 'ai.cache_write_tokens', 'ai.call_count',
-  'ai.session_duration_ms', 'ai.subscription_covered', 'codeburn.device_id',
+  'ai.session_duration_ms', 'ai.subscription_covered', 'ai.category', 'codeburn.device_id', 'codeburn.detail_level',
   'codeburn.coverage_through', 'codeburn.attribution_methodology',
   'git.repo', 'git.sha', 'git.commit_count', 'git.in_main', 'git.was_reverted', 'git.pr_links',
+  ...DETAIL_CALL_KEYS,
 ])
+
+/// Core keys written only when BuildOtlpOptions.detailLevel is set. The legacy
+/// wire (no detail level) never carries them, so receivers set up before team
+/// servers keep the exact field set their users accepted.
+export const DETAIL_LEVEL_ONLY_KEYS: ReadonlySet<string> = new Set(['ai.category', 'codeburn.detail_level', ...DETAIL_CALL_KEYS])
+
+/** Core keys that actually go on the wire, with or without a detail level. */
+export function coreSyncAttributeKeys(withDetailLevel: boolean): string[] {
+  return Array.from(CORE_SYNC_ATTRIBUTE_KEYS).filter(k => withDetailLevel || !DETAIL_LEVEL_ONLY_KEYS.has(k))
+}
 
 /// Wire guard for plugin-supplied attributes (see BuildOtlpOptions).
 export function filterPluginAttributes(attrs: OtlpAttribute[], declaredKeys: ReadonlySet<string>): OtlpAttribute[] {
@@ -264,16 +378,26 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
     ? filterPluginAttributes(opts.pluginAttributes, opts.pluginAttributeKeys)
     : []
 
-  const spans: OtlpSpan[] = calls.map(({ call, sessionId, workingDirectory, session }) => {
-    const perCallEnrichment = opts?.pluginEnrichment?.perCall.get(call.deduplicationKey) ?? []
-    const startNano = toUnixNano(call.timestamp)
+  const summary = opts?.detailLevel === 'summary'
+
+  const spans: OtlpSpan[] = calls.map(({ call, sessionId, workingDirectory, session: fullSession, category, turn }) => {
+    // Summary level never sees session context at all.
+    const session = summary ? undefined : fullSession
+    const perCallEnrichment = summary ? [] : opts?.pluginEnrichment?.perCall.get(call.deduplicationKey) ?? []
+    let startNano = toUnixNano(call.timestamp)
     // End time = start + 1ms (we don't have real duration, but OTLP requires both)
-    const endNano = (BigInt(startNano) + 1_000_000n).toString()
+    let endNano = (BigInt(startNano) + 1_000_000n).toString()
+    if (summary && startNano !== '0') {
+      // Round down to the hour: exact timing would let a receiver re-order calls into sessions.
+      const rounded = (BigInt(startNano) / (BigInt(HOUR_MS) * 1_000_000n)) * (BigInt(HOUR_MS) * 1_000_000n)
+      startNano = rounded.toString()
+      endNano = startNano
+    }
 
     const provider = sanitizeProviderIdentifier(call.provider)
     const model = sanitizeModelIdentifier(call.model)
     const project = projectBasenameFromWorkingDirectory(workingDirectory)
-    const tools = sanitizeToolIdentifiers(call.tools)
+    const tools = summary ? [] : sanitizeToolIdentifiers(call.tools)
     const attributes: OtlpAttribute[] = [
       { key: 'ai.provider', value: { stringValue: provider } },
       { key: 'ai.model', value: { stringValue: model } },
@@ -288,6 +412,9 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
     const projectAttribute = safeProjectAttribute(project)
     if (projectAttribute) attributes.push(projectAttribute)
 
+    const categoryValue = opts?.detailLevel ? safeCategory(category) : undefined
+    if (categoryValue) attributes.push({ key: 'ai.category', value: { stringValue: categoryValue } })
+
     if (tools.length > 0) {
       attributes.push({
         key: 'ai.tools',
@@ -295,9 +422,14 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
       })
     }
 
-    // cost_estimated = true when provider reports char-based estimates
+    // cost_estimated = true when provider reports char-based estimates. The
+    // detail-level wire also honours the parser's own estimate flag; the legacy
+    // wire keeps the old heuristic unchanged.
     const isEstimated = call.provider === 'kiro' || call.usage.inputTokens === 0
+      || (opts?.detailLevel !== undefined && call.isEstimated === true)
     attributes.push({ key: 'ai.cost_estimated', value: { boolValue: isEstimated } })
+
+    if (opts?.detailLevel) attributes.push(...detailLevelCallAttributes(call, turn))
 
     // --- CB-3 additive fields (boundary spec section 7). Each is emitted only
     // when its value is proven; an old receiver ignoring them loses nothing.
@@ -336,17 +468,20 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
       if (session.subscriptionCovered !== undefined) {
         attributes.push({ key: 'ai.subscription_covered', value: { boolValue: session.subscriptionCovered } })
       }
+    } else if (summary && fullSession?.subscriptionCovered !== undefined) {
+      // A plan or proxy-path decision, not a session fact, so summary keeps it.
+      attributes.push({ key: 'ai.subscription_covered', value: { boolValue: fullSession.subscriptionCovered } })
     }
 
     // Plugin socket: declared-and-guarded plugin fields only (see
     // filterPluginAttributes). No plugins => no change to any byte.
-    attributes.push(...guardedPluginAttributes)
+    if (!summary) attributes.push(...guardedPluginAttributes)
 
     // Per-call enrichment from sync exporters
     attributes.push(...perCallEnrichment)
 
     return {
-      traceId: deriveTraceId(sessionId),
+      traceId: summary ? deriveDayBucketTraceId(deviceId, call.timestamp) : deriveTraceId(sessionId),
       spanId: deriveSpanId(call.deduplicationKey),
       name: `${provider}/${model}`,
       startTimeUnixNano: startNano,
@@ -358,13 +493,16 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
   const resourceAttributes: OtlpAttribute[] = [
     { key: 'codeburn.device_id', value: { stringValue: deviceId } },
   ]
+  if (opts?.detailLevel) {
+    resourceAttributes.push({ key: 'codeburn.detail_level', value: { stringValue: opts.detailLevel } })
+  }
   const coverageThrough = opts?.coverageThrough ? sanitizeIdentifier(opts.coverageThrough, 32) : undefined
   if (coverageThrough) {
     resourceAttributes.push({ key: 'codeburn.coverage_through', value: { stringValue: coverageThrough } })
   }
 
   // Append extra spans from plugin exporters
-  if (opts?.pluginEnrichment?.extraSpans) {
+  if (!summary && opts?.pluginEnrichment?.extraSpans) {
     spans.push(...opts.pluginEnrichment.extraSpans)
   }
 
