@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -19,16 +20,22 @@ export type ClaudeDeps = {
   /** Credential files inside running WSL distros (#1061); empty off Windows. */
   wslCredentialPaths: () => string[]
   readFile: typeof readSecureFile
-  keychain?: () => Promise<KeychainOutcome>
+  keychain: () => Promise<KeychainOutcome>
   now: () => number
 }
 
-const defaults: ClaudeDeps = {
+const defaults: Omit<ClaudeDeps, 'credentialPath' | 'keychain'> = {
   fetch: globalThis.fetch,
-  credentialPath: path.join(os.homedir(), '.claude', '.credentials.json'),
   wslCredentialPaths: () => wslHomes().map(home => `${home}\\.claude\\.credentials.json`),
   readFile: readSecureFile,
   now: Date.now,
+}
+
+/** Claude Code keeps the login of any config dir but ~/.claude under its own Keychain
+ *  item, suffixed with the first 8 hex chars of the SHA-256 of the dir's NFC path. */
+export function claudeKeychainService(configDir: string): string {
+  if (path.resolve(configDir) === path.resolve(os.homedir(), '.claude')) return KEYCHAIN_SERVICE
+  return `${KEYCHAIN_SERVICE}-${createHash('sha256').update(configDir.normalize('NFC')).digest('hex').slice(0, 8)}`
 }
 
 function empty(connection: QuotaProvider['connection'], footerLines: string[] = []): QuotaProvider {
@@ -92,16 +99,16 @@ async function credentialFromFiles(deps: ClaudeDeps): Promise<{ credential: Clau
  */
 async function credentialFrom(source: CredentialSource, file: string, deps: ClaudeDeps): Promise<ClaudeCredential | null> {
   if (source === 'file') return file === deps.credentialPath ? credentialAt(file, deps) : wslCredentialAt(file, deps)
-  const outcome = await (deps.keychain ?? readClaudeKeychain)()
+  const outcome = await deps.keychain()
   return outcome.status === 'found' ? parseCredential(outcome.value) : null
 }
 
-export async function readClaudeKeychain(): Promise<KeychainOutcome> {
+export async function readClaudeKeychain(service: string): Promise<KeychainOutcome> {
   // Claude Code has written the item under both `$USER` (2.1.x) and the older
   // hardcoded "agentseal" account; a user-scoped miss must fall through to the
   // service-only lookup rather than reporting disconnected.
   const user = process.env.USER
-  return readKeychainPassword(KEYCHAIN_SERVICE, user ? [user, null] : [null])
+  return readKeychainPassword(service, user ? [user, null] : [null])
 }
 
 function windowOf(label: string, value: unknown): QuotaWindow | null {
@@ -117,7 +124,7 @@ function windowOf(label: string, value: unknown): QuotaWindow | null {
 export function planLabel(credential: Pick<ClaudeCredential, 'subscriptionType' | 'rateLimitTier'>): string {
   const subscriptionType = credential.subscriptionType?.toLowerCase() ?? ''
   const tier = credential.rateLimitTier?.toLowerCase() ?? ''
-  const hasMax20 = tier.includes('max_20x') || tier.includes('max20x') || tier.includes('max-20x')
+  const multiplier = tier.match(/max[_-]?(\d+)x/)?.[1]
   const hasMax = tier.includes('max')
   if (subscriptionType === 'team' || (subscriptionType === '' && tier.includes('team'))) {
     return hasMax ? 'Team Premium' : 'Team'
@@ -125,13 +132,14 @@ export function planLabel(credential: Pick<ClaudeCredential, 'subscriptionType' 
   if (subscriptionType === 'enterprise' || (subscriptionType === '' && tier.includes('enterprise'))) {
     return hasMax ? 'Enterprise Premium' : 'Enterprise'
   }
-  if (subscriptionType === 'max' || hasMax) {
-    return hasMax20 ? 'Max 20x' : 'Max 5x'
-  }
+  if (tier.includes('ultra')) return 'Ultra'
+  if (multiplier) return `Max ${multiplier}x`
+  if (subscriptionType === 'max' || hasMax) return 'Max'
   if (subscriptionType === 'pro' || tier.includes('pro')) {
     return 'Pro'
   }
-  return 'Subscription'
+  const readable = tier.replace(/^default_claude_/, '').replace(/_/g, ' ')
+  return readable ? readable[0].toUpperCase() + readable.slice(1) : 'Subscription'
 }
 
 export function decodeClaudeUsage(body: unknown, credential: ClaudeCredential): QuotaProvider {
@@ -174,17 +182,24 @@ async function request(token: string, deps: ClaudeDeps, parent?: AbortSignal): P
 
 export type ClaudeResult = { quota: QuotaProvider; retryAfterSeconds?: number }
 
-export async function fetchClaudeQuota(options: Partial<ClaudeDeps> & { signal?: AbortSignal; allowKeychain?: boolean } = {}): Promise<ClaudeResult> {
-  const deps = { ...defaults, ...options }
+export async function fetchClaudeQuota(options: Partial<ClaudeDeps> & { signal?: AbortSignal; allowKeychain?: boolean; configDir?: string } = {}): Promise<ClaudeResult> {
+  const configDir = options.configDir ?? path.join(os.homedir(), '.claude')
+  const deps = { ...defaults, credentialPath: path.join(configDir, '.credentials.json'), keychain: () => readClaudeKeychain(claudeKeychainService(configDir)), ...options }
   try {
     const fromFile = await credentialFromFiles(deps)
     let credential = fromFile?.credential ?? null
     let source: CredentialSource = 'file'
-    if (!credential && options.allowKeychain && process.platform === 'darwin') {
-      const outcome = await (deps.keychain ?? readClaudeKeychain)()
+    // A file left from before Claude Code moved the login into the Keychain keeps an
+    // expired token: the Keychain's login wins, and without one the file still answers.
+    const fileExpired = credential?.expiresAt !== undefined && credential.expiresAt <= deps.now()
+    if ((!credential || fileExpired) && options.allowKeychain && process.platform === 'darwin') {
+      const outcome = await deps.keychain()
       if (outcome.status === 'accessDenied') return { quota: empty('accessDenied') }
-      credential = outcome.status === 'found' ? parseCredential(outcome.value) : null
-      source = 'keychain'
+      const fromKeychain = outcome.status === 'found' ? parseCredential(outcome.value) : null
+      if (fromKeychain) {
+        credential = fromKeychain
+        source = 'keychain'
+      }
     }
     if (!credential) return { quota: empty('disconnected') }
 

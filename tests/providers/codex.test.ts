@@ -2,9 +2,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtemp, mkdir, writeFile, rm, stat } from 'fs/promises'
 import { basename, join } from 'path'
 import { tmpdir } from 'os'
+import zlib from 'zlib'
 
 import { createCodexProvider } from '../../src/providers/codex.js'
 import { clearCodexMemCaches, CODEX_CACHE_VERSION, codexCacheFileName } from '../../src/codex-cache.js'
+import { rolloutFileSessionId } from '../../src/launcher-homes.js'
+import { readCodexThroughput } from '../../src/codex-throughput.js'
 import { calculateCost, parseLiteLLMEntry, restorePricingState, snapshotPricingState } from '../../src/models.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
@@ -1056,6 +1059,39 @@ describe('codex provider - JSONL parsing', () => {
     ])
   })
 
+  it('attributes mcp-cli only when it is the command being run', async () => {
+    const execStr = (command: string) => JSON.stringify({
+      type: 'response_item',
+      timestamp: '2026-04-14T10:00:30Z',
+      payload: { type: 'function_call', name: 'exec_command', arguments: JSON.stringify({ command }) },
+    })
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-mcpcli-position.jsonl', [
+      sessionMeta({ session_id: 'sess-mcpcli-position', model: 'gpt-5.5' }),
+      userMessage('mention the MCP CLI without running it'),
+      execStr('git commit -m "mcp-cli call orion-merger initech-term-sheet"'),
+      execStr('echo mcp-cli call a b'),
+      execStr('ls -la # mcp-cli call a b'),
+      execStr('grep -rn "run mcp-cli call github get_issue to fetch" docs/'),
+      execStr('mcp-cli call "orion merger" initech'),
+      execStr('cd repo && mcp-cli call linear list_issues'),
+      execStr('./mcp-cli call github get_issue'),
+      tokenCount({ timestamp: '2026-04-14T10:01:00Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    const tools = calls[0]!.tools
+    expect(tools.filter(t => t === 'Bash')).toHaveLength(7)
+    expect(tools.filter(t => t.startsWith('mcp__')).sort()).toEqual([
+      'mcp__github__get_issue',
+      'mcp__linear__list_issues',
+    ])
+  })
+
   // #478 follow-up: the shapes the `function_call` path never reached. Fixtures
   // are synthesized from the real shapes seen in Codex rollouts (a `custom_tool_call`
   // whose payload is an `input` JS program, and an item-model `item_completed`
@@ -1519,6 +1555,289 @@ describe('codex provider - fork replay masking against the parent rollout', () =
       tokenCount({ timestamp: at('01:00.010'), last: { input: 500 }, total: { input: 1_500 } }),
     ])
     expect((await parseFile(childPath)).map(x => x.inputTokens)).toEqual([500])
+  })
+})
+describe('codex provider - native tool events', () => {
+  function nativeResponseItem(type: string, item: Record<string, unknown>, timestamp: string) {
+    return JSON.stringify({ type: 'response_item', timestamp, payload: { type, ...item } })
+  }
+
+  function completedWebSearch(id: string, timestamp: string) {
+    return JSON.stringify({
+      type: 'event_msg', timestamp,
+      payload: {
+        type: 'item_completed',
+        item: { type: 'WebSearch', id, query: 'fixture query', results: [] },
+      },
+    })
+  }
+
+  function completedExtension(kind: string, id: string, timestamp: string, results: unknown[] = []) {
+    return JSON.stringify({
+      type: 'event_msg', timestamp,
+      payload: {
+        type: 'item_completed',
+        item: { type: 'Extension', results, id, action: { type: 'search' }, kind, query: 'fixture query' },
+      },
+    })
+  }
+
+  async function parseFile(filePath: string): Promise<ParsedProviderCall[]> {
+    const provider = createCodexProvider(tmpDir)
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser({ path: filePath, project: 'test', provider: 'codex' }, new Set()).parse()) {
+      calls.push(call)
+    }
+    return calls
+  }
+
+  it('attributes built-in response tools without changing recorded usage or cost', async () => {
+    const nativePath = await writeSession(tmpDir, '2026-04-14', 'rollout-native-tools.jsonl', [
+      sessionMeta({ session_id: 'sess-native-tools' }),
+      userMessage('use the built-in tools'),
+      nativeResponseItem('web_search_call', { id: 'ws-1', status: 'completed', action: { type: 'search', query: 'fixture' } }, '2026-04-14T10:00:10Z'),
+      nativeResponseItem('tool_search_call', { id: 'ts-1', call_id: 'search-1', status: 'completed', execution: 'server', arguments: { query: 'fixture' } }, '2026-04-14T10:00:11Z'),
+      nativeResponseItem('image_generation_call', { id: 'ig-1', status: 'completed', result: 'fixture-image-result' }, '2026-04-14T10:00:12Z'),
+      tokenUsageRecord({ responseId: 'resp-native-tools', usage: { input: 1000, cached: 200, output: 100 } }),
+    ])
+    const controlPath = await writeSession(tmpDir, '2026-04-14', 'rollout-native-control.jsonl', [
+      sessionMeta({ session_id: 'sess-native-control' }),
+      tokenUsageRecord({ responseId: 'resp-native-control', usage: { input: 1000, cached: 200, output: 100 } }),
+    ])
+
+    const [native] = await parseFile(nativePath)
+    const [control] = await parseFile(controlPath)
+
+    expect(native).toBeDefined()
+    expect(native!.tools).toEqual(['WebSearch', 'ToolSearch', 'ImageGeneration'])
+    expect(native!.toolSequence?.map(step => step[0]?.tool)).toEqual(native!.tools)
+    expect(native).toMatchObject({ inputTokens: 800, cachedInputTokens: 200, outputTokens: 100, webSearchRequests: 0 })
+    expect(native!.costUSD).toBe(control!.costUSD)
+  })
+
+  it('deduplicates partial, completed, and mirrored WebSearch events by item identity', async () => {
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-native-dedup.jsonl', [
+      sessionMeta({ session_id: 'sess-native-dedup' }),
+      nativeResponseItem('web_search_call', { id: 'ws-shared', status: 'searching', action: { type: 'search', query: 'fixture' } }, '2026-04-14T10:00:10Z'),
+      nativeResponseItem('web_search_call', { id: 'ws-shared', status: 'completed', action: { type: 'search', query: 'fixture' } }, '2026-04-14T10:00:11Z'),
+      completedWebSearch('ws-shared', '2026-04-14T10:00:12Z'),
+      completedWebSearch('ws-item-only', '2026-04-14T10:00:13Z'),
+      tokenUsageRecord({ responseId: 'resp-native-dedup', usage: { input: 100, output: 20 } }),
+    ])
+
+    const [call] = await parseFile(filePath)
+
+    expect(call?.tools).toEqual(['WebSearch', 'WebSearch'])
+    expect(call?.toolSequence?.map(step => step[0]?.tool)).toEqual(['WebSearch', 'WebSearch'])
+  })
+
+  it('counts an id-less web_search_call written right after its item once', async () => {
+    const action = { type: 'search', query: 'fixture query' }
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-native-idless-mirror.jsonl', [
+      sessionMeta({ session_id: 'sess-native-idless-mirror' }),
+      completedWebSearch('ws-a', '2026-04-14T10:00:10.000Z'),
+      nativeResponseItem('web_search_call', { status: 'completed', action }, '2026-04-14T10:00:10.002Z'),
+      completedWebSearch('ws-b', '2026-04-14T10:00:11.000Z'),
+      nativeResponseItem('web_search_call', { status: 'completed', action }, '2026-04-14T10:00:11.001Z'),
+      nativeResponseItem('web_search_call', { status: 'completed', action }, '2026-04-14T10:00:12.000Z'),
+      tokenUsageRecord({ responseId: 'resp-native-idless-mirror', usage: { input: 100, output: 20 } }),
+    ])
+
+    const [call] = await parseFile(filePath)
+
+    expect(call?.tools).toEqual(['WebSearch', 'WebSearch', 'WebSearch'])
+  })
+
+  it('recognizes only Extension items with the explicit web.search kind', async () => {
+    const largeResults = [{ body: 'fixture result body '.repeat(3_000) }]
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-native-extension-search.jsonl', [
+      sessionMeta({ session_id: 'sess-native-extension-search' }),
+      completedExtension('web.search', 'ext-search', '2026-04-14T10:00:10Z', largeResults),
+      completedExtension('file.search', 'ext-other', '2026-04-14T10:00:11Z'),
+      tokenUsageRecord({ responseId: 'resp-native-extension-search', usage: { input: 100, output: 20 } }),
+    ])
+
+    const [call] = await parseFile(filePath)
+
+    expect(call?.tools).toEqual(['WebSearch'])
+  })
+
+  it('attaches native tool events after the final usage record to that turn', async () => {
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-native-trailing.jsonl', [
+      sessionMeta({ session_id: 'sess-native-trailing' }),
+      tokenUsageRecord({ responseId: 'resp-native-trailing', usage: { input: 100, output: 20 } }),
+      completedWebSearch('ws-trailing', '2026-04-14T10:01:00Z'),
+    ])
+
+    const calls = await parseFile(filePath)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.tools).toEqual(['WebSearch'])
+  })
+
+  it('suppresses native tool events replayed by a fork while keeping divergent work', async () => {
+    const parentPath = await writeSession(tmpDir, '2026-04-14', 'rollout-native-parent.jsonl', [
+      sessionMeta({ session_id: 'sess-native-parent' }),
+      nativeResponseItem('web_search_call', { id: 'ws-parent', status: 'completed' }, '2026-04-14T10:00:01Z'),
+      tokenUsageRecord({ timestamp: '2026-04-14T10:00:02Z', responseId: 'resp-parent', usage: { input: 100, output: 20 } }),
+    ])
+    const forkPath = await writeSession(tmpDir, '2026-04-14', 'rollout-native-fork.jsonl', [
+      sessionMeta({ session_id: 'sess-native-fork', forked_from_id: 'sess-native-parent', timestamp: '2026-04-14T10:00:10Z' }),
+      nativeResponseItem('web_search_call', { id: 'ws-parent', status: 'completed' }, '2026-04-14T10:00:10.100Z'),
+      tokenUsageRecord({ timestamp: '2026-04-14T10:00:10.200Z', responseId: 'resp-parent', usage: { input: 100, output: 20 } }),
+      completedWebSearch('ws-parent', '2026-04-14T10:00:10.300Z'),
+      nativeResponseItem('web_search_call', { id: 'ws-fork', status: 'completed' }, '2026-04-14T10:00:14Z'),
+      tokenUsageRecord({ timestamp: '2026-04-14T10:00:14.100Z', responseId: 'resp-fork', usage: { input: 80, output: 15 } }),
+    ])
+
+    const parentCalls = await parseFile(parentPath)
+    const forkCalls = await parseFile(forkPath)
+
+    expect(parentCalls[0]?.tools).toEqual(['WebSearch'])
+    expect(forkCalls).toHaveLength(1)
+    expect(forkCalls[0]?.tools).toEqual(['WebSearch'])
+  })
+
+  it('keeps a fork-only native identity before replay usage anchors and suppresses parent item ids', async () => {
+    const largeParentImage = ` \t${JSON.stringify({
+      type: 'response_item',
+      timestamp: '2026-10-17T10:00:01.500Z',
+      payload: { type: 'image_generation_call', status: 'completed', result: 'x'.repeat(128 * 1024), id: 'ig-parent' },
+    })}`
+    const parentPath = await writeSession(tmpDir, '2026-10-17', 'rollout-2026-10-17T10-00-00-sess-native-parent.jsonl', [
+      sessionMeta({ session_id: 'sess-native-parent', timestamp: '2026-10-17T10:00:00Z' }),
+      nativeResponseItem('web_search_call', { id: 'ws-parent', status: 'completed' }, '2026-10-17T10:00:01Z'),
+      completedExtension('web.search', 'ext-parent', '2026-10-17T10:00:01.250Z', [{ body: 'parent extension body '.repeat(3_000) }]),
+      largeParentImage,
+      tokenUsageRecord({ timestamp: '2026-10-17T10:00:02Z', responseId: 'resp-parent', usage: { input: 100, output: 20 } }),
+    ])
+    const forkPath = await writeSession(tmpDir, '2026-10-17', 'rollout-2026-10-17T10-00-10-sess-native-fork.jsonl', [
+      sessionMeta({ session_id: 'sess-native-fork', forked_from_id: 'sess-native-parent', timestamp: '2026-10-17T10:00:10Z' }),
+      nativeResponseItem('web_search_call', { id: 'ws-fork', status: 'completed' }, '2026-10-17T10:00:10.100Z'),
+      nativeResponseItem('web_search_call', { id: 'ws-parent', status: 'completed' }, '2026-10-17T10:00:10.200Z'),
+      nativeResponseItem('image_generation_call', { id: 'ig-parent', status: 'completed', result: 'small' }, '2026-10-17T10:00:10.250Z'),
+      completedExtension('web.search', 'ext-parent', '2026-10-17T10:00:10.275Z'),
+      tokenUsageRecord({ timestamp: '2026-10-17T10:00:10.300Z', responseId: 'resp-parent', usage: { input: 100, output: 20 } }),
+      tokenUsageRecord({ timestamp: '2026-10-17T10:00:10.400Z', responseId: 'resp-fork', usage: { input: 80, output: 15 } }),
+    ])
+
+    const parentCalls = await parseFile(parentPath)
+    const forkCalls = await parseFile(forkPath)
+
+    expect(parentCalls[0]?.tools).toEqual(['WebSearch', 'WebSearch', 'ImageGeneration'])
+    expect(forkCalls).toHaveLength(1)
+    expect(forkCalls[0]?.tools).toEqual(['WebSearch'])
+    expect(forkCalls[0]?.inputTokens).toBe(80)
+  })
+
+  it('keeps direct native identities in large lines without reading nested or sibling ids', async () => {
+    const largeImage = JSON.stringify({
+      type: 'response_item', timestamp: '2026-04-14T10:00:10Z',
+      payload: { type: 'image_generation_call', status: 'completed', revised_prompt: 'fixture', result: 'a'.repeat(2 * 1024 * 1024), id: 'ig-late' },
+    })
+    const duplicateImage = JSON.stringify({
+      type: 'response_item', timestamp: '2026-04-14T10:00:11Z',
+      payload: { type: 'image_generation_call', id: 'ig-late', status: 'completed', result: 'small' },
+    })
+    const imageWithoutId = JSON.stringify({
+      type: 'response_item', timestamp: '2026-04-14T10:00:12Z',
+      payload: { type: 'image_generation_call', status: 'completed', result: 'b'.repeat(128 * 1024) },
+      metadata: { id: 'ig-sibling' },
+    })
+    const imageSiblingControl = JSON.stringify({
+      type: 'response_item', timestamp: '2026-04-14T10:00:13Z',
+      payload: { type: 'image_generation_call', id: 'ig-sibling', status: 'completed', result: 'small' },
+    })
+    const largeToolSearch = JSON.stringify({
+      type: 'response_item', timestamp: '2026-04-14T10:00:14Z',
+      payload: { type: 'tool_search_call', arguments: { filler: 'c'.repeat(128 * 1024) }, call_id: 'ts-late' },
+    })
+    const duplicateToolSearch = JSON.stringify({
+      type: 'response_item', timestamp: '2026-04-14T10:00:15Z',
+      payload: { type: 'tool_search_call', call_id: 'ts-late', arguments: {} },
+    })
+    const toolSearchWithoutId = JSON.stringify({
+      type: 'response_item', timestamp: '2026-04-14T10:00:16Z',
+      payload: { type: 'tool_search_call', arguments: { filler: 'd'.repeat(128 * 1024) } },
+      metadata: { call_id: 'ts-sibling' },
+    })
+    const toolSearchSiblingControl = JSON.stringify({
+      type: 'response_item', timestamp: '2026-04-14T10:00:17Z',
+      payload: { type: 'tool_search_call', call_id: 'ts-sibling', arguments: {} },
+    })
+    const largeItemCompleted = JSON.stringify({
+      type: 'event_msg', timestamp: '2026-04-14T10:00:18Z',
+      payload: {
+        type: 'item_completed',
+        item: {
+          results: [{ type: 'NestedResult', id: 'nested-result', body: 'e'.repeat(128 * 1024) }],
+          action: { type: 'search', id: 'nested-action' },
+          type: 'WebSearch',
+          id: 'ws-late',
+        },
+      },
+    })
+    const duplicateItemCompleted = JSON.stringify({
+      type: 'event_msg', timestamp: '2026-04-14T10:00:19Z',
+      payload: { type: 'item_completed', item: { results: [], type: 'WebSearch', id: 'ws-late' } },
+    })
+    const itemWithoutId = JSON.stringify({
+      type: 'event_msg', timestamp: '2026-04-14T10:00:20Z',
+      payload: { type: 'item_completed', item: { results: [{ type: 'NestedResult', id: 'nested-result' }], type: 'WebSearch' } },
+      metadata: { item: { type: 'WebSearch', id: 'ws-sibling' } },
+    })
+    const itemSiblingControl = JSON.stringify({
+      type: 'event_msg', timestamp: '2026-04-14T10:00:21Z',
+      payload: { type: 'item_completed', item: { type: 'WebSearch', id: 'ws-sibling' } },
+    })
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-native-large-image.jsonl', [
+      sessionMeta({ session_id: 'sess-native-large-image' }),
+      largeImage,
+      duplicateImage,
+      imageWithoutId,
+      imageSiblingControl,
+      largeToolSearch,
+      duplicateToolSearch,
+      toolSearchWithoutId,
+      toolSearchSiblingControl,
+      largeItemCompleted,
+      duplicateItemCompleted,
+      itemWithoutId,
+      itemSiblingControl,
+      tokenUsageRecord({ responseId: 'resp-native-large-image', usage: { input: 100, output: 20 } }),
+    ])
+
+    const calls = await parseFile(filePath)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.tools).toEqual([
+      'ImageGeneration', 'ImageGeneration', 'ImageGeneration',
+      'ToolSearch', 'ToolSearch', 'ToolSearch',
+      'WebSearch', 'WebSearch', 'WebSearch',
+    ])
+  })
+
+  it('does not classify a large compact line from a nested metadata payload', async () => {
+    const misleadingPayload = ` \t${JSON.stringify({
+      type: 'response_item',
+      timestamp: '2026-04-14T10:00:10Z',
+      metadata: { payload: { type: 'image_generation_call', id: 'ig-decoy' } },
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'large message body '.repeat(5_000) }],
+      },
+    })}`
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-native-nested-payload.jsonl', [
+      sessionMeta({ session_id: 'sess-native-nested-payload' }),
+      misleadingPayload,
+      tokenUsageRecord({ responseId: 'resp-native-nested-payload', usage: { input: 100, output: 20 } }),
+    ])
+
+    const calls = await parseFile(filePath)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.tools).toEqual([])
   })
 })
 
@@ -2005,6 +2324,18 @@ describe('codex provider - priority service tier (#1616)', () => {
     expect(calls[1]!.costUSD).toBeCloseTo((800 * GPT54.input + 200 * GPT54.cacheRead + 500 * GPT54.output) * 2, 12)
   })
 
+  it('prices service_tier "ultrafast" turns at the ultrafast rates', async () => {
+    const calls = await parseCalls([
+      sessionMeta({ session_id: 'sess-ultra', model: 'gpt-6-astra', timestamp: '2026-09-28T10:00:00Z' }),
+      threadSettings('ultrafast', '2026-09-28T10:00:01Z'),
+      userMessage('ultrafast turn', '2026-09-28T10:01:00Z'),
+      tokenCount({ timestamp: '2026-09-28T10:01:30Z', last: { input: 1000, cached: 200, output: 500 }, total: { input: 1000, cached: 200, output: 500, total: 1700 } }),
+    ])
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.speed).toBe('ultrafast')
+    expect(calls[0]!.costUSD).toBeCloseTo(800 * 6e-5 + 200 * 6e-6 + 500 * 3e-4, 12)
+  })
+
   it('prices a flex turn at standard when the model publishes no flex rates', async () => {
     const calls = await parseCalls([
       sessionMeta({ session_id: 'sess-flex-none', model: 'gpt-5.3-codex', timestamp: '2026-09-28T10:00:00Z' }),
@@ -2128,3 +2459,67 @@ describe('codex provider - priority service tier (#1616)', () => {
   })
 })
 
+describe('codex provider - Zstandard-compressed rollouts', () => {
+  const lines = [
+    // Larger than a stream chunk, so the first line spans several decoded chunks.
+    JSON.stringify({
+      type: 'session_meta',
+      timestamp: '2026-04-14T10:00:00Z',
+      payload: { cwd: '/Users/test/zst', originator: 'codex-cli', session_id: 'sess-zst', base_instructions: { text: 'x'.repeat(100_000) } },
+    }),
+    functionCall('exec_command'),
+    tokenCount({ timestamp: '2026-04-14T10:01:00Z', last: { input: 100, output: 50 }, total: { total: 150 } }),
+    tokenCount({ timestamp: '2026-04-14T10:02:00Z', last: { input: 300, cached: 100, output: 70 }, total: { total: 620 } }),
+  ]
+
+  async function writeCompressed(path: string): Promise<string> {
+    await writeFile(path, zlib.zstdCompressSync(Buffer.from(lines.join('\n') + '\n')))
+    return path
+  }
+
+  async function parseAll(dir: string): Promise<ParsedProviderCall[]> {
+    const provider = createCodexProvider(dir)
+    const seenKeys = new Set<string>()
+    const calls: ParsedProviderCall[] = []
+    for (const session of await provider.discoverSessions()) {
+      for await (const call of provider.createSessionParser(session, seenKeys).parse()) calls.push(call)
+    }
+    return calls
+  }
+
+  it('discovers and parses a .jsonl.zst rollout exactly like the plain one', async () => {
+    const plainHome = join(tmpDir, 'plain')
+    const zstHome = join(tmpDir, 'zst')
+    const plainPath = await writeSession(plainHome, '2026-04-14', 'rollout-2026-04-14T10-00-00-zst.jsonl', lines)
+    const zstPath = await writeCompressed((await writeSession(zstHome, '2026-04-14', 'rollout-2026-04-14T10-00-00-zst.jsonl', lines)) + '.zst')
+    await rm(zstPath.slice(0, -'.zst'.length))
+
+    const sessions = await createCodexProvider(zstHome).discoverSessions()
+    expect(sessions).toEqual([{ path: zstPath, project: 'Users-test-zst', provider: 'codex' }])
+
+    const plainCalls = await parseAll(plainHome)
+    expect(plainCalls).toHaveLength(2)
+    expect(await parseAll(zstHome)).toEqual(plainCalls)
+    expect(rolloutFileSessionId(zstPath)).toBe('sess-zst')
+    expect(await readCodexThroughput(zstPath)).toEqual(await readCodexThroughput(plainPath))
+  })
+
+  it('counts a rollout present in both forms once, from the plain file', async () => {
+    const plainPath = await writeSession(tmpDir, '2026-04-14', 'rollout-2026-04-14T10-00-00-zst.jsonl', lines)
+    await writeCompressed(plainPath + '.zst')
+
+    const sessions = await createCodexProvider(tmpDir).discoverSessions()
+    expect(sessions.map(s => s.path)).toEqual([plainPath])
+    expect(await parseAll(tmpDir)).toHaveLength(2)
+  })
+
+  it('discovers a .jsonl.zst rollout in archived_sessions', async () => {
+    const archivedDir = join(tmpDir, 'archived_sessions')
+    await mkdir(archivedDir, { recursive: true })
+    const zstPath = await writeCompressed(join(archivedDir, 'rollout-2026-04-14T10-00-00-zst.jsonl.zst'))
+
+    const sessions = await createCodexProvider(tmpDir).discoverSessions()
+    expect(sessions).toEqual([{ path: zstPath, project: 'Users-test-zst', provider: 'codex' }])
+    expect(await parseAll(tmpDir)).toHaveLength(2)
+  })
+})

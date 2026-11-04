@@ -1,6 +1,8 @@
-import { closeSync, existsSync, openSync, readdirSync, readSync, realpathSync } from 'fs'
+import { existsSync, readdirSync, realpathSync } from 'fs'
 import { homedir } from 'os'
 import { join, resolve, sep } from 'path'
+
+import { readTextHeadSync } from './fs-utils.js'
 
 export type LauncherNote = {
   name: string
@@ -49,33 +51,36 @@ export const FIRST_LINE_READ_CAP = 1024 * 1024
  *  Missing / unreadable files return undefined — callers must not drop those. */
 export function rolloutFileSessionId(filePath: string): string | undefined {
   try {
-    const fd = openSync(filePath, 'r')
-    try {
-      const buf = Buffer.alloc(FIRST_LINE_READ_CAP)
-      const n = readSync(fd, buf, 0, buf.length, 0)
-      if (n === 0) return undefined
-      const slice = buf.subarray(0, n)
-      const nl = slice.indexOf(0x0a)
-      // Hit the 1 MiB cap without a newline: incomplete, not a parseable id.
-      if (nl === -1 && n === FIRST_LINE_READ_CAP) return undefined
-      const line = (nl === -1 ? slice : slice.subarray(0, nl)).toString('utf8')
-      if (!line) return undefined
-      const parsed: unknown = JSON.parse(line)
-      if (!parsed || typeof parsed !== 'object') return undefined
-      const payload = (parsed as { payload?: { session_id?: unknown } }).payload
-      const id = payload?.session_id
-      return typeof id === 'string' && id.length > 0 ? id : undefined
-    } finally {
-      closeSync(fd)
-    }
+    const slice = readTextHeadSync(filePath, FIRST_LINE_READ_CAP)
+    if (slice.length === 0) return undefined
+    const nl = slice.indexOf(0x0a)
+    // Hit the 1 MiB cap without a newline: incomplete, not a parseable id.
+    if (nl === -1 && slice.length === FIRST_LINE_READ_CAP) return undefined
+    const line = (nl === -1 ? slice : slice.subarray(0, nl)).toString('utf8')
+    if (!line) return undefined
+    const parsed: unknown = JSON.parse(line)
+    if (!parsed || typeof parsed !== 'object') return undefined
+    const payload = (parsed as { payload?: { session_id?: unknown } }).payload
+    const id = payload?.session_id
+    return typeof id === 'string' && id.length > 0 ? id : undefined
   } catch {
     return undefined
   }
 }
 
+/** `rollout-*.jsonl`, or the `.jsonl.zst` form Codex compresses cold rollouts into. */
+export function isRolloutFileName(name: string): boolean {
+  return name.startsWith('rollout-') && (name.endsWith('.jsonl') || name.endsWith('.jsonl.zst'))
+}
+
+/** Rollout filename without `.jsonl` / `.jsonl.zst`. */
+export function rolloutStem(name: string): string {
+  return name.replace(/\.jsonl(\.zst)?$/, '')
+}
+
 export function walkRolloutFiles(codexDir: string, visit: (filePath: string) => void): void {
   const take = (dir: string, file: string) => {
-    if (file.startsWith('rollout-') && file.endsWith('.jsonl')) visit(join(dir, file))
+    if (isRolloutFileName(file)) visit(join(dir, file))
   }
   const sessionsDir = join(codexDir, 'sessions')
   try {

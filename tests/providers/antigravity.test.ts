@@ -1,6 +1,7 @@
 import { mkdtemp, mkdir, readFile, rm, stat, utimes, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { join, resolve } from 'path'
+import { fileURLToPath, pathToFileURL } from 'url'
 import { createRequire } from 'node:module'
 import { describe, expect, it } from 'vitest'
 
@@ -24,12 +25,18 @@ import {
   dropPlaceholderModelId,
   normalizePricingModel,
   buildCallsFromGeneratorMetadata,
+  cleanAntigravityUserPrompt,
+  extractAntigravityTranscriptPrompt,
+  extractAntigravitySqlitePrompt,
+  extractAntigravityUserPrompt,
+  MAX_USER_TEXT_LENGTH,
 } from '../../src/providers/antigravity.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 import { classifyTurn } from '../../src/classifier.js'
 import type { ParsedApiCall, ParsedTurn } from '../../src/types.js'
 
 const requireForTest = createRequire(import.meta.url)
+const PRIVATE_PROJECT_URI = pathToFileURL(resolve('/Users/example/private-project')).href
 
 // Mirrors the parsed-call -> turn shape src/parser.ts builds (cachedCallToApiCall).
 function turnFromCall(call: ParsedProviderCall): ParsedTurn {
@@ -79,7 +86,7 @@ function createCurrentAntigravityCliDb(dbPath: string, fixture: CurrentCliFixtur
     db.exec('CREATE TABLE trajectory_metadata_blob (id text DEFAULT "main", data blob, PRIMARY KEY (id))')
     db.prepare('INSERT INTO trajectory_metadata_blob (id, data) VALUES (?, ?)').run(
       'main',
-      Buffer.from('file:///Users/example/private-project'),
+      Buffer.from(PRIVATE_PROJECT_URI),
     )
     for (const row of fixture.rows) {
       const data = Buffer.from(row.hex, 'hex')
@@ -95,6 +102,19 @@ async function collectAntigravityCalls(source: { path: string; project: string; 
   const calls: ParsedProviderCall[] = []
   for await (const call of parser.parse()) calls.push(call)
   return calls
+}
+
+async function withTempAntigravityHome(prefix: string, fn: (tempHome: string) => Promise<void>): Promise<void> {
+  const tempHome = await mkdtemp(join(tmpdir(), prefix))
+  const previousCacheDir = process.env['CODEBURN_CACHE_DIR']
+  process.env['CODEBURN_CACHE_DIR'] = join(tempHome, 'cache')
+  try {
+    await fn(tempHome)
+  } finally {
+    if (previousCacheDir === undefined) delete process.env['CODEBURN_CACHE_DIR']
+    else process.env['CODEBURN_CACHE_DIR'] = previousCacheDir
+    await rm(tempHome, { recursive: true, force: true })
+  }
 }
 
 describe('antigravity provider helpers', () => {
@@ -604,9 +624,9 @@ describe('antigravity provider helpers', () => {
         outputTokens: 71,
         reasoningTokens: 659,
         sessionId: fixture.conversationId,
-        project: 'antigravity-cli',
+        project: 'private-project',
+        projectPath: fileURLToPath(PRIVATE_PROJECT_URI),
       })
-      expect(calls[0]!.projectPath).toBeUndefined()
       expect(calls[0]!.costUSD).toBeGreaterThan(0)
     } finally {
       if (previousCacheDir === undefined) delete process.env['CODEBURN_CACHE_DIR']
@@ -855,19 +875,6 @@ describe('antigravity provider helpers', () => {
     expect(calls[0]!.costUSD).toBeGreaterThan(0)
     expect(calls[1]!.model).toBe('unknown')
   })
-
-  async function withTempAntigravityHome(prefix: string, fn: (tempHome: string) => Promise<void>): Promise<void> {
-    const tempHome = await mkdtemp(join(tmpdir(), prefix))
-    const previousCacheDir = process.env['CODEBURN_CACHE_DIR']
-    process.env['CODEBURN_CACHE_DIR'] = join(tempHome, 'cache')
-    try {
-      await fn(tempHome)
-    } finally {
-      if (previousCacheDir === undefined) delete process.env['CODEBURN_CACHE_DIR']
-      else process.env['CODEBURN_CACHE_DIR'] = previousCacheDir
-      await rm(tempHome, { recursive: true, force: true })
-    }
-  }
 
   it('stamps file mtime as fallback timestamp for SQLite-parsed calls', async () => {
     if (!isSqliteAvailable()) return
@@ -1546,5 +1553,197 @@ describe('antigravity provider toolDisplayName', () => {
     expect(provider.toolDisplayName('mcp_context7_resolve-library-id')).toBe('mcp__context7__resolve-library-id')
     expect(provider.toolDisplayName('mcp__context7__resolve-library-id')).toBe('mcp__context7__resolve-library-id')
     expect(provider.toolDisplayName('run_command')).toBe('run_command')
+  })
+})
+
+describe('antigravity user message extraction', () => {
+  it('cleans user prompt from <USER_REQUEST> tags', () => {
+    const raw = '<USER_REQUEST>\nFix the bug in parser\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\ntime: 12:00\n</ADDITIONAL_METADATA>'
+    expect(cleanAntigravityUserPrompt(raw)).toBe('Fix the bug in parser')
+  })
+
+  it('handles unclosed <USER_REQUEST> at end of string', () => {
+    const raw = '<USER_REQUEST>\nPrompt without closing tag'
+    expect(cleanAntigravityUserPrompt(raw)).toBe('Prompt without closing tag')
+  })
+
+  it('truncates long user prompts to MAX_USER_TEXT_LENGTH (500 chars)', () => {
+    const longPrompt = 'a'.repeat(600)
+    const cleaned = cleanAntigravityUserPrompt(longPrompt)
+    expect(cleaned).toHaveLength(MAX_USER_TEXT_LENGTH)
+    expect(cleaned).toBe('a'.repeat(500))
+  })
+
+  it('handles empty or missing prompts safely', () => {
+    expect(cleanAntigravityUserPrompt('')).toBe('')
+    expect(cleanAntigravityUserPrompt('<USER_REQUEST></USER_REQUEST>')).toBe('')
+  })
+
+  it('extracts user prompt from transcript.jsonl', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'agy-prompt-transcript-'))
+    try {
+      const cascadeId = 'test-cascade-123'
+      const transcriptDir = join(tempDir, 'brain', cascadeId, '.system_generated', 'logs')
+      await mkdir(transcriptDir, { recursive: true })
+      const transcriptPath = join(transcriptDir, 'transcript.jsonl')
+      const lines = [
+        JSON.stringify({ type: 'SYSTEM_INSTRUCTION', content: 'You are an assistant' }),
+        JSON.stringify({ type: 'USER_INPUT', content: '<USER_REQUEST>\nImplement userMessage extraction\n</USER_REQUEST>' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', content: 'I will implement it' }),
+      ].join('\n')
+      await writeFile(transcriptPath, lines, 'utf-8')
+
+      const fakeDbPath = join(tempDir, 'conversations', `${cascadeId}.db`)
+      const prompt = await extractAntigravityTranscriptPrompt(cascadeId, fakeDbPath)
+      expect(prompt).toBe('Implement userMessage extraction')
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('returns empty string when transcript file does not exist', async () => {
+    const prompt = await extractAntigravityTranscriptPrompt('nonexistent-cascade-id', '/fake/path/nonexistent.db')
+    expect(prompt).toBe('')
+  })
+
+  it('falls back to SQLite steps table when transcript is missing', async () => {
+    if (!isSqliteAvailable()) return
+
+    const tempDir = await mkdtemp(join(tmpdir(), 'agy-prompt-sqlite-'))
+    try {
+      const { DatabaseSync: Database } = requireForTest('node:sqlite')
+      const cascadeId = 'test-cascade-sqlite'
+      const convDir = join(tempDir, 'conversations')
+      await mkdir(convDir, { recursive: true })
+      const dbPath = join(convDir, `${cascadeId}.db`)
+
+      const varint = (n: number): number[] => {
+        const out: number[] = []
+        let v = n
+        while (v > 0x7f) { out.push((v & 0x7f) | 0x80); v = Math.floor(v / 128) }
+        out.push(v)
+        return out
+      }
+      const tag = (field: number, wire: number): number[] => varint(field * 8 + wire)
+      const lenField = (field: number, bytes: number[]): number[] => [...tag(field, 2), ...varint(bytes.length), ...bytes]
+
+      const promptBytes = Array.from(Buffer.from('<USER_REQUEST>\nPrompt from SQLite step\n</USER_REQUEST>', 'utf-8'))
+      const subTag2 = lenField(2, promptBytes)
+      const tag19 = lenField(19, subTag2)
+      const stepPayload = Buffer.from(tag19)
+
+      const db = new Database(dbPath) as TestDb
+      db.exec('CREATE TABLE steps (idx integer, step_type integer, step_payload blob, PRIMARY KEY (idx))')
+      db.prepare('INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)').run(0, 14, stepPayload)
+      db.close()
+
+      const prompt = await extractAntigravityUserPrompt(cascadeId, dbPath)
+      expect(prompt).toBe('Prompt from SQLite step')
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('populates userMessage on buildCallsFromGeneratorMetadata', () => {
+    const metadata = [
+      {
+        chatModel: {
+          model: 'gemini-pro',
+          chatStartMetadata: { createdAt: '2026-10-24T10:00:00.000Z' },
+          usage: {
+            inputTokens: '100',
+            outputTokens: '50',
+            responseOutputTokens: '50',
+            model: 'gemini-pro',
+            responseId: 'resp-1',
+          },
+        },
+      },
+    ]
+    const calls = buildCallsFromGeneratorMetadata('test-cascade', metadata as any, {}, 'Hello Antigravity')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.userMessage).toBe('Hello Antigravity')
+  })
+
+  it('provider parser extracts userMessage from transcript.jsonl', async () => {
+    if (!isSqliteAvailable()) return
+
+    await withTempAntigravityHome('codeburn-antigravity-e2e-prompt-', async (tempHome) => {
+      const cascadeId = 'e2e-cascade-test'
+      const conversationsDir = join(tempHome, '.gemini', 'antigravity', 'conversations')
+      const brainLogsDir = join(tempHome, '.gemini', 'antigravity', 'brain', cascadeId, '.system_generated', 'logs')
+      await mkdir(conversationsDir, { recursive: true })
+      await mkdir(brainLogsDir, { recursive: true })
+
+      const transcriptPath = join(brainLogsDir, 'transcript.jsonl')
+      await writeFile(
+        transcriptPath,
+        JSON.stringify({
+          type: 'USER_INPUT',
+          content: '<USER_REQUEST>\nFix the bug in parser.ts and add tests\n</USER_REQUEST>',
+        }) + '\n',
+        'utf-8',
+      )
+
+      const fixture = JSON.parse(await readFile(
+        new URL('../fixtures/antigravity-standalone/gen-metadata.json', import.meta.url),
+        'utf-8',
+      )) as CurrentCliFixture
+      const dbPath = join(conversationsDir, `${cascadeId}.db`)
+      createCurrentAntigravityCliDb(dbPath, {
+        conversationId: cascadeId,
+        rows: [fixture.rows[0]!],
+      })
+
+      const calls = await collectAntigravityCalls({ path: dbPath, project: 'antigravity', provider: 'antigravity' })
+      expect(calls.length).toBeGreaterThan(0)
+      expect(calls[0]!.userMessage).toBe('Fix the bug in parser.ts and add tests')
+    })
+  })
+
+  it('provider parser falls back to SQLite steps table when transcript log is absent', async () => {
+    if (!isSqliteAvailable()) return
+
+    await withTempAntigravityHome('codeburn-antigravity-e2e-sqlite-fallback-', async (tempHome) => {
+      const cascadeId = 'e2e-sqlite-fallback'
+      const conversationsDir = join(tempHome, '.gemini', 'antigravity', 'conversations')
+      await mkdir(conversationsDir, { recursive: true })
+
+      const fixture = JSON.parse(await readFile(
+        new URL('../fixtures/antigravity-standalone/gen-metadata.json', import.meta.url),
+        'utf-8',
+      )) as CurrentCliFixture
+      const dbPath = join(conversationsDir, `${cascadeId}.db`)
+      createCurrentAntigravityCliDb(dbPath, {
+        conversationId: cascadeId,
+        rows: [fixture.rows[0]!],
+      })
+
+      const { DatabaseSync: Database } = requireForTest('node:sqlite')
+      const db = new Database(dbPath) as TestDb
+
+      const varint = (n: number): number[] => {
+        const out: number[] = []
+        let v = n
+        while (v > 0x7f) { out.push((v & 0x7f) | 0x80); v = Math.floor(v / 128) }
+        out.push(v)
+        return out
+      }
+      const tag = (field: number, wire: number): number[] => varint(field * 8 + wire)
+      const lenField = (field: number, bytes: number[]): number[] => [...tag(field, 2), ...varint(bytes.length), ...bytes]
+
+      const promptBytes = Array.from(Buffer.from('<USER_REQUEST>\nWrite a new function in parser.ts\n</USER_REQUEST>', 'utf-8'))
+      const subTag2 = lenField(2, promptBytes)
+      const tag19 = lenField(19, subTag2)
+      const stepPayload = Buffer.from(tag19)
+
+      db.exec('CREATE TABLE steps (idx integer, step_type integer, step_payload blob, PRIMARY KEY (idx))')
+      db.prepare('INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)').run(0, 14, stepPayload)
+      db.close()
+
+      const calls = await collectAntigravityCalls({ path: dbPath, project: 'antigravity', provider: 'antigravity' })
+      expect(calls.length).toBeGreaterThan(0)
+      expect(calls[0]!.userMessage).toBe('Write a new function in parser.ts')
+    })
   })
 })

@@ -43,6 +43,11 @@ describe('Claude quota', () => {
       [undefined, 'max_5x', 'Max 5x'],
       [undefined, 'max_20x', 'Max 20x'],
       [undefined, 'team', 'Team'],
+      [undefined, 'default_claude_max_10x', 'Max 10x'],
+      [undefined, 'default_claude_ultra', 'Ultra'],
+      [undefined, 'default_claude_foo_bar', 'Foo bar'],
+      ['max', '', 'Max'],
+      [undefined, 'default_claude_max', 'Max'],
       [undefined, undefined, 'Subscription'],
     ]
     for (const [subscriptionType, rateLimitTier, label] of cases) {
@@ -455,6 +460,27 @@ describe('collectQuota claudeProfiles (#1523)', () => {
       if (previousDirs === undefined) delete process.env.CLAUDE_CONFIG_DIRS
       else process.env.CLAUDE_CONFIG_DIRS = previousDirs
     }
+  })
+
+  it('full mode reuses the claude row for the first configured directory, wherever it lives', async () => {
+    await withTwoDirs(async (_dirs, sources) => {
+      const claudeRow: QuotaProvider = {
+        provider: 'claude', connection: 'connected', planLabel: 'Pro', footerLines: [],
+        primary: { label: 'Weekly', percent: 0.4, resetsAt: null }, details: [],
+      }
+      const reads: string[] = []
+      const report = await collectQuota({
+        readers: [{ id: 'claude', name: 'Claude', read: async () => claudeRow }],
+        claudeProfileDetail: 'full',
+        claudeProfileReader: async source => {
+          reads.push(source.id)
+          return { provider: 'claude', connection: 'disconnected', primary: null, details: [], planLabel: null, footerLines: [] }
+        },
+        claudeToday: async () => new Map(),
+      })
+      expect(reads).toEqual([sources[1].id])
+      expect(report.claudeProfiles?.[0]).toMatchObject({ id: sources[0].id, available: true, plan: 'Pro' })
+    })
   })
 
   it('list mode (the default) names the directories without reading or parsing any of them', async () => {

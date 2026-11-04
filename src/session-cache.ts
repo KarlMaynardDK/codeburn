@@ -33,7 +33,7 @@ export type CachedCall = {
   /// True when `costUSD` (or the tokens it is priced from) is estimated rather
   /// than metered. Persisted so the estimated-cost marker survives the cache.
   isEstimated?: boolean
-  speed: 'standard' | 'fast' | 'flex'
+  speed: 'standard' | 'fast' | 'flex' | 'ultrafast'
   timestamp: string
   tools: string[]
   bashCommands: string[]
@@ -377,7 +377,13 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // queued_command prompt attachments, including classification and PR links.
   // per-call-cwd-v1: cached calls carry their cwd so a session that moved
   // folders splits across projects per call.
-  claude: 'advisor-usage-v1-skills-rich-capture-v1-cross-provider-pr-v1-session-lineage-capture-v1-queued-human-prompts-v1-per-call-cwd-v1',
+  // streamed-tool-blocks-v1: parallel tool_use blocks written on earlier lines
+  // of one streamed message are kept, so cached calls regain their tools.
+  // powershell-shell-tool-v1: the Windows PowerShell tool is a shell tool, so
+  // cached calls regain the commands compaction used to drop.
+  // thinking-tokens-v1: reasoningTokens is read from usage.output_tokens_details,
+  // so cached calls regain their thinking share of the output.
+  claude: 'advisor-usage-v1-skills-rich-capture-v1-cross-provider-pr-v1-session-lineage-capture-v1-queued-human-prompts-v1-per-call-cwd-v1-streamed-tool-blocks-v1-powershell-shell-tool-v1-thinking-tokens-v1',
   cline: 'worktree-project-grouping-v1',
   // reported-cost-v1: the CLI reports its own per-message cost, so entries
   // cached before cline-cli joined the reported-cost allowlist in parser.ts
@@ -429,14 +435,19 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // 'standard'), and `gpt-reserve` now splits cache writes like GPT-5.6 Luna.
   // codex-fork-mask-v1: a fork's replay burst drops only records the parent
   // rollout holds, so cached forks that dropped the whole burst re-parse.
+  // native-tool-events-v1: capture built-in Responses tools and item-model
+  // WebSearch mirrors, preserving the first observed item identity across
+  // cached turns and append checkpoints.
+  // mcp-cli-command-v1: mcp-cli counts only in command position, so cached
+  // fake mcp__ tools from commit messages or echoes re-parse away.
   // Compose every suffix so cached sessions receive all accounting fixes.
-  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1-session-meta-model-v1-session-meta-fields-v1-codex-pricing-v1-codex-tps-v1-codex-mcp-skills-v1-activity-price-v1-fork-replay-burst-v1-codex-token-usage-record-v1-codex-priority-tier-v1-codex-auto-review-date-v1-codex-flex-reserve-v1-codex-fork-mask-v1',
+  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1-session-meta-model-v1-session-meta-fields-v1-codex-pricing-v1-codex-tps-v1-codex-mcp-skills-v1-activity-price-v1-fork-replay-burst-v1-codex-token-usage-record-v1-codex-priority-tier-v1-codex-auto-review-date-v1-codex-flex-reserve-v1-codex-fork-mask-v1-native-tool-events-v1-mcp-cli-command-v1',
   // reported-cost-v1: cached Crush calls stored costUSD: undefined and must
   // re-parse to keep the recorded session cost.
   crush: 'reported-cost-v1',
   // import-guess-est-v1: synced Auto rows with no dollar amount are estimated.
   // full-lookback-v1: a cached parse could be cut at a narrow request's start.
-  cursor: 'composer-anchored-crediting-v1-est-cost-import-guess-est-v1-full-lookback-v1',
+  cursor: 'composer-anchored-crediting-v1-est-cost-import-guess-est-v1-full-lookback-v1-bubble-id-dedupe-v1',
   // full-turn-accounting: every assistant message counts as a turn
   // (previously only the first after each user message survived), tool_use
   // inputs join the output text, and input tokens use the full user text
@@ -494,7 +505,10 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // anthropic-auto fallback; cached entries must re-parse once.
   // chatsession-agent-totals-v1: chat-session requests read every agent round
   // (modelTotals, root completionTokens) and copilotCredits as nanoAiu.
-  copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1-session-store-v3-chatsession-otel-skills-v1-otel-trace-metadata-once-v1-transcript-unknown-usage-v1-otel-workspace-project-v1-journal-request-input-v1-tokenless-turns-v1-store-row-output-v1-jetbrains-opus-4-7-v1-chatsession-agent-totals-v1',
+  // otel-cache-inclusive-input-v1: cached OTel calls hold inputTokens with
+  // cache reads and writes still inside it, so they must re-parse. Calls whose
+  // spans agent-traces.db already pruned keep the old input.
+  copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1-session-store-v3-chatsession-otel-skills-v1-otel-trace-metadata-once-v1-transcript-unknown-usage-v1-otel-workspace-project-v1-journal-request-input-v1-tokenless-turns-v1-store-row-output-v1-jetbrains-opus-4-7-v1-chatsession-agent-totals-v1-otel-cache-inclusive-input-v1',
   // authoritative-usage-v4: persist one Grok session call from top-level
   // authoritative totals, use modelUsage only for priced attribution, clamp
   // reasoning per record, and label mixed sessions estimated.
@@ -516,7 +530,8 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // billing-mode-v1: the resolved cost basis now rides on each call as
   // `billing` (`included` -> subscription, `actual` -> metered). Cached calls
   // hold none, so they must re-parse.
-  hermes: 'reasoning-output-accounting-v1-est-cost-routed-ids-workspace-pr-v5-cost-provenance-v3-billing-route-v1-billing-mode-v1',
+  // helper-usage-v1: auxiliary-model rows in session_model_usage now become calls.
+  hermes: 'reasoning-output-accounting-v1-est-cost-routed-ids-workspace-pr-v5-cost-provenance-v3-billing-route-v1-billing-mode-v1-helper-usage-v1',
   // reported-cost-v1: OpenClaw's per-message `usage.cost.total` is now
   // preserved through the cache via `costFromBilling`. This is OpenClaw's
   // first parse version; adding it moves the provider's env fingerprint,
@@ -551,7 +566,7 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // consumer requires (a marker-less value is treated as synthesized and fails
   // closed). Entries cached under project-path-v1 hold projectPath but no
   // workingDirectory, so a re-parse is required for the fix to take effect.
-  kiro: 'ide-parsing-v1-est-cost-project-path-v1-working-directory-v1',
+  kiro: 'ide-parsing-v1-est-cost-project-path-v1-working-directory-v1-no-text-tools-v1',
   // nested-agent-v1: OMP writes crewmate transcripts one directory below each
   // parent session. reported-cost-v2 persists those measured costs through the
   // cache, including the explicit zero on xai-oauth turns.
@@ -612,14 +627,21 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // cached before this hold costUSD: undefined and are re-priced from the
   // token floor on every read, so they must re-parse once for the real dollars
   // to land.
-  warp: 'worktree-project-grouping-v1-est-cost-billing-cost-v1',
+  // billed-cost-v1: total_billed_cost_in_cents prices conversations that carry
+  // no provider cost or charged usage.
+  warp: 'worktree-project-grouping-v1-est-cost-billing-cost-v1-billed-cost-v1',
   // cache-read-v1-est-cost: gen_metadata and RPC usage now carry cache-read
   // tokens, fields 9/10 read as thinking/response (they were swapped), and
   // placeholder-only models are priced and flagged costIsEstimated.
   // model-fallback-v1: gen_metadata without usage.model falls back to
   // chatModel.model instead of dropping the session, Gemini 3.8 Flash
   // placeholders resolve, and Gemini 3 Flash -a/-d rows are priced.
-  antigravity: 'worktree-project-grouping-v7-cache-read-v1-est-cost-model-fallback-v1',
+  // user-msg-v1: extracts user prompts from brain transcripts (<USER_REQUEST>)
+  // or SQLite steps table, attributing userMessage across calls and turns.
+  // cli-workspace-v1: Antigravity CLI (.db) conversations now attribute
+  // projectPath and project from trajectory_metadata_blob instead of collapsing
+  // into a generic antigravity-cli bucket.
+  antigravity: 'worktree-project-grouping-v7-cache-read-v1-est-cost-model-fallback-v1-user-msg-v1-cli-workspace-v1',
   // pr-attribution-v1: the parser now reads the `message`/`part` tables for
   // per-turn user prompt text and the GitHub PR URLs it references. Cached
   // ZCode sessions hold empty userMessage turns and no session prLinks, so
