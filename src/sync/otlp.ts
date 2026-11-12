@@ -114,6 +114,12 @@ export interface CallWithSession {
   category?: string
   /** Set only on the first behavioral call of a behavioral turn, so a receiver counts each turn once. */
   turn?: TurnWireContext
+  /**
+   * Set only on the first call after a mid-session model switch that re-sent
+   * the conversation to the new model while the old cache was still warm: the
+   * context tokens re-sent (see modelSwitchesInSession). Sent as ai.model_switch_tokens.
+   */
+  modelSwitchTokens?: number
 }
 
 /** Turn outcome facts (ClassifiedTurn.hasEdits / retries), sent as ai.turn_* on a detail-level wire. */
@@ -237,7 +243,7 @@ function identifierList(key: string, values: readonly string[]): OtlpAttribute[]
  * commands or titles. Zero and false values are omitted; a receiver reads a
  * missing key as zero, false or (for ai.request_weight) one.
  */
-function detailLevelCallAttributes(call: ParsedApiCall, turn: TurnWireContext | undefined): OtlpAttribute[] {
+function detailLevelCallAttributes(call: ParsedApiCall, turn: TurnWireContext | undefined, modelSwitchTokens: number | undefined): OtlpAttribute[] {
   const attributes: OtlpAttribute[] = [
     ...positiveInt('ai.reasoning_tokens', call.usage.reasoningTokens),
     ...positiveInt('ai.web_search_requests', call.usage.webSearchRequests),
@@ -248,6 +254,7 @@ function detailLevelCallAttributes(call: ParsedApiCall, turn: TurnWireContext | 
     ...positiveInt('ai.tool_errors', call.toolErrors),
     ...positiveInt('ai.active_duration_ms', call.activeDurationMs),
     ...positiveInt('ai.tool_wait_ms', call.toolWaitMs),
+    ...positiveInt('ai.model_switch_tokens', modelSwitchTokens),
   ]
   if (call.savingsUSD !== undefined && Number.isFinite(call.savingsUSD) && call.savingsUSD > 0) {
     attributes.push({ key: 'ai.savings_usd', value: { doubleValue: call.savingsUSD } })
@@ -328,7 +335,7 @@ const DETAIL_CALL_KEYS = [
   'ai.billing_route', 'ai.billing_mode', 'ai.nano_aiu', 'ai.request_weight', 'ai.lines_added', 'ai.lines_removed',
   'ai.tool_errors', 'ai.interrupted', 'ai.user_modified', 'ai.active_duration_ms', 'ai.tool_wait_ms',
   'ai.turn_start', 'ai.turn_has_edits', 'ai.turn_retries',
-  'ai.mcp_tools', 'ai.skills', 'ai.subagent_types', 'ai.plan_mode',
+  'ai.mcp_tools', 'ai.skills', 'ai.subagent_types', 'ai.plan_mode', 'ai.model_switch_tokens',
 ]
 
 /// Attribute keys the core emitter writes. Plugins add fields; they never
@@ -380,7 +387,7 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
 
   const summary = opts?.detailLevel === 'summary'
 
-  const spans: OtlpSpan[] = calls.map(({ call, sessionId, workingDirectory, session: fullSession, category, turn }) => {
+  const spans: OtlpSpan[] = calls.map(({ call, sessionId, workingDirectory, session: fullSession, category, turn, modelSwitchTokens }) => {
     // Summary level never sees session context at all.
     const session = summary ? undefined : fullSession
     const perCallEnrichment = summary ? [] : opts?.pluginEnrichment?.perCall.get(call.deduplicationKey) ?? []
@@ -429,7 +436,7 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
       || (opts?.detailLevel !== undefined && call.isEstimated === true)
     attributes.push({ key: 'ai.cost_estimated', value: { boolValue: isEstimated } })
 
-    if (opts?.detailLevel) attributes.push(...detailLevelCallAttributes(call, turn))
+    if (opts?.detailLevel) attributes.push(...detailLevelCallAttributes(call, turn, modelSwitchTokens))
 
     // --- CB-3 additive fields (boundary spec section 7). Each is emitted only
     // when its value is proven; an old receiver ignoring them loses nothing.

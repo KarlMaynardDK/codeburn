@@ -6,7 +6,7 @@ import { fmtNum, fmtTokens, label, usd } from '@/lib/utils'
 import { getPeople, getPerson, type Breakdown, type Filters, type Meta, type PersonRow } from '../lib/api'
 import { PersonActions } from '../PersonActions'
 import { DailyChart, Spark } from '../DailyChart'
-import { Button, CsvButton, Empty, ErrorNote, Loading, Panel, TablePanel } from '../ui'
+import { Button, CsvButton, Empty, ErrorNote, LinesChangedNote, Loading, Panel, TablePanel } from '../ui'
 
 const tok = (p: PersonRow) => p.input + p.output + p.cache_read + p.cache_write
 const pct = (r: number | undefined) => (r == null ? '-' : (r * 100).toFixed(0) + '%')
@@ -19,45 +19,47 @@ export function People({ filters, onOpen, meta }: { filters: Filters; onOpen: (i
   const people = [...q.data!].sort((a, b) => b.cost - a.cost)
   if (!people.length) return <Empty />
   return (
-    <TablePanel
-      title="People"
-      filename="team-people.csv"
-      columns={[
-        { key: 'name', label: 'Person' },
-        { key: 'team', label: 'Team' },
-        { key: 'cost', label: 'Cost', num: true },
-        { key: 'tokens', label: 'Tokens', num: true },
-        { key: 'calls', label: 'Calls', num: true },
-        { key: 'cache', label: 'Cache read', num: true },
-        { key: 'oneShot', label: 'One-shot', num: true },
-        { key: 'lines', label: 'Lines +/-', num: true },
-        { key: 'model', label: 'Top model' },
-        { key: 'trend', label: 'Trend' },
-        { key: 'seen', label: 'Last seen' },
-        { key: 'through', label: 'Data through' },
-        ...(meta ? [{ key: 'actions', label: '' }] : []),
-      ]}
-      rows={people.map((p) => ({
-        name: (
-          <button type="button" className="text-primary hover:underline" onClick={() => onOpen(p.id)}>
-            {p.name}
-          </button>
-        ),
-        team: p.team ?? '-',
-        cost: usd(p.cost),
-        tokens: fmtTokens(tok(p)),
-        calls: fmtNum(p.calls),
-        cache: pct(p.cache_read_ratio),
-        oneShot: pct(p.one_shot_rate ?? undefined),
-        lines: p.lines_added || p.lines_removed ? `+${fmtNum(p.lines_added)} / -${fmtNum(p.lines_removed)}` : '-',
-        model: p.top_model ? label(p.top_model) : '-',
-        trend: <Spark values={p.trend} />,
-        seen: when(p.last_seen),
-        through: p.data_through ?? '-',
-        actions: meta ? <PersonActions meta={meta} personId={p.id} name={p.name} /> : null,
-      }))}
-      csv={people.map((p) => [p.name, p.email, p.team, p.cost, p.input, p.output, p.cache_read, p.cache_write, p.calls, p.cache_read_ratio, p.one_shot_rate, p.lines_added, p.lines_removed, p.top_model, p.last_seen, p.data_through])}
-    />
+    <div className="flex flex-col gap-4">
+      <TablePanel
+        title="People"
+        filename="team-people.csv"
+        columns={[
+          { key: 'name', label: 'Person' },
+          { key: 'team', label: 'Team' },
+          { key: 'cost', label: 'Cost', num: true },
+          { key: 'tokens', label: 'Tokens', num: true },
+          { key: 'calls', label: 'Calls', num: true },
+          { key: 'cache', label: 'Cache read', num: true },
+          { key: 'oneShot', label: 'One-shot', num: true },
+          { key: 'model', label: 'Top model' },
+          { key: 'trend', label: 'Trend' },
+          { key: 'seen', label: 'Last seen' },
+          { key: 'through', label: 'Data through' },
+          ...(meta ? [{ key: 'actions', label: '' }] : []),
+        ]}
+        rows={people.map((p) => ({
+          name: (
+            <button type="button" className="text-primary hover:underline" onClick={() => onOpen(p.id)}>
+              {p.name}
+            </button>
+          ),
+          team: p.team ?? '-',
+          cost: usd(p.cost),
+          tokens: fmtTokens(tok(p)),
+          calls: fmtNum(p.calls),
+          cache: pct(p.cache_read_ratio),
+          oneShot: pct(p.one_shot_rate ?? undefined),
+          model: p.top_model ? label(p.top_model) : '-',
+          trend: <Spark values={p.trend} />,
+          seen: when(p.last_seen),
+          through: p.data_through ?? '-',
+          actions: meta ? <PersonActions meta={meta} personId={p.id} name={p.name} /> : null,
+        }))}
+        csvHeaders={['Person', 'Email', 'Team', 'Cost USD', 'Input tokens', 'Output tokens', 'Cache read tokens', 'Cache write tokens', 'Calls', 'Cache read ratio', 'One-shot rate', 'Top model', 'Last seen', 'Data through']}
+        csv={people.map((p) => [p.name, p.email, p.team, p.cost, p.input, p.output, p.cache_read, p.cache_write, p.calls, p.cache_read_ratio, p.one_shot_rate, p.top_model, p.last_seen, p.data_through])}
+      />
+      <LinesChangedNote />
+    </div>
   )
 }
 
@@ -105,8 +107,8 @@ function Detail({ d }: { d: Awaited<ReturnType<typeof getPerson>> }) {
       </div>
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <MetricCard label="One-shot edits" value={pct(p.one_shot_rate ?? undefined)} sub={p.edit_turns ? `${fmtNum(p.one_shot_turns)} of ${fmtNum(p.edit_turns)} edit prompts` : undefined} />
-        <MetricCard label="Lines changed" value={`+${fmtNum(p.lines_added)} / -${fmtNum(p.lines_removed)}`} />
         <MetricCard label="Tool errors" value={fmtNum(p.tool_errors)} />
+        <MetricCard label="Model switches" value={fmtNum(p.model_switches ?? 0)} sub={p.model_switches ? `${fmtTokens(p.model_switch_tokens ?? 0)} tokens re-sent` : 'mid-session, warm cache'} />
         <MetricCard label="Data through" value={p.data_through ?? '-'} sub={p.last_seen ? `last seen ${when(p.last_seen)}` : undefined} />
       </div>
       <Panel title="Usage over time">
@@ -118,6 +120,7 @@ function Detail({ d }: { d: Awaited<ReturnType<typeof getPerson>> }) {
         <Split title="By project" items={d.by_project} />
         <Split title="By category" items={d.by_category} />
       </div>
+      <LinesChangedNote />
     </>
   )
 }

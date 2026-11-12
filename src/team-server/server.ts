@@ -10,7 +10,7 @@ import { assertServeConfig, type TeamServerConfig } from './config.js'
 import { checkState, completeLogin, decideAccess, registrationEnabled, startLogin } from './gitlab.js'
 import { helpPage } from './help.js'
 import { parseCoaching } from './coaching.js'
-import { ingestOtlp } from './ingest.js'
+import { MAX_SPAN_AGE_DAYS, ingestOtlp } from './ingest.js'
 import type { Store } from './store.js'
 
 export const MAX_BODY_BYTES = 10 * 1024 * 1024
@@ -91,6 +91,7 @@ export function discoveryDoc(config: TeamServerConfig, pkg?: ClientPackage) {
     revoke_path: '/v1/revoke',
     traces_path: '/v1/traces',
     max_batch_size: MAX_BATCH_SIZE,
+    max_span_age_days: MAX_SPAN_AGE_DAYS,
     detail_levels: config.accept_session_detail ? ['summary', 'sessions'] : ['summary'],
     ...(config.accept_findings ? { findings_path: '/v1/findings' } : {}),
     ...(config.accept_coaching ? { coaching_path: '/v1/coaching' } : {}),
@@ -147,7 +148,7 @@ export function createTeamServer(opts: TeamServerOptions): Server {
         const origin = config.public_url
           ?? originFromRequest(req.headers.host, Array.isArray(fwd) ? fwd[0] : fwd, tls)
         if (!origin) return sendJson(res, 400, { error: 'invalid_host' })
-        const body = path === '/install.sh' ? installShScript(origin, pkg, config.install_mode) : installPs1Script(origin, pkg, config.install_mode)
+        const body = path === '/install.sh' ? installShScript(origin, pkg, config.install_mode, config.org_name) : installPs1Script(origin, pkg, config.install_mode, config.org_name)
         res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' })
         return void res.end(method === 'HEAD' ? undefined : body)
       }

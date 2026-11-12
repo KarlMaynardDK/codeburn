@@ -134,13 +134,17 @@ export type Extras = {
   one_shot_turns: number
   retries: number
   plan_mode_calls: number
+  /** Mid-session model switches that re-sent warm context, and the context tokens they re-sent. */
+  model_switches: number
+  model_switch_tokens: number
   /** Null when no turn outcomes were sent for the period. */
   one_shot_rate: number | null
 }
 export const EMPTY_EXTRAS: Extras = {
   reasoning: 0, cache_write_1h: 0, web_search: 0, estimated_cost_usd: 0, covered_cost_usd: 0, savings_usd: 0, nano_aiu: 0,
   lines_added: 0, lines_removed: 0, tool_errors: 0, interrupted: 0, user_modified: 0, active_ms: 0, tool_wait_ms: 0,
-  turns: 0, edit_turns: 0, one_shot_turns: 0, retries: 0, plan_mode_calls: 0, one_shot_rate: null,
+  turns: 0, edit_turns: 0, one_shot_turns: 0, retries: 0, plan_mode_calls: 0, model_switches: 0, model_switch_tokens: 0,
+  one_shot_rate: null,
 }
 export type Overview = {
   totals: { cost: number; input: number; output: number; cache_read: number; cache_write: number; calls: number; active_people: number } & Extras
@@ -188,7 +192,11 @@ export type PersonDetail = {
 export type MatrixCell = { model: string; category: string; cost: number; tokens: number; calls: number; people: number }
 export type ModelsData = { matrix: MatrixCell[]; by_model: Breakdown[] }
 export type ProjectRow = { project: string; cost: number; tokens: number; calls: number; people: number; top_person?: string | null }
-export type SessionRow = { trace_id: string; person: string; project: string; started: string; duration_ms: number; calls: number; cost: number }
+export type SessionRow = {
+  trace_id: string; person: string; project: string; started: string; duration_ms: number; calls: number; cost: number
+  input: number; output: number; cache_read: number; cache_write: number
+  edit_turns: number; one_shot_turns: number; one_shot_rate: number | null
+}
 export type EvidenceTable = { title: string; columns: string[]; rows: string[][] }
 export type InsightKind = 'training' | 'cost' | 'setup'
 export type Insight = {

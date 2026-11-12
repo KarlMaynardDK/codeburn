@@ -116,6 +116,39 @@ describe.each(BACKENDS)('store (%s)', backend => {
     ])
   })
 
+  it('counts model switches and the context they re-sent into daily_usage', async () => {
+    ts = await makeStore(backend)
+    const { person } = await ts.store.addPerson({ name: 'Ann', email: '', team: '' })
+    const ts0 = new Date().toISOString()
+    await ts.store.ingestSpans(person.id, 'd', [
+      spanRecord({ span_id: 'a', ts: ts0, model_switch_tokens: 80_000 }),
+      spanRecord({ span_id: 'b', ts: ts0, model_switch_tokens: 40_000 }),
+      spanRecord({ span_id: 'c', ts: ts0 }),
+    ], false)
+    const [u] = await ts.store.all('SELECT calls, model_switches, model_switch_tokens FROM daily_usage')
+    expect([Number(u!.calls), Number(u!.model_switches), Number(u!.model_switch_tokens)]).toEqual([3, 2, 120_000])
+    // Re-sending the same span (sync reset + push --since all) replaces it, it does not count twice.
+    await ts.store.ingestSpans(person.id, 'd', [spanRecord({ span_id: 'a', ts: ts0, model_switch_tokens: 80_000 })], false)
+    const [again] = await ts.store.all('SELECT model_switches, model_switch_tokens FROM daily_usage')
+    expect([Number(again!.model_switches), Number(again!.model_switch_tokens)]).toEqual([2, 120_000])
+  })
+
+  it('upgrades a v4 database: adds the span column and rebuilds daily_usage with the switch counts', async () => {
+    ts = await makeStore(backend)
+    const db = ts.store.db
+    const { person } = await ts.store.addPerson({ name: 'Ann', email: '', team: '' })
+    await ts.store.ingestSpans(person.id, 'd', [spanRecord({ span_id: 'a', ts: new Date().toISOString() })], false)
+    // Back to the v4 shape: no span column, daily_usage without the two counts.
+    await db.all('ALTER TABLE spans DROP COLUMN model_switch_tokens')
+    await db.all('ALTER TABLE daily_usage DROP COLUMN model_switches')
+    await db.all('ALTER TABLE daily_usage DROP COLUMN model_switch_tokens')
+    await db.all('UPDATE schema_version SET version = 4')
+    await migrate(db)
+    expect(await ts.store.all('SELECT version FROM schema_version')).toEqual([{ version: SCHEMA_VERSION }])
+    const [u] = await ts.store.all('SELECT calls, model_switches, model_switch_tokens FROM daily_usage')
+    expect([Number(u!.calls), Number(u!.model_switches), Number(u!.model_switch_tokens)]).toEqual([1, 0, 0])
+  })
+
   it('stores only hashes of secrets', async () => {
     ts = await makeStore(backend)
     const { enrollmentToken } = await ts.store.addPerson({ name: 'Ann', email: 'a@x.io', team: 't' })

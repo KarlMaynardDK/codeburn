@@ -1,5 +1,5 @@
 import type { TeamServerConfig } from './config.js'
-import { installerLines, setupCommand } from './client-package.js'
+import { installerLines, REFRESH_COMMANDS, setupCommand, teamLabel } from './client-package.js'
 
 /** One step of the "after it is installed" checklist shown on the install-token page, the help page and `team admin`. */
 export interface SetupStep {
@@ -131,7 +131,11 @@ ${code(['codeburn sync status          # endpoint, auth, what is sent, last push
 <h2 id="upgrade">Upgrade</h2>
 <p>By default each scheduled sync first installs this server's CLI build when it differs from yours, so you normally do nothing.</p>
 ${code(['codeburn --version', 'codeburn update                       # install the server build now', 'codeburn sync auto updates           # show whether automatic updates are on', 'codeburn sync auto updates off       # or: on'])}
-<p>You can also run the installer command from <a href="#install">Install and connect</a> again. A new build can change what is sent; if so automatic sync pauses until you run <code>codeburn sync auto enable --accept</code>.</p>
+${opts.installers ? `<p>Or run the installer again, without a token:</p>${code(installerLines(origin, '').unix.replace(/ -s -- --token $/, ''))}${code(installerLines(origin, '').windows.replace(/ -Token $/, ''))}
+<p>On a connected machine it asks <em>Do you consent to uploading your AI usage data to the ${esc(teamLabel(config.org_name, origin))} team server?</em> Yes accepts what the new build sends and re-sends your history, so the team's numbers are rebuilt with any new fields:</p>
+${code([...REFRESH_COMMANDS])}
+<p>No (or no terminal to answer in) changes nothing: run those three commands yourself when you are ready.</p>` : ''}
+<p>A new build can change what is sent; if so automatic sync pauses until you run <code>codeburn sync auto enable --accept</code>.</p>
 
 <h2 id="another">Another machine</h2>
 <p>Each machine needs its own token. ${opts.registration ? 'Use <em>Set up another machine</em> in the dashboard header (any unused token stops working), then' : 'Ask your admin for a new token, then'} run the install command on that machine and work through <a href="#finish">Finish setup</a>. Your usage from all machines is combined under you.</p>

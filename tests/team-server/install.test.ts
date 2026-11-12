@@ -93,11 +93,47 @@ describe('client package distribution', () => {
     expect(ps1).toContain('& $Cb sync config all on')
     expect(ps1).toContain('& $Cb sync auto enable --accept')
     expect(ps1).toContain('& $Cb sync push --since all')
-    for (const manual of [installShScript('https://cb.example.com', pkg), installPs1Script('https://cb.example.com', pkg, 'manual')]) {
-      expect(manual).not.toContain('config all on')
-      expect(manual).not.toContain('auto enable --accept </dev/null')
-      expect(manual).not.toContain('& $Cb sync auto enable --accept')
+    // Manual mode: setting up with a token never accepts on the person's behalf. The only accept is the update path's,
+    // behind the consent question.
+    const manualSh = installShScript('https://cb.example.com', pkg)
+    const manualPs1 = installPs1Script('https://cb.example.com', pkg, 'manual')
+    for (const manual of [manualSh, manualPs1]) expect(manual).not.toContain('config all on')
+    const shTokenPath = manualSh.slice(manualSh.indexOf('if [ -n "$TOKEN" ]'), manualSh.indexOf('elif "$CB" sync status'))
+    expect(shTokenPath).not.toContain('--accept </dev/null')
+    const ps1TokenPath = manualPs1.slice(manualPs1.indexOf("if ($Token -ne '')"), manualPs1.indexOf('& $Cb sync status *> $null'))
+    expect(ps1TokenPath).not.toContain('& $Cb sync auto enable --accept')
+  })
+
+  it('asks a connected machine for consent on update, then accepts, resets and re-pushes', async () => {
+    const { pkg } = await makePackage()
+    const { installShScript, installPs1Script } = await import('../../src/team-server/client-package.js')
+    for (const mode of ['manual', 'all'] as const) {
+      const sh = installShScript('https://cb.example.com', pkg, mode, 'Acme Platform')
+      expect(sh).toContain("TEAM_LABEL='Acme Platform'")
+      expect(sh).toContain('Do you consent to uploading your AI usage data to the %s team server? [y/N]')
+      // The answer comes from the terminal (the script itself is on stdin); no terminal means no.
+      expect(sh).toContain('read -r ANSWER </dev/tty')
+      expect(sh).toContain('elif "$CB" sync status >/dev/null 2>&1 </dev/null; then\n    refresh_sharing "$CB"')
+      const yes = sh.slice(sh.indexOf('y|Y|yes|Yes|YES)'), sh.indexOf('    *)\n      printf'))
+      expect(yes.indexOf('sync auto enable --accept')).toBeLessThan(yes.indexOf('sync reset --confirm'))
+      expect(yes.indexOf('sync reset --confirm')).toBeLessThan(yes.indexOf('sync push --since all'))
+      expect(yes.includes('sync config all on')).toBe(mode === 'all')
+
+      const ps1 = installPs1Script('https://cb.example.com', pkg, mode, 'Acme Platform')
+      expect(ps1).toContain("$TeamLabel = 'Acme Platform'")
+      expect(ps1).toContain('Read-Host "Do you consent to uploading your AI usage data to the $TeamLabel team server? [y/N]"')
+      expect(ps1).toContain('-not [Console]::IsInputRedirected')
+      const psYes = ps1.slice(ps1.indexOf("if ($Answer -match"), ps1.indexOf('Nothing new is uploaded'))
+      expect(psYes.indexOf('sync auto enable --accept')).toBeLessThan(psYes.indexOf('sync reset --confirm'))
+      expect(psYes.indexOf('sync reset --confirm')).toBeLessThan(psYes.indexOf('sync push --since all'))
     }
+  })
+
+  it('reduces the team name to quote-free text and falls back to the host', async () => {
+    const { teamLabel } = await import('../../src/team-server/client-package.js')
+    expect(teamLabel("Acme's Team; rm -rf / `x` $(y)", 'https://cb.example.com')).toBe('Acmes Team rm -rf x (y)')
+    expect(teamLabel('', 'https://cb.example.com:8443')).toBe('cb.example.com:8443')
+    expect(teamLabel('  "\'$  ', 'https://cb.example.com')).toBe('cb.example.com')
   })
 
   it('generates scripts with the derived URL and versioned path, with no accept flag', async () => {
@@ -113,7 +149,9 @@ describe('client package distribution', () => {
     expect(sh.indexOf('npm uninstall -g codeburn')).toBeLessThan(sh.indexOf('npm install -g'))
     expect(sh).toContain('nodejs.org')
     expect(sh).not.toMatch(/--accept"/)
-    expect(sh).not.toMatch(/sync auto enable --accept\b(?!\\n)/)
+    // Outside the consent-gated update path, --accept only appears in printed advice.
+    const outsideRefresh = sh.slice(0, sh.indexOf('refresh_sharing() {')) + sh.slice(sh.indexOf('\n}\n', sh.indexOf('refresh_sharing() {')))
+    expect(outsideRefresh).not.toMatch(/sync auto enable --accept\b(?!\\n)/)
     const ps1 = await (await fetch(`${t.base}/install.ps1`)).text()
     expect(ps1).toContain(`$PkgUrl = '${t.base}/install/codeburn-team-1.2.3.tgz'`)
     expect(ps1).toContain("$ErrorActionPreference = 'Stop'")

@@ -5,11 +5,13 @@
  * pipeline is unit-testable without a full CLI invocation.
  */
 
-import type { ProjectSummary } from '../types.js'
+import type { ParsedApiCall, ProjectSummary } from '../types.js'
 import type { PlanMap, PlanProvider } from '../config.js'
 import { isProxiedPath } from '../models.js'
 import { isBehavioralCall, isBehavioralTurn } from '../behavioral-weight.js'
 import { inferSessionProvider } from '../session-output.js'
+import { isUserStartedSession } from '../session-population.js'
+import { modelSwitchesInSession } from '../model-switch.js'
 import { resolveWorkUnits, workUnitSessionKey } from '../work-units.js'
 import { assertHttps } from './discovery.js'
 import { currentCliVersion } from '../plugins/loader.js'
@@ -161,6 +163,40 @@ function syncedShapes(sentKeys: ReadonlySet<string>): Map<string, Set<CopilotSha
 const FUTURE_GRACE_MS = 60 * 60 * 1000
 
 /**
+ * Span age limit of team servers that predate `max_span_age_days` in their
+ * discovery doc (src/team-server/ingest.ts MAX_SPAN_AGE_DAYS).
+ */
+export const TEAM_SERVER_DEFAULT_MAX_SPAN_AGE_DAYS = 183
+
+/** Pushes take a while; stop this far short of the server's cutoff so a span can't age out in flight. */
+const AGE_LIMIT_MARGIN_MS = 60 * 60 * 1000
+
+/** The age limit to apply when pushing: the advertised one, the team-server default, or none (OIDC). */
+export function spanAgeLimitDays(discovery: { max_span_age_days?: number } | undefined, authMode: 'enrollment' | 'oidc' | undefined): number | undefined {
+  if (discovery?.max_span_age_days) return discovery.max_span_age_days
+  return authMode === 'enrollment' ? TEAM_SERVER_DEFAULT_MAX_SPAN_AGE_DAYS : undefined
+}
+
+/**
+ * Splits off calls the server would reject as too old. The server answers a
+ * batch with only a rejected COUNT, so one old call would keep its whole batch
+ * out of the ledger and resend it on every push. They are skipped instead
+ * (not ledgered: nothing was stored, and the parser window drops them soon).
+ */
+export function splitByServerAge<T extends { call: { timestamp: string } }>(calls: T[], maxAgeDays: number | undefined, now: number = Date.now()): { inWindow: T[]; tooOld: T[] } {
+  if (!maxAgeDays) return { inWindow: calls, tooOld: [] }
+  const cutoff = now - maxAgeDays * 86_400_000 + AGE_LIMIT_MARGIN_MS
+  const inWindow: T[] = []
+  const tooOld: T[] = []
+  for (const c of calls) {
+    const ts = Date.parse(c.call.timestamp)
+    if (Number.isFinite(ts) && ts < cutoff) tooOld.push(c)
+    else inWindow.push(c)
+  }
+  return { inWindow, tooOld }
+}
+
+/**
  * Newest moment a session can be SHOWN to have been active, or null when
  * nothing about it can be dated. Unparseable and implausibly-future stamps
  * carry no information about recency and are ignored rather than treated as
@@ -270,6 +306,12 @@ export function collectUnsentCalls(projects: ProjectSummary[], now: number = Dat
         ...(durationMs !== undefined ? { durationMs } : {}),
         ...lineageContext(session, provider, resolution, unitById),
       }
+      // Subagent transcripts start a fresh context by design, so only
+      // user-started sessions report model switches.
+      const switches = new Map<ParsedApiCall, number>()
+      if (isUserStartedSession(session)) {
+        for (const sw of modelSwitchesInSession(session)) switches.set(sw.call, sw.carriedTokens)
+      }
       for (const turn of session.turns) {
         // The turn's outcome rides on its first behavioral call only, so a
         // receiver counts turns the way the local reports do.
@@ -286,6 +328,7 @@ export function collectUnsentCalls(projects: ProjectSummary[], now: number = Dat
             category: turn.category,
             session: covered !== undefined ? { ...sessionContext, subscriptionCovered: covered } : sessionContext,
             ...(startsTurn ? { turn: { hasEdits: turn.hasEdits, retries: turn.retries } } : {}),
+            ...(switches.has(call) ? { modelSwitchTokens: switches.get(call)! } : {}),
           })
         }
       }

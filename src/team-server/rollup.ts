@@ -39,7 +39,7 @@ const SUMS = `SUM(du.cost_usd) AS cost, SUM(du.input) AS input, SUM(du.output) A
 const EXTRA_COLS = [
   'reasoning', 'cache_write_1h', 'web_search', 'estimated_cost_usd', 'covered_cost_usd', 'savings_usd', 'nano_aiu',
   'lines_added', 'lines_removed', 'tool_errors', 'interrupted', 'user_modified', 'active_ms', 'tool_wait_ms',
-  'turns', 'edit_turns', 'one_shot_turns', 'retries', 'plan_mode_calls',
+  'turns', 'edit_turns', 'one_shot_turns', 'retries', 'plan_mode_calls', 'model_switches', 'model_switch_tokens',
 ] as const
 const EXTRA_SUMS = EXTRA_COLS.map(c => `SUM(du.${c}) AS ${c}`).join(', ')
 type Extras = Record<(typeof EXTRA_COLS)[number], number>
@@ -221,13 +221,46 @@ export async function projects(store: Store, f: Filters) {
 
 export async function sessions(store: Store, f: Filters) {
   const params: unknown[] = [f.from, addDays(f.to, 1)]
-  let sql = 'SELECT s.trace_id, p.name AS person, s.project, s.started, s.duration_ms, s.calls, s.cost FROM sessions s JOIN people p ON p.id = s.person_id WHERE s.started >= ? AND s.started < ?'
+  let sql = 'SELECT s.trace_id, s.person_id, p.name AS person, s.project, s.started, s.duration_ms, s.calls, s.cost FROM sessions s JOIN people p ON p.id = s.person_id WHERE s.started >= ? AND s.started < ?'
   if (f.person) { sql += ' AND s.person_id = ?'; params.push(f.person) }
   { const t = teamClause(f); sql += t.sql; params.push(...t.params) }
   if (f.project) { sql += ' AND s.project = ?'; params.push(f.project) }
   sql += ' ORDER BY s.started DESC LIMIT 500'
   const rows = await store.all(sql, params)
-  return rows.map(r => ({ trace_id: r.trace_id, person: r.person, project: r.project, started: r.started, duration_ms: n(r.duration_ms), calls: n(r.calls), cost: n(r.cost) }))
+  const stats = await sessionSpanStats(store, rows.map(r => r.trace_id as string))
+  return rows.map(r => {
+    const x = stats.get(`${r.person_id}\u0000${r.trace_id}`) ?? EMPTY_SESSION_STATS
+    return {
+      trace_id: r.trace_id, person: r.person, project: r.project, started: r.started, duration_ms: n(r.duration_ms), calls: n(r.calls), cost: n(r.cost),
+      ...x, one_shot_rate: oneShotRate(x),
+    }
+  })
+}
+
+const EMPTY_SESSION_STATS = { input: 0, output: 0, cache_read: 0, cache_write: 0, edit_turns: 0, one_shot_turns: 0 }
+
+/**
+ * Token and one-shot totals per session, summed from the same session-level spans the sessions row is built
+ * from (the sessions table keeps only duration, calls and cost). Keyed by person and trace.
+ */
+async function sessionSpanStats(store: Store, traceIds: string[]): Promise<Map<string, typeof EMPTY_SESSION_STATS>> {
+  const out = new Map<string, typeof EMPTY_SESSION_STATS>()
+  const ids = [...new Set(traceIds)]
+  for (let i = 0; i < ids.length; i += 200) {
+    const chunk = ids.slice(i, i + 200)
+    const rows = await store.all(
+      `SELECT person_id, trace_id, SUM(input) AS input, SUM(output) AS output, SUM(cache_read) AS cache_read, SUM(cache_write) AS cache_write,
+         SUM(turn_start * turn_has_edits) AS edit_turns,
+         SUM(CASE WHEN turn_start = 1 AND turn_has_edits = 1 AND turn_retries = 0 THEN 1 ELSE 0 END) AS one_shot_turns
+       FROM spans WHERE detail_level = 'sessions' AND trace_id IN (${chunk.map(() => '?').join(',')}) GROUP BY person_id, trace_id`, chunk)
+    for (const r of rows) {
+      out.set(`${r.person_id}\u0000${r.trace_id}`, {
+        input: n(r.input), output: n(r.output), cache_read: n(r.cache_read), cache_write: n(r.cache_write),
+        edit_turns: n(r.edit_turns), one_shot_turns: n(r.one_shot_turns),
+      })
+    }
+  }
+  return out
 }
 
 const KIND_ORDER: Record<string, number> = { mcp: 0, skill: 1, subagent: 2 }

@@ -145,6 +145,7 @@ export function parseOtlp(payload: unknown, acceptSessionDetail: boolean, now = 
           mcp_tools: names(a.get('ai.mcp_tools')),
           skills: names(a.get('ai.skills')),
           subagent_types: names(a.get('ai.subagent_types')),
+          model_switch_tokens: int(a.get('ai.model_switch_tokens')),
         })
       }
     }

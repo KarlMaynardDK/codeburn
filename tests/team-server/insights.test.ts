@@ -136,6 +136,20 @@ describe.each(BACKENDS)('team insights (%s)', backend => {
       expect(err.evidence[1].rows).toEqual([['mcp__github__get_issue', '10']])
     })
 
+    it('flags mid-session model switches by the model switched to, and stays quiet below the threshold', async () => {
+      t = await startServer(backend)
+      const [a, b1] = await people(['Ivy', 'Jon'])
+      const switches = (tag: string, n: number, tokens: number, model: string) =>
+        Array.from({ length: n }, (_, k) => span({ id: `${tag}${k}`, at: daysAgo(1), model, attrs: [i('ai.model_switch_tokens', tokens)] }))
+      await send(t, a!.cred, [...switches('o', 3, 90_000, 'claude-opus-4-1'), ...switches('s', 1, 30_000, 'claude-sonnet-4')])
+      await send(t, b1!.cred, switches('j', 2, 150_000, 'claude-opus-4-1'))
+      const list = by(await insightsFor(), 'model-switch-recache')
+      expect(list).toHaveLength(1)
+      expect(list[0]).toMatchObject({ person: 'Ivy', kind: 'training', severity: 'info', value: 300_000 })
+      expect(list[0].detail).toContain('4 switches re-sent 300.0K tokens')
+      expect(list[0].evidence[0].rows).toEqual([['claude-opus-4-1', '3', '270.0K'], ['claude-sonnet-4', '1', '30.0K']])
+    })
+
     it('names the people using fast mode', async () => {
       t = await startServer(backend)
       const [a, b1] = await people(['Ivy', 'Jon'])

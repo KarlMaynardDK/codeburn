@@ -20,6 +20,9 @@ export const MIN_CALLS_FOR_ERROR_RULE = 50
 export const MIN_TOOL_ERROR_RATE = 0.05
 export const MIN_INTERRUPT_RATE = 0.05
 export const FAST_SHARE_INFO = 0.25
+/** Mid-session model switches that re-sent warm context: absolute, so it needs no peers. */
+export const MODEL_SWITCH_MIN_COUNT = 3
+export const MODEL_SWITCH_MIN_TOKENS = 200_000
 // Absolute thresholds that mirror the coaching notes of the local `codeburn report` (src/workflow-insights.ts), so they
 // apply to a single person and need no peers.
 /** A task category needs this many edit prompts before its one-shot rate counts. */
@@ -118,6 +121,10 @@ interface Agg {
   plan_calls: number
   interrupted: number
   tool_errors: number
+  model_switches: number
+  model_switch_tokens: number
+  /** Re-sent context tokens by the model switched to. */
+  switchTo: Map<string, { switches: number; tokens: number }>
   fast: number
   cats: Map<string, { edit: number; one: number }>
   simpleTotal: number
@@ -132,7 +139,8 @@ async function loadAggs(store: Store, f: Filters): Promise<Agg[]> {
     `SELECT p.id AS id, p.name AS name, p.team AS team, du.project AS project, du.model AS model, du.category AS category, du.speed AS speed,
        SUM(du.cost_usd) AS cost, SUM(du.calls) AS calls, SUM(du.input) AS input, SUM(du.cache_read) AS cache_read,
        SUM(du.edit_turns) AS edit_turns, SUM(du.one_shot_turns) AS one_shot_turns, SUM(du.retries) AS retries,
-       SUM(du.plan_mode_calls) AS plan_calls, SUM(du.interrupted) AS interrupted, SUM(du.tool_errors) AS tool_errors
+       SUM(du.plan_mode_calls) AS plan_calls, SUM(du.interrupted) AS interrupted, SUM(du.tool_errors) AS tool_errors,
+       SUM(du.model_switches) AS model_switches, SUM(du.model_switch_tokens) AS model_switch_tokens
      FROM daily_usage du JOIN people p ON p.id = du.person_id WHERE du.day >= ? AND du.day <= ?${sc.sql}
      GROUP BY p.id, p.name, p.team, du.project, du.model, du.category, du.speed`,
     [f.from, f.to, ...sc.params])
@@ -142,7 +150,7 @@ async function loadAggs(store: Store, f: Filters): Promise<Agg[]> {
     if (!a) {
       a = {
         id: r.id, name: String(r.name), team: String(r.team ?? ''), cost: 0, calls: 0, input: 0, cache_read: 0, edit_turns: 0, one_shot: 0,
-        retries: 0, plan_calls: 0, interrupted: 0, tool_errors: 0, fast: 0, cats: new Map(), simpleTotal: 0, simplePremium: 0,
+        retries: 0, plan_calls: 0, interrupted: 0, tool_errors: 0, model_switches: 0, model_switch_tokens: 0, switchTo: new Map(), fast: 0, cats: new Map(), simpleTotal: 0, simplePremium: 0,
         premiumSimple: new Map(), premiumSimpleProjects: new Map(),
       }
       byId.set(r.id, a)
@@ -158,6 +166,14 @@ async function loadAggs(store: Store, f: Filters): Promise<Agg[]> {
     a.plan_calls += n(r.plan_calls)
     a.interrupted += n(r.interrupted)
     a.tool_errors += n(r.tool_errors)
+    if (n(r.model_switches) > 0) {
+      a.model_switches += n(r.model_switches)
+      a.model_switch_tokens += n(r.model_switch_tokens)
+      const to = a.switchTo.get(String(r.model)) ?? { switches: 0, tokens: 0 }
+      to.switches += n(r.model_switches)
+      to.tokens += n(r.model_switch_tokens)
+      a.switchTo.set(String(r.model), to)
+    }
     if (r.speed === 'fast') a.fast += cost
     const category = String(r.category)
     if (n(r.edit_turns) > 0) {
@@ -212,6 +228,7 @@ interface Analysis {
 }
 
 const table = (title: string, columns: string[], rows: string[][]): EvidenceTable => ({ title, columns, rows })
+const fmtTokens = (t: number) => t >= 1e6 ? `${(t / 1e6).toFixed(1)}M` : t >= 1e3 ? `${(t / 1e3).toFixed(1)}K` : String(Math.round(t))
 
 async function analyse(store: Store, f: Filters, opts: { includeCoaching: boolean }): Promise<Analysis> {
   const insights: Insight[] = []
@@ -401,6 +418,20 @@ async function analyse(store: Store, f: Filters, opts: { includeCoaching: boolea
         ],
       })
     }
+  }
+
+  // Mid-session model switches that sent the whole conversation to a model whose cache held none of it.
+  for (const a of aggs) {
+    if (a.model_switches < MODEL_SWITCH_MIN_COUNT || a.model_switch_tokens < MODEL_SWITCH_MIN_TOKENS) continue
+    const top = [...a.switchTo.entries()].sort((x, y) => y[1].tokens - x[1].tokens).slice(0, 5)
+    add({
+      id: 'model-switch-recache', severity: 'info', kind: 'training', ...who(a), value: a.model_switch_tokens,
+      title: `${a.name} switches models mid-session`,
+      detail: `${Math.round(a.model_switches)} switches re-sent ${fmtTokens(a.model_switch_tokens)} tokens of conversation. The new model's cache holds none of it, so each switch pays for the whole context again at the cache-write or input rate. Only switches made while the old cache was still warm count.`,
+      action: 'Pick the model before starting. When a task needs a different one, start a new session with a short summary instead of switching mid-conversation.',
+      evidence: [table('Switched to', ['Model', 'Switches', 'Tokens re-sent'],
+        top.map(([model, t]) => [model, String(Math.round(t.switches)), fmtTokens(t.tokens)]))],
+    })
   }
 
   // Frequent interruptions.

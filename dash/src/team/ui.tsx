@@ -50,15 +50,18 @@ export function TablePanel({
   columns,
   rows,
   csv,
+  csvHeaders,
 }: {
   title: string
   filename: string
   columns: Column[]
   rows: Array<Record<string, ReactNode>>
   csv: CsvValue[][]
+  /** Header row for the CSV when its columns differ from the table's (raw ids, unformatted counts). */
+  csvHeaders?: string[]
 }) {
   return (
-    <Panel title={title} actions={<CsvButton filename={filename} headers={columns.map((c) => c.label)} rows={csv} />}>
+    <Panel title={title} actions={<CsvButton filename={filename} headers={csvHeaders ?? columns.map((c) => c.label)} rows={csv} />}>
       <div className="overflow-x-auto">
         <DataTable columns={columns} rows={rows} />
       </div>
@@ -74,6 +77,22 @@ export function ErrorNote({ error }: { error: unknown }) {
   const e = error as ApiError
   const msg = e instanceof ApiError && e.code ? `${e.code} (${e.status})` : String((error as Error)?.message ?? error)
   return <div className="py-8 text-center text-sm text-red-500">Could not load data: {msg}</div>
+}
+
+/** A muted footnote under a page's metrics. */
+export function Note({ children }: { children: ReactNode }) {
+  return <p className="text-xs leading-relaxed text-tertiary-foreground">{children}</p>
+}
+
+/** Why the dashboards show no lines-changed figure, although clients still send the counts. */
+export function LinesChangedNote() {
+  return (
+    <Note>
+      Lines changed is deliberately not shown: the counts are misleading. Only some tools report them (Claude Code and
+      Codex), a file written in one go counts as zero lines, an edited line counts once as added and once as removed, and
+      the number of lines says nothing about the value of the work.
+    </Note>
+  )
 }
 
 export function Empty({ children = 'No usage recorded for this period.' }: { children?: ReactNode }) {

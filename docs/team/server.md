@@ -87,6 +87,8 @@ The optional `gitlab` block has its own variables; see [GitLab sign-in](#gitlab-
 
 Identity always comes from the device credential, never from the payload. Credentials, enrollment tokens and viewer
 keys are stored only as SHA-256 hashes. Spans older than 183 days (or more than a day in the future) are rejected.
+The discovery document advertises the age limit as `max_span_age_days`, and `codeburn sync push` skips older calls
+instead of sending them (it reports how many), so a `--since all` push doesn't resend old calls on every push.
 
 ## Client devices and automatic sync
 

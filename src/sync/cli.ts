@@ -25,7 +25,7 @@ import {
 } from './auth.js'
 import { createCredentialStore } from './credentials.js'
 import { readSyncConfig, type SyncConfig, writeSyncConfig, deleteSyncConfig, updateLastSync, receiptsPath, readReceipts, appendReceipt } from './config.js'
-import { collectUnsentCalls, collectUnsentAttribution, sendBatches, sendAttributionBatches, batchCalls, MAX_PER_PUSH, MAX_ATTRIBUTION_PER_PUSH, type PushResult } from './push.js'
+import { collectUnsentCalls, collectUnsentAttribution, sendBatches, sendAttributionBatches, batchCalls, splitByServerAge, spanAgeLimitDays, MAX_PER_PUSH, MAX_ATTRIBUTION_PER_PUSH, type PushResult } from './push.js'
 import { batchAttributionItems, wireProjectName, coreSyncAttributeKeys } from './otlp.js'
 import { loadPlugins, declaredSyncAttributes, currentCliVersion, type PluginLoad } from '../plugins/loader.js'
 import { collectPluginEnrichment } from '../plugins/exporter.js'
@@ -137,8 +137,10 @@ async function executePush(input: ExecutePushInput): Promise<{ result: PushResul
   const wireDetailLevel = wireDetailLevelFor(config, discoveryDoc.detail_levels)
 
   let result: PushResult = { outcome: 'complete', totalSent: 0, totalRejected: 0, totalCostSent: 0 }
-  if (unsent.length > 0) {
-    const toPush = unsent.slice(0, MAX_PER_PUSH)
+  // The automatic window is a week, so this rarely bites; it keeps one stale call from pinning a batch.
+  const { inWindow } = splitByServerAge(unsent, spanAgeLimitDays(discoveryDoc, config.authMode))
+  if (inWindow.length > 0) {
+    const toPush = inWindow.slice(0, MAX_PER_PUSH)
     const batches = batchCalls(toPush, discoveryDoc.max_batch_size)
     result = await sendBatches({
       endpoint,
@@ -674,7 +676,11 @@ export function registerSyncCommands(program: Command): void {
           process.stderr.write(`[dry-run] Auth: valid (Bearer token obtained)\n`)
         }
 
-        // Collect data
+        // Collect data. Price with the same tables `report` uses (live LiteLLM
+        // cache over the bundled snapshot); without this every pushed cost came
+        // from the bundled fallback and could differ from the local report.
+        const { loadPricing } = await import('../models.js')
+        await loadPricing()
         const { parseAllSessions } = await import('../parser.js')
         const { getDateRange } = await import('../cli-date.js')
 
@@ -711,7 +717,14 @@ export function registerSyncCommands(program: Command): void {
           : undefined
 
         // Flatten + filter against sent-ledger
-        const { allCalls, unsent, held, frozen } = collectUnsentCalls(projects, Date.now(), { plans })
+        const collected = collectUnsentCalls(projects, Date.now(), { plans })
+        const { allCalls, held, frozen } = collected
+        // Calls past the server's age limit would only be rejected, and a rejection holds back their whole batch.
+        const maxAgeDays = spanAgeLimitDays(discoveryDoc, config.authMode)
+        const { inWindow: unsent, tooOld } = splitByServerAge(collected.unsent, maxAgeDays)
+        const tooOldNote = tooOld.length > 0
+          ? `${tooOld.length} calls older than the server's ${maxAgeDays}-day limit skipped`
+          : ''
 
         // Plugin socket: load declared sync attribute keys once for the dry-run
         // disclosure and the real-push wire guard. Loader is directory-stat only
@@ -738,7 +751,8 @@ export function registerSyncCommands(program: Command): void {
         if (opts.dryRun) {
           const toPushCount = Math.min(unsent.length, MAX_PER_PUSH)
           const cost = unsent.slice(0, MAX_PER_PUSH).reduce((s, c) => s + c.call.costUSD, 0)
-          process.stderr.write(`[dry-run] Window: ${opts.since} — ${allCalls.length} calls total, ${allCalls.length - unsent.length - held.length - frozen.length} already synced\n`)
+          process.stderr.write(`[dry-run] Window: ${opts.since} — ${allCalls.length} calls total, ${allCalls.length - unsent.length - tooOld.length - held.length - frozen.length} already synced\n`)
+          if (tooOldNote) process.stderr.write(`[dry-run] ${tooOldNote}\n`)
           if (held.length > 0) {
             process.stderr.write(`[dry-run] ${held.length} calls held: their session is still reconciling and its values can still change (#988). They push once it settles.\n`)
           }
@@ -815,9 +829,10 @@ export function registerSyncCommands(program: Command): void {
           const pendingNote = [
             held.length > 0 ? `${held.length} held while their session is still reconciling` : '',
             frozen.length > 0 ? `${frozen.length} frozen behind an already-synced rollup` : '',
+            tooOldNote,
           ].filter(Boolean).join(', ')
           process.stderr.write(pendingNote
-            ? `Nothing to push yet (${allCalls.length - held.length - frozen.length} calls already synced, ${pendingNote}).\n`
+            ? `Nothing to push yet (${allCalls.length - held.length - frozen.length - tooOld.length} calls already synced, ${pendingNote}).\n`
             : `Nothing to push (${allCalls.length} calls already synced).\n`)
           updateLastSync()
           await maybeSendFindings({ config, findingsPath: discoveryDoc?.findings_path, bearer: tokens.access_token, log: msg => process.stderr.write(`${msg}\n`) })
@@ -923,6 +938,7 @@ export function registerSyncCommands(program: Command): void {
         if (result.totalRejected > 0) {
           process.stderr.write(`  ${result.totalRejected} spans rejected (will retry on next push)\n`)
         }
+        if (tooOldNote) process.stderr.write(`  ${tooOldNote}\n`)
         if (unsent.length > MAX_PER_PUSH) {
           process.stderr.write(`  ${unsent.length - MAX_PER_PUSH} calls remaining (safety limit). Run \`codeburn sync push\` again.\n`)
         }
@@ -951,8 +967,9 @@ export function registerSyncCommands(program: Command): void {
   auto
     .command('enable')
     .description('Enable automatic scheduled pushes (requires --accept to proceed)')
-    .option('--cadence <cadence>', 'Schedule frequency: daily or hourly', 'daily')
+    .option('--cadence <cadence>', 'Schedule frequency: daily or hourly (default: the one accepted before, else daily)')
     .option('--attribution', 'Also send work-matching data (session-to-commit links)')
+    .option('--no-attribution', 'Do not send work-matching data (default: the choice accepted before, else off)')
     .option('--accept', 'Accept the disclosure and enable automatic sync')
     .action(async (opts: { cadence?: string; attribution?: boolean; accept?: boolean }) => {
       const config = readSyncConfig()
@@ -961,7 +978,10 @@ export function registerSyncCommands(program: Command): void {
         process.exit(1)
       }
 
-      const cadence = opts.cadence as 'daily' | 'hourly'
+      // Accepting again (after an update changed what is sent) keeps the schedule and work-matching choice the
+      // person accepted before, unless a flag says otherwise.
+      const previous = config.auto?.accepted
+      const cadence = (opts.cadence ?? previous?.cadence ?? 'daily') as 'daily' | 'hourly'
       if (cadence !== 'daily' && cadence !== 'hourly') {
         process.stderr.write('Invalid --cadence. Use: daily or hourly\n')
         process.exit(1)
@@ -978,7 +998,7 @@ export function registerSyncCommands(program: Command): void {
           return { key, disclosure }
         })
 
-        const workMatching = opts.attribution ?? false
+        const workMatching = opts.attribution ?? previous?.attribution ?? false
         const fingerprintInput = buildAcceptanceFingerprintInput(config, allKeys, workMatching, cadence)
         const fingerprint = computeAcceptanceFingerprint(fingerprintInput)
 
@@ -1022,7 +1042,7 @@ export function registerSyncCommands(program: Command): void {
         } catch (schedErr) {
           process.stderr.write(`Warning: ${(schedErr as Error).message}\n`)
           process.stderr.write(`Acceptance was stored and will take effect, but the schedule could not be installed.\n`)
-          process.stderr.write(`Run: codeburn sync auto enable --cadence ${cadence} --attribution${opts.attribution ? '' : ''}\n`)
+          process.stderr.write(`Run: codeburn sync auto enable --cadence ${cadence}${workMatching ? ' --attribution' : ''}\n`)
           process.stderr.write(`Or install manually: ${manualScheduleHint()}\n`)
           process.exit(1)
         }
@@ -1252,7 +1272,9 @@ export function registerSyncCommands(program: Command): void {
         }
 
         // Collect data - 7 day window. Sent-ledger prevents duplicates across runs,
-        // so daily/hourly rescans don't lose anything.
+        // so daily/hourly rescans don't lose anything. Same pricing as `report` (see push).
+        const { loadPricing } = await import('../models.js')
+        await loadPricing()
         const { parseAllSessions } = await import('../parser.js')
         const { getDateRange } = await import('../cli-date.js')
 

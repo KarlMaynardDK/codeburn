@@ -26,7 +26,7 @@ export function newId(prefix: string): string {
   return prefix + randomBytes(8).toString('hex')
 }
 
-export const SCHEMA_VERSION = 4
+export const SCHEMA_VERSION = 5
 
 /**
  * Span columns added in schema v2, with their defaults. Spans stored before v2 read as zero, empty or
@@ -52,20 +52,21 @@ function dailyUsageTable(real: string, int: string): string {
   const sums = ['input', 'output', 'reasoning', 'cache_read', 'cache_write', 'cache_write_1h', 'web_search'].map(c => `${c} ${int} NOT NULL`)
   const costs = ['cost_usd', 'estimated_cost_usd', 'covered_cost_usd', 'savings_usd'].map(c => `${c} ${real} NOT NULL`)
   const counts = ['nano_aiu', 'calls', 'lines_added', 'lines_removed', 'tool_errors', 'interrupted', 'user_modified', 'active_ms',
-    'tool_wait_ms', 'turns', 'edit_turns', 'one_shot_turns', 'retries', 'plan_mode_calls'].map(c => `${c} ${int} NOT NULL`)
+    'tool_wait_ms', 'turns', 'edit_turns', 'one_shot_turns', 'retries', 'plan_mode_calls', 'model_switches', 'model_switch_tokens'].map(c => `${c} ${int} NOT NULL`)
   return `CREATE TABLE IF NOT EXISTS daily_usage (person_id TEXT NOT NULL, day TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, project TEXT NOT NULL, category TEXT NOT NULL, speed TEXT NOT NULL, route TEXT NOT NULL, billing TEXT NOT NULL, ${[...sums, ...costs, ...counts].join(', ')}, PRIMARY KEY (person_id, day, provider, model, project, category, speed, route, billing))`
 }
 
 /** Rolls spans up into daily_usage. `where` narrows the spans (empty for a full rebuild). */
 function dailyUsageInsert(where: string): string {
-  return `INSERT INTO daily_usage (person_id, day, provider, model, project, category, speed, route, billing, input, output, reasoning, cache_read, cache_write, cache_write_1h, web_search, cost_usd, estimated_cost_usd, covered_cost_usd, savings_usd, nano_aiu, calls, lines_added, lines_removed, tool_errors, interrupted, user_modified, active_ms, tool_wait_ms, turns, edit_turns, one_shot_turns, retries, plan_mode_calls)
+  return `INSERT INTO daily_usage (person_id, day, provider, model, project, category, speed, route, billing, input, output, reasoning, cache_read, cache_write, cache_write_1h, web_search, cost_usd, estimated_cost_usd, covered_cost_usd, savings_usd, nano_aiu, calls, lines_added, lines_removed, tool_errors, interrupted, user_modified, active_ms, tool_wait_ms, turns, edit_turns, one_shot_turns, retries, plan_mode_calls, model_switches, model_switch_tokens)
     SELECT person_id, day, provider, model, project, category, speed, route, billing,
       SUM(input), SUM(output), SUM(reasoning), SUM(cache_read), SUM(cache_write), SUM(cache_write_1h), SUM(web_search), SUM(cost_usd),
       SUM(CASE WHEN cost_estimated = 1 THEN cost_usd ELSE 0 END), SUM(CASE WHEN subscription_covered = 1 THEN cost_usd ELSE 0 END),
       SUM(savings_usd), SUM(nano_aiu), SUM(request_weight), SUM(lines_added), SUM(lines_removed), SUM(tool_errors), SUM(interrupted),
       SUM(user_modified), SUM(active_ms), SUM(tool_wait_ms), SUM(turn_start), SUM(turn_start * turn_has_edits),
       SUM(CASE WHEN turn_start = 1 AND turn_has_edits = 1 AND turn_retries = 0 THEN 1 ELSE 0 END),
-      SUM(turn_start * turn_has_edits * turn_retries), SUM(plan_mode)
+      SUM(turn_start * turn_has_edits * turn_retries), SUM(plan_mode),
+      SUM(CASE WHEN model_switch_tokens > 0 THEN 1 ELSE 0 END), SUM(model_switch_tokens)
     FROM spans ${where} GROUP BY person_id, day, provider, model, project, category, speed, route, billing`
 }
 
@@ -74,10 +75,11 @@ function migrationV2(real: string, int: string): string[] {
   return [
     ...spanV2Columns(real, int).map(col => `ALTER TABLE spans ADD COLUMN ${col}`),
     `ALTER TABLE devices ADD COLUMN coverage_through TEXT`,
+    // Recreated empty here: migrationV5, which always follows, drops it again and refills it from spans once they
+    // have every column the rollup reads.
     `DROP TABLE daily_usage`,
     dailyUsageTable(real, int),
     `CREATE INDEX IF NOT EXISTS daily_usage_day ON daily_usage (day)`,
-    dailyUsageInsert(''),
   ]
 }
 
@@ -90,6 +92,20 @@ function migrationV4(int: string, from: number): string[] {
   return [
     `ALTER TABLE spans ADD COLUMN real_project TEXT`,
     ...(from >= 2 ? [`ALTER TABLE work_sessions ADD COLUMN hidden ${int} NOT NULL DEFAULT 0`] : []),
+  ]
+}
+
+/**
+ * Statements that move a v4 database to v5: the context tokens a call re-sent after a mid-session model switch, and
+ * its daily rollup. daily_usage is derived, so it is dropped and rebuilt (older spans read as no switch).
+ */
+function migrationV5(real: string, int: string): string[] {
+  return [
+    `ALTER TABLE spans ADD COLUMN model_switch_tokens ${int} NOT NULL DEFAULT 0`,
+    `DROP TABLE daily_usage`,
+    dailyUsageTable(real, int),
+    `CREATE INDEX IF NOT EXISTS daily_usage_day ON daily_usage (day)`,
+    dailyUsageInsert(''),
   ]
 }
 
@@ -110,7 +126,7 @@ export function schemaStatements(real: string, int: string): string[] {
     `CREATE TABLE IF NOT EXISTS viewers (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, revoked_at TEXT)`,
     `CREATE TABLE IF NOT EXISTS viewer_sessions (token_hash TEXT PRIMARY KEY, viewer_id TEXT NOT NULL, expires_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS sso_sessions (token_hash TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, person_id TEXT, subject TEXT NOT NULL, email TEXT, expires_at TEXT NOT NULL)`,
-    `CREATE TABLE IF NOT EXISTS spans (span_id TEXT PRIMARY KEY, person_id TEXT NOT NULL, device_id TEXT NOT NULL, trace_id TEXT NOT NULL, ts TEXT NOT NULL, day TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, project TEXT NOT NULL, category TEXT NOT NULL, input ${int} NOT NULL, output ${int} NOT NULL, cache_read ${int} NOT NULL, cache_write ${int} NOT NULL, cost_usd ${real} NOT NULL, detail_level TEXT NOT NULL, work_unit_id TEXT, session_role TEXT, call_count ${int}, session_duration_ms ${int}, ${spanV2Columns(real, int).join(', ')}, real_project TEXT)`,
+    `CREATE TABLE IF NOT EXISTS spans (span_id TEXT PRIMARY KEY, person_id TEXT NOT NULL, device_id TEXT NOT NULL, trace_id TEXT NOT NULL, ts TEXT NOT NULL, day TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, project TEXT NOT NULL, category TEXT NOT NULL, input ${int} NOT NULL, output ${int} NOT NULL, cache_read ${int} NOT NULL, cache_write ${int} NOT NULL, cost_usd ${real} NOT NULL, detail_level TEXT NOT NULL, work_unit_id TEXT, session_role TEXT, call_count ${int}, session_duration_ms ${int}, ${spanV2Columns(real, int).join(', ')}, real_project TEXT, model_switch_tokens ${int} NOT NULL DEFAULT 0)`,
     `CREATE INDEX IF NOT EXISTS spans_person_day ON spans (person_id, day)`,
     `CREATE INDEX IF NOT EXISTS spans_trace ON spans (person_id, trace_id)`,
     dailyUsageTable(real, int),
@@ -146,6 +162,7 @@ export async function migrate(db: Db): Promise<void> {
     if (from < 2) for (const stmt of migrationV2(real, int)) await q.all(stmt)
     if (from < 3) for (const stmt of migrationV3()) await q.all(stmt)
     if (from < 4) for (const stmt of migrationV4(int, from)) await q.all(stmt)
+    if (from < 5) for (const stmt of migrationV5(real, int)) await q.all(stmt)
     if (!stored) await q.all('INSERT INTO schema_version (version) VALUES (?)', [SCHEMA_VERSION])
     else if (from < SCHEMA_VERSION) await q.all('UPDATE schema_version SET version = ?', [SCHEMA_VERSION])
   })
@@ -249,6 +266,8 @@ export interface SpanRecord {
   mcp_tools: string[]
   skills: string[]
   subagent_types: string[]
+  /** Context tokens re-sent on the first call after a warm-cache model switch; absent or 0 otherwise. */
+  model_switch_tokens?: number
 }
 
 /** One `codeburn.session.attribution` span: the repo, PR links and commit count of a session. */
@@ -278,7 +297,7 @@ const SPAN_COLUMNS = [
   'detail_level', 'work_unit_id', 'session_role', 'call_count', 'session_duration_ms', 'speed', 'route', 'billing', 'cost_estimated',
   'subscription_covered', 'reasoning', 'web_search', 'cache_write_1h', 'savings_usd', 'nano_aiu', 'request_weight', 'lines_added',
   'lines_removed', 'tool_errors', 'interrupted', 'user_modified', 'active_ms', 'tool_wait_ms', 'turn_start', 'turn_has_edits',
-  'turn_retries', 'plan_mode', 'mcp_tools', 'skills', 'subagent_types', 'real_project',
+  'turn_retries', 'plan_mode', 'mcp_tools', 'skills', 'subagent_types', 'real_project', 'model_switch_tokens',
 ] as const
 
 const bit = (b: boolean) => (b ? 1 : 0)
@@ -291,6 +310,7 @@ function spanValues(s: SpanRecord, day: string): unknown[] {
     bit(s.subscription_covered), s.reasoning, s.web_search, s.cache_write_1h, s.savings_usd, s.nano_aiu, s.request_weight, s.lines_added,
     s.lines_removed, s.tool_errors, bit(s.interrupted), bit(s.user_modified), s.active_ms, s.tool_wait_ms, bit(s.turn_start), bit(s.turn_has_edits),
     s.turn_retries, bit(s.plan_mode), nameList(s.mcp_tools), nameList(s.skills), nameList(s.subagent_types), s.real_project ?? null,
+    s.model_switch_tokens ?? 0,
   ]
 }
 

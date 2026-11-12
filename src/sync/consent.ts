@@ -60,6 +60,7 @@ export const CORE_SYNC_FIELD_MEANINGS: ReadonlyMap<string, string> = new Map([
   ['ai.skills', 'names of the skills the call used'],
   ['ai.subagent_types', 'types of subagents the call started'],
   ['ai.plan_mode', 'whether the call used plan mode'],
+  ['ai.model_switch_tokens', 'on the first call after a mid-session model switch: how many context tokens were sent again'],
 ])
 
 export interface FingerprintInput {

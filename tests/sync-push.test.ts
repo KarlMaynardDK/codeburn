@@ -643,3 +643,40 @@ describe('parseRetryAfterMs', () => {
     expect(parseRetryAfterMs('-5')).toBeNull()
   })
 })
+
+describe('splitByServerAge', () => {
+  const now = Date.parse('2026-11-11T12:00:00.000Z')
+  const at = (key: string, timestamp: string): CallWithSession => {
+    const c = makeCws(key)
+    return { ...c, call: { ...c.call, timestamp } }
+  }
+
+  it('skips calls past the age limit so they cannot pin a batch', async () => {
+    const { splitByServerAge } = await import('../src/sync/push.js')
+    const calls = [
+      at('old', '2026-05-01T00:00:00.000Z'),
+      // Inside 183 days but within the in-flight margin of the cutoff: skipped too.
+      at('edge', new Date(now - 183 * 86_400_000 + 30 * 60_000).toISOString()),
+      at('fresh', '2026-11-10T00:00:00.000Z'),
+      at('undatable', 'not a date'),
+    ]
+    const { inWindow, tooOld } = splitByServerAge(calls, 183, now)
+    expect(tooOld.map(c => c.call.deduplicationKey)).toEqual(['old', 'edge'])
+    expect(inWindow.map(c => c.call.deduplicationKey)).toEqual(['fresh', 'undatable'])
+  })
+
+  it('keeps everything when the server states no limit', async () => {
+    const { splitByServerAge } = await import('../src/sync/push.js')
+    const calls = [at('old', '2020-01-01T00:00:00.000Z')]
+    expect(splitByServerAge(calls, undefined, now)).toEqual({ inWindow: calls, tooOld: [] })
+  })
+
+  it('uses the advertised limit, else the team-server default for enrollment, else none', async () => {
+    const { spanAgeLimitDays, TEAM_SERVER_DEFAULT_MAX_SPAN_AGE_DAYS } = await import('../src/sync/push.js')
+    expect(spanAgeLimitDays({ max_span_age_days: 90 }, 'enrollment')).toBe(90)
+    expect(spanAgeLimitDays({}, 'enrollment')).toBe(TEAM_SERVER_DEFAULT_MAX_SPAN_AGE_DAYS)
+    expect(spanAgeLimitDays(undefined, 'enrollment')).toBe(TEAM_SERVER_DEFAULT_MAX_SPAN_AGE_DAYS)
+    expect(spanAgeLimitDays({}, 'oidc')).toBeUndefined()
+    expect(spanAgeLimitDays(undefined, undefined)).toBeUndefined()
+  })
+})

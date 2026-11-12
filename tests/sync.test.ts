@@ -46,6 +46,14 @@ describe('parseDiscoveryDoc', () => {
     expect(doc.findings_path).toBe('/v1/findings')
     expect(doc.org_name).toBe('Acme')
     expect(doc.issuer).toBe('')
+    expect(doc.max_span_age_days).toBeUndefined()
+  })
+
+  it('reads max_span_age_days and drops a non-positive or non-numeric one', () => {
+    const base = { version: 1, auth: 'enrollment', enroll_path: '/v1/enroll' }
+    expect(parseDiscoveryDoc({ ...base, max_span_age_days: 183 }).max_span_age_days).toBe(183)
+    expect(parseDiscoveryDoc({ ...base, max_span_age_days: 0 }).max_span_age_days).toBeUndefined()
+    expect(parseDiscoveryDoc({ ...base, max_span_age_days: '183' }).max_span_age_days).toBeUndefined()
   })
 
   it('enrollment doc defaults detail_levels to summary and requires enroll_path', () => {

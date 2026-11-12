@@ -81,8 +81,21 @@ export function originFromRequest(host: string | undefined, forwardedProto: stri
 
 const MIN_NODE = '22.13'
 
+/**
+ * The team name for the installers' consent question: org_name reduced to a safe, quote-free set of characters (it is
+ * interpolated into single-quoted sh and PowerShell strings), else the server's host.
+ */
+export function teamLabel(orgName: string | undefined, origin: string): string {
+  const org = (orgName ?? '').replace(/[^A-Za-z0-9 ._&()+-]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80)
+  if (org) return org
+  try { return new URL(origin).host } catch { return 'CodeBurn' }
+}
+
+/** What an already-connected machine runs after agreeing on an update: accept, then re-send all history. */
+export const REFRESH_COMMANDS = ['codeburn sync auto enable --accept', 'codeburn sync reset --confirm', 'codeburn sync push --since all'] as const
+
 /** `origin` must already be validated (scheme://safe-host[:port]); nothing else is interpolated. */
-export function installShScript(origin: string, pkg: ClientPackage, installMode: InstallMode = 'manual'): string {
+export function installShScript(origin: string, pkg: ClientPackage, installMode: InstallMode = 'manual', orgName = ''): string {
   const pkgUrl = `${origin}${pkg.path}`
   return `#!/bin/sh
 # CodeBurn team client installer, served by ${origin}
@@ -92,8 +105,32 @@ set -eu
 BASE_URL='${origin}'
 PKG_URL='${pkgUrl}'
 PKG_VERSION='${pkg.version}'
+TEAM_LABEL='${teamLabel(orgName, origin)}'
 
 die() { printf 'codeburn install: %s\\n' "$1" >&2; exit 1; }
+
+# An update on a machine that is already connected: ask once, and on yes accept what the new build sends and re-send
+# all history so the team's numbers are rebuilt with it. The answer is read from the terminal, because the script
+# itself arrives on stdin; with no terminal the answer is no.
+refresh_sharing() {
+  ANSWER=''
+  if (: </dev/tty) 2>/dev/null; then
+    printf '\\nDo you consent to uploading your AI usage data to the %s team server? [y/N] ' "$TEAM_LABEL" >/dev/tty
+    IFS= read -r ANSWER </dev/tty || ANSWER=''
+  fi
+  case "$ANSWER" in
+    y|Y|yes|Yes|YES)
+${installMode === 'all' ? `      "$1" sync config all on </dev/null
+` : ''}      "$1" sync auto enable --accept </dev/null || die 'codeburn sync auto enable --accept failed.'
+      "$1" sync reset --confirm </dev/null
+      "$1" sync push --since all </dev/null || die 'codeburn sync push --since all failed. Run it again later.'
+      ;;
+    *)
+      printf '\\nNothing new is uploaded until you agree: automatic sync stays paused if this build sends something new.\\n'
+      printf 'To agree later, run:\\n${REFRESH_COMMANDS.map(c => `  ${c}`).join('\\n')}\\n'
+      ;;
+  esac
+}
 
 main() {
   TOKEN=''
@@ -145,6 +182,8 @@ ${installMode === 'all' ? `    printf '\\nThis server is set to share everything
     if ! "$CB" sync auto enable </dev/null; then
       printf '\\nAutomatic sync is NOT enabled yet. Read the disclosure above and, if you agree, run:\\n  codeburn sync auto enable --accept\\n'
     fi`}
+  elif "$CB" sync status >/dev/null 2>&1 </dev/null; then
+    refresh_sharing "$CB"
   else
     printf '\\nInstalled. To connect this machine, ask your admin for an enrollment token and run:\\n  codeburn sync setup %s --token <token>\\n' "$BASE_URL"
   fi
@@ -155,7 +194,7 @@ main "$@"
 `
 }
 
-export function installPs1Script(origin: string, pkg: ClientPackage, installMode: InstallMode = 'manual'): string {
+export function installPs1Script(origin: string, pkg: ClientPackage, installMode: InstallMode = 'manual', orgName = ''): string {
   const pkgUrl = `${origin}${pkg.path}`
   return `# CodeBurn team client installer, served by ${origin}
 # Usage: & ([scriptblock]::Create((irm ${origin}/install.ps1))) [-Token cbe_...] [-Detail summary|sessions]
@@ -169,6 +208,7 @@ $ErrorActionPreference = 'Stop'
 $BaseUrl = '${origin}'
 $PkgUrl = '${pkgUrl}'
 $PkgVersion = '${pkg.version}'
+$TeamLabel = '${teamLabel(orgName, origin)}'
 
 function Fail([string]$Message) { throw "codeburn install: $Message" }
 
@@ -225,9 +265,38 @@ ${installMode === 'all' ? `  Write-Host ''
     Write-Host '  codeburn sync auto enable --accept'
   }`}
 } else {
-  Write-Host ''
-  Write-Host 'Installed. To connect this machine, ask your admin for an enrollment token and run:'
-  Write-Host "  codeburn sync setup $BaseUrl --token <token>"
+  $ErrorActionPreference = 'Continue'
+  & $Cb sync status *> $null
+  $Connected = ($LASTEXITCODE -eq 0)
+  $ErrorActionPreference = 'Stop'
+  if ($Connected) {
+    # An update on a machine that is already connected: ask once, and on yes accept what the new build sends and
+    # re-send all history so the team's numbers are rebuilt with it. With no interactive console the answer is no.
+    $Answer = ''
+    try {
+      if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+        $Answer = Read-Host "Do you consent to uploading your AI usage data to the $TeamLabel team server? [y/N]"
+      }
+    } catch { $Answer = '' }
+    if ($Answer -match '^\\s*(y|yes)\\s*$') {
+${installMode === 'all' ? `      & $Cb sync config all on
+      if ($LASTEXITCODE -ne 0) { Fail 'codeburn sync config all on failed.' }
+` : ''}      & $Cb sync auto enable --accept
+      if ($LASTEXITCODE -ne 0) { Fail 'codeburn sync auto enable --accept failed.' }
+      & $Cb sync reset --confirm
+      & $Cb sync push --since all
+      if ($LASTEXITCODE -ne 0) { Fail 'codeburn sync push --since all failed. Run it again later.' }
+    } else {
+      Write-Host ''
+      Write-Host 'Nothing new is uploaded until you agree: automatic sync stays paused if this build sends something new.'
+      Write-Host 'To agree later, run:'
+${REFRESH_COMMANDS.map(c => `      Write-Host '  ${c}'`).join('\n')}
+    }
+  } else {
+    Write-Host ''
+    Write-Host 'Installed. To connect this machine, ask your admin for an enrollment token and run:'
+    Write-Host "  codeburn sync setup $BaseUrl --token <token>"
+  }
 }
 Write-Host ''
 Write-Host "What to run next, upgrading and uninstalling: $BaseUrl/help"

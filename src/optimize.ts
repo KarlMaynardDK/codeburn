@@ -12,12 +12,13 @@ import { readSessionLines, readSessionFileSync } from './fs-utils.js'
 import { discoverAllSessions, providerDisplayName } from './providers/index.js'
 import { parseJsonlLine, shouldSkipLine } from './parser.js'
 import type { DateRange, ProjectSummary, SessionSummary } from './types.js'
-import { cacheWriteCostPerToken, getModelCosts, type ModelCosts } from './models.js'
+import { cacheWriteCostPerToken, getModelCosts, getShortModelName, type ModelCosts } from './models.js'
 import { formatCost } from './currency.js'
 import { formatTokens } from './format.js'
 import { recommendModelDefault, type ModelDefaultRecommendation } from './act/model-defaults.js'
 import { appliedFixGlyph, formatAppliedFix, type AppliedFix } from './act/types.js'
 import { isUserStartedSession, userStartedProjects } from './session-population.js'
+import { modelSwitchesInSession } from './model-switch.js'
 import { countSessions, inferSessionProvider, sessionBillableOutputTokens } from './session-output.js'
 import { aggregateFileChurn, buildCoachingNotes, scanUserCorrections, medianTimeToFirstEditMs, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 
@@ -117,6 +118,10 @@ const LOW_CACHE_HIT_TARGET_PERCENT = 80
 const LOW_CACHE_HIT_MIN_INPUT_TOKENS = CONTEXT_BLOAT_MIN_INPUT_TOKENS
 const LOW_CACHE_HIT_MIN_CALLS = 5
 const LOW_CACHE_HIT_PREVIEW = 5
+// Model-switch re-cache thresholds for the finding; detection lives in model-switch.ts.
+const MODEL_SWITCH_PREVIEW = 5
+const MODEL_SWITCH_HIGH_MIN_SWITCHES = 10
+const MODEL_SWITCH_LOW_MAX_SWITCHES = 2
 const WORTH_IT_MIN_COST_USD = 2
 const WORTH_IT_NO_EDIT_MIN_COST_USD = 3
 // A zero-edit session's full cost is an upper bound on recoverable waste, not
@@ -367,6 +372,7 @@ export type FindingId =
   | 'context-heavy-sessions'
   | 'cost-outliers'
   | 'low-cache-hit-sessions'
+  | 'model-switch-recache'
   | 'claude-md-too-long'
   | 'bash-output-cap'
   | 'unused-agents'
@@ -406,6 +412,7 @@ export const FINDING_CLASS: Record<FindingId, FindingClass> = {
   'context-heavy-sessions': 'keep',  // context-heavy work is often load-bearing
   'cost-outliers': 'nudge',
   'low-cache-hit-sessions': 'nudge',
+  'model-switch-recache': 'nudge',
   'claude-md-too-long': 'nudge',     // trimming is a judgement call, not a rule block
   'bash-output-cap': 'fix',
   'unused-agents': 'fix',
@@ -447,6 +454,7 @@ export const FINDING_BASIS: Record<FindingId, FindingBasis> = {
   'context-heavy-sessions': 'measured',    // counted input/cache tokens above the target ratio
   'cost-outliers': 'measured',             // counted session tokens above the peer average
   'low-cache-hit-sessions': 'estimated',   // counted tokens below the target hit ratio x read discount
+  'model-switch-recache': 'estimated',     // counted re-sent tokens x read discount; USD at the new model's rates
   'claude-md-too-long': 'estimated',       // lines x CLAUDEMD_TOKENS_PER_LINE
   'bash-output-cap': 'estimated',          // chars x BASH_TOKENS_PER_CHAR
   'unused-agents': 'estimated',            // count x TOKENS_PER_AGENT_DEF
@@ -3985,6 +3993,101 @@ export function detectLowCacheHitSessions(projects: ProjectSummary[]): WasteFind
   }
 }
 
+export type ModelSwitchEvent = {
+  project: string
+  sessionId: string
+  from: string
+  to: string
+  timestamp: string
+  /// Context tokens re-sent to the new model (see modelSwitchesInSession).
+  carriedTokens: number
+  /// What re-sending cost above reading the same tokens from cache, at the
+  /// new model's rates. Null when the model has no known price.
+  extraUSD: number | null
+}
+
+/// Every warm-cache model switch in the user-started sessions, priced at the
+/// new model's rates. Subagent transcripts are skipped: their context is
+/// fresh by design.
+export function findModelSwitchEvents(projects: ProjectSummary[], pricing?: FindingPricing): ModelSwitchEvent[] {
+  const events: ModelSwitchEvent[] = []
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      if (!isOptimizeSession(session)) continue
+      for (const { call, from, carriedTokens } of modelSwitchesInSession(session)) {
+        let extraUSD: number | null = null
+        const costs = pricing?.costs(call.model) ?? null
+        if (costs) {
+          // Split the carried tokens the way the call reported them:
+          // cache writes first, then plain input.
+          const written = Math.min(call.usage.cacheCreationInputTokens, carriedTokens)
+          const plain = carriedTokens - written
+          extraUSD = written * Math.max(0, costs.cacheWriteCostPerToken - costs.cacheReadCostPerToken)
+            + plain * Math.max(0, costs.inputCostPerToken - costs.cacheReadCostPerToken)
+        }
+        events.push({
+          project: project.project,
+          sessionId: session.sessionId,
+          from,
+          to: call.model,
+          timestamp: call.timestamp,
+          carriedTokens,
+          extraUSD,
+        })
+      }
+    }
+  }
+  return events
+}
+
+export function detectModelSwitchRecache(projects: ProjectSummary[], pricing?: FindingPricing): WasteFinding | null {
+  const events = findModelSwitchEvents(projects, pricing)
+  if (events.length === 0) return null
+
+  type SessionRow = { project: string; sessionId: string; switches: number; carried: number; pairs: Set<string> }
+  const bySession = new Map<string, SessionRow>()
+  for (const e of events) {
+    const id = `${e.project}\0${e.sessionId}`
+    const row = bySession.get(id) ?? { project: e.project, sessionId: e.sessionId, switches: 0, carried: 0, pairs: new Set<string>() }
+    row.switches++
+    row.carried += e.carriedTokens
+    row.pairs.add(`${getShortModelName(e.from)} -> ${getShortModelName(e.to)}`)
+    bySession.set(id, row)
+  }
+  const rows = [...bySession.values()].sort((a, b) =>
+    b.carried - a.carried || a.project.localeCompare(b.project) || a.sessionId.localeCompare(b.sessionId))
+
+  const preview = rows.slice(0, MODEL_SWITCH_PREVIEW)
+  const list = preview
+    .map(r => `${r.project}/${r.sessionId}: ${r.switches} switch${r.switches === 1 ? '' : 'es'} (${[...r.pairs].join(', ')}), ${formatTokens(r.carried)} re-sent`)
+    .join('; ')
+  const extra = rows.length > preview.length ? `; +${rows.length - preview.length} more` : ''
+  const totalCarried = events.reduce((sum, e) => sum + e.carriedTokens, 0)
+  const tokensSaved = Math.round(totalCarried * (1 - CACHE_READ_DISCOUNT))
+  const priced = events.every(e => e.extraUSD !== null)
+  const savingsUSD = priced ? events.reduce((sum, e) => sum + (e.extraUSD ?? 0), 0) : undefined
+
+  let impact: Impact
+  if (events.length >= MODEL_SWITCH_HIGH_MIN_SWITCHES || totalCarried >= CONTEXT_BLOAT_HIGH_INPUT_TOKENS) impact = 'high'
+  else if (events.length <= MODEL_SWITCH_LOW_MAX_SWITCHES && totalCarried < CONTEXT_BLOAT_LOW_INPUT_TOKENS) impact = 'low'
+  else impact = 'medium'
+
+  return {
+    id: 'model-switch-recache',
+    title: `${events.length} mid-session model switch${events.length === 1 ? '' : 'es'} re-sent the context`,
+    explanation: `Switching models mid-session sends the whole conversation so far to the new model. Its cache holds none of it, so those tokens are paid at the cache-write or input rate instead of the cache-read rate: ${list}${extra}. Only switches made while the old cache was still warm are counted.`,
+    impact,
+    tokensSaved,
+    ...(savingsUSD !== undefined ? { savingsUSD } : {}),
+    fix: {
+      type: 'paste',
+      destination: 'manual',
+      label: 'Switch models at session boundaries:',
+      text: 'Pick the model before you start. When a task needs a different one, start a new session with a short summary of where you are instead of switching mid-conversation.',
+    },
+  }
+}
+
 function findYoungProjectFirstSessionIds(projects: ProjectSummary[]): Set<string> {
   const firstSessionIds = new Set<string>()
 
@@ -4247,6 +4350,7 @@ export async function scanAndDetect(
     () => detectContextBloat(behavioralProjects, lowWorthSessionIds, provider),
     () => detectSessionOutliers(behavioralProjects, outlierExclusions, provider),
     () => detectLowCacheHitSessions(behavioralProjects),
+    () => detectModelSwitchRecache(behavioralProjects, pricing),
     claudeOnly(() => detectBloatedClaudeMd(projectCwds)),
     claudeOnly(() => detectBashBloat()),
     claudeOnly(() => detectRecurringContext(openers)),

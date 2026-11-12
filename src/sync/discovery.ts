@@ -11,6 +11,8 @@ export interface CodeburnDiscoveryDoc {
   scopes: string[]
   traces_path: string
   max_batch_size: number
+  /** Oldest span (in days) the server accepts; older ones are rejected. Absent = no stated limit. */
+  max_span_age_days?: number
   /** "enrollment" = self-hosted team server (no IdP); otherwise OIDC. */
   auth?: 'enrollment' | 'oidc'
   enroll_path?: string
@@ -123,6 +125,10 @@ export function parseDiscoveryDoc(raw: unknown): CodeburnDiscoveryDoc {
     ? doc.max_batch_size
     : 1000
 
+  const max_span_age_days = typeof doc.max_span_age_days === 'number' && Number.isFinite(doc.max_span_age_days) && doc.max_span_age_days > 0
+    ? doc.max_span_age_days
+    : undefined
+
   const levels = Array.isArray(doc.detail_levels)
     ? doc.detail_levels.filter((l): l is DetailLevel => l === 'summary' || l === 'sessions')
     : []
@@ -135,6 +141,7 @@ export function parseDiscoveryDoc(raw: unknown): CodeburnDiscoveryDoc {
 
   return {
     version, issuer, client_id, scopes, traces_path, max_batch_size, detail_levels,
+    ...(max_span_age_days !== undefined ? { max_span_age_days } : {}),
     ...(enrollment ? { auth: 'enrollment' as const, enroll_path: doc.enroll_path as string } : {}),
     ...(enrollment && typeof doc.revoke_path === 'string' && doc.revoke_path.startsWith('/') ? { revoke_path: doc.revoke_path } : {}),
     ...(typeof doc.findings_path === 'string' && doc.findings_path.startsWith('/') ? { findings_path: doc.findings_path } : {}),

@@ -37,6 +37,37 @@ If the device is already enrolled with this server, you don't need a token or se
 saved. Re-running setup would enroll it again and drop its automatic sync acceptance. See
 [Client devices and automatic sync](server.md#client-devices-and-automatic-sync).
 
+## Updating a connected machine with the installer
+
+Run the same one-liner without `--token` (`-Token`):
+
+```sh
+curl -fsSL https://codeburn.example.com/install.sh | sh
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://codeburn.example.com/install.ps1)))
+```
+
+It installs the server's build and, because the machine is already connected (`codeburn sync status` succeeds), asks:
+
+```text
+Do you consent to uploading your AI usage data to the <org_name> team server? [y/N]
+```
+
+`<org_name>` is the server's `org_name`, or its host when that is unset. On **yes** the installer runs:
+
+```sh
+codeburn sync auto enable --accept   # accept what this build sends; keeps your cadence and work-matching choice
+codeburn sync reset --confirm        # forget which calls were already sent
+codeburn sync push --since all       # re-send up to six months, so the team's numbers are rebuilt with the new fields
+```
+
+With `install_mode: all` it also runs `codeburn sync config all on` first. Re-sending is safe: the server replaces
+calls it already has instead of counting them twice. Anything else, including no answer when there is no terminal
+(for example under a deployment tool), counts as **no**: nothing is accepted, automatic sync stays paused if the build
+sends new fields, and the installer prints those three commands to run later.
+
 ## Endpoints
 
 All are unauthenticated `GET`s and return 404 when no client package is configured.

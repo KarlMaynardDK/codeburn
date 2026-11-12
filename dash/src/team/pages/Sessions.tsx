@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 
-import { fmtNum, usd } from '@/lib/utils'
-import { ApiError, getSessions, type Filters } from '../lib/api'
+import { fmtNum, fmtTokens, usd } from '@/lib/utils'
+import { ApiError, getSessions, type Filters, type SessionRow } from '../lib/api'
 import { Empty, ErrorNote, Loading, selectCls, TablePanel } from '../ui'
 
 function dur(ms: number): string {
@@ -10,6 +10,12 @@ function dur(ms: number): string {
   if (s < 60) return `${s}s`
   const m = Math.floor(s / 60)
   return m < 60 ? `${m}m ${s % 60}s` : `${Math.floor(m / 60)}h ${m % 60}m`
+}
+
+/** One-shot share of the session's edit prompts; '-' when it had no edit prompts. */
+function oneShot(s: SessionRow): string {
+  if (s.one_shot_rate == null) return '-'
+  return `${Math.round(s.one_shot_rate * 100)}% (${s.one_shot_turns}/${s.edit_turns})`
 }
 
 export function Sessions({ filters }: { filters: Filters }) {
@@ -49,6 +55,11 @@ export function Sessions({ filters }: { filters: Filters }) {
           { key: 'project', label: 'Project' },
           { key: 'duration', label: 'Duration', num: true },
           { key: 'calls', label: 'Calls', num: true },
+          { key: 'input', label: 'Tokens in', num: true },
+          { key: 'output', label: 'Tokens out', num: true },
+          { key: 'cache_read', label: 'Cache read', num: true },
+          { key: 'cache_write', label: 'Cache write', num: true },
+          { key: 'oneshot', label: 'One-shot', num: true },
           { key: 'cost', label: 'Cost', num: true },
         ]}
         rows={rows.map((s) => ({
@@ -57,9 +68,21 @@ export function Sessions({ filters }: { filters: Filters }) {
           project: s.project,
           duration: dur(s.duration_ms),
           calls: fmtNum(s.calls),
+          input: fmtTokens(s.input),
+          output: fmtTokens(s.output),
+          cache_read: fmtTokens(s.cache_read),
+          cache_write: fmtTokens(s.cache_write),
+          oneshot: oneShot(s),
           cost: usd(s.cost),
         }))}
-        csv={rows.map((s) => [s.trace_id, s.started, s.person, s.project, s.duration_ms, s.calls, s.cost])}
+        csvHeaders={[
+          'trace_id', 'started', 'person', 'project', 'duration_ms', 'calls',
+          'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens', 'edit_turns', 'one_shot_turns', 'one_shot_rate', 'cost_usd',
+        ]}
+        csv={rows.map((s) => [
+          s.trace_id, s.started, s.person, s.project, s.duration_ms, s.calls,
+          s.input, s.output, s.cache_read, s.cache_write, s.edit_turns, s.one_shot_turns, s.one_shot_rate, s.cost,
+        ])}
       />
     </div>
   )

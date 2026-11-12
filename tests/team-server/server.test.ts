@@ -13,7 +13,7 @@ describe.each(BACKENDS)('team server (%s)', backend => {
     it('advertises enrollment auth and gates detail levels and findings on config', async () => {
       t = await startServer(backend, { org_name: 'Acme' })
       let doc = await (await fetch(`${t.base}/.well-known/codeburn-export.json`)).json() as any
-      expect(doc).toMatchObject({ version: 1, auth: 'enrollment', enroll_path: '/v1/enroll', traces_path: '/v1/traces', max_batch_size: 1000, detail_levels: ['summary'], org_name: 'Acme' })
+      expect(doc).toMatchObject({ version: 1, auth: 'enrollment', enroll_path: '/v1/enroll', traces_path: '/v1/traces', max_batch_size: 1000, max_span_age_days: 183, detail_levels: ['summary'], org_name: 'Acme' })
       expect(doc.findings_path).toBeUndefined()
       expect(doc.issuer).toBeUndefined()
       await t.cleanup()
@@ -218,6 +218,25 @@ describe.each(BACKENDS)('team server (%s)', backend => {
       expect(api.status).toBe(200)
       expect(api.json.sessions).toHaveLength(2)
       expect(api.json.sessions[0]).toMatchObject({ person: 'Ann', project: 'app' })
+    })
+
+    it('sessions carry token totals and the one-shot rate of their edit prompts', async () => {
+      t = await startServer(backend, { accept_session_detail: true })
+      const a = await enrollPerson(t, 'Ann')
+      const trace = 'f1'.padEnd(32, '0')
+      const turn = (retries: number) => [b('ai.turn_start', true), b('ai.turn_has_edits', true), i('ai.turn_retries', retries)]
+      await send(t, a.cred, [
+        span({ id: 'e1', trace, session: true, input: 10, output: 20, cacheRead: 300, cacheWrite: 40, attrs: turn(0) }),
+        span({ id: 'e2', trace, session: true, input: 5, output: 7, cacheRead: 100, cacheWrite: 0, attrs: turn(2) }),
+        span({ id: 'e3', trace, session: true, input: 1, output: 1 }),
+        span({ id: 'e4', trace: 'f2'.padEnd(32, '0'), session: true }),
+      ], 'sessions')
+      const viewer = await viewerClient(t)
+      const rows = (await viewer.get('/api/team/sessions')).json.sessions as any[]
+      expect(rows.find(r => r.trace_id === trace)).toMatchObject({
+        input: 16, output: 28, cache_read: 400, cache_write: 40, edit_turns: 2, one_shot_turns: 1, one_shot_rate: 0.5,
+      })
+      expect(rows.find(r => r.trace_id === 'f2'.padEnd(32, '0'))).toMatchObject({ edit_turns: 0, one_shot_rate: null })
     })
 
     it('a missing detail level is treated as sessions but still stripped when the server refuses detail', async () => {

@@ -7,7 +7,7 @@ import { fmtNum, fmtTokens, label, usd } from '@/lib/utils'
 import { getOverview, type Breakdown, type Filters } from '../lib/api'
 import { pctChange } from '../lib/period'
 import { DailyChart, type Unit } from '../DailyChart'
-import { CsvButton, Empty, ErrorNote, Loading, Panel, selectCls } from '../ui'
+import { CsvButton, Empty, ErrorNote, LinesChangedNote, Loading, Panel, selectCls } from '../ui'
 
 function delta(cur: number, prev: number | undefined): string | undefined {
   if (prev === undefined) return undefined
@@ -17,7 +17,6 @@ function delta(cur: number, prev: number | undefined): string | undefined {
 
 const pct = (r: number | null) => (r == null ? '-' : `${Math.round(r * 100)}%`)
 const share = (part: number, total: number) => (total > 0 ? `${Math.round((part / total) * 100)}% of spend` : undefined)
-const linesSub = (cost: number, lines: number) => (lines > 0 ? `${usd((cost / lines) * 1000)} per 1k lines` : 'no line counts sent yet')
 
 function Split({ title, items, useLabel }: { title: string; items: Breakdown[]; useLabel?: boolean }) {
   const sorted = [...items].sort((a, b) => b.cost - a.cost).slice(0, 10)
@@ -50,9 +49,8 @@ export function Overview({ filters, compare }: { filters: Filters; compare: bool
         <MetricCard label="Calls" value={fmtNum(t.calls)} />
         <MetricCard label="Active people" value={fmtNum(t.active_people)} />
       </div>
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
         <MetricCard label="One-shot edits" value={pct(t.one_shot_rate)} sub={t.edit_turns ? `${fmtNum(t.one_shot_turns)} of ${fmtNum(t.edit_turns)} edit prompts` : 'no turn data sent yet'} />
-        <MetricCard label="Lines changed" value={`+${fmtNum(t.lines_added)} / -${fmtNum(t.lines_removed)}`} sub={linesSub(t.cost, t.lines_added + t.lines_removed)} />
         <MetricCard label="Subscription-covered" value={usd(t.covered_cost_usd)} sub={share(t.covered_cost_usd, t.cost)} />
         <MetricCard label="Estimated cost" value={usd(t.estimated_cost_usd)} sub={share(t.estimated_cost_usd, t.cost)} />
       </div>
@@ -62,6 +60,11 @@ export function Overview({ filters, compare }: { filters: Filters; compare: bool
           <MetricCard label="Reasoning tokens" value={fmtTokens(t.reasoning)} />
           <MetricCard label="Tool errors" value={fmtNum(t.tool_errors)} sub={t.calls ? `${((t.tool_errors / t.calls) * 100).toFixed(1)} per 100 calls` : undefined} />
           <MetricCard label="Interrupted calls" value={fmtNum(t.interrupted)} sub={t.user_modified ? `${fmtNum(t.user_modified)} edits changed by hand` : undefined} />
+        </div>
+      ) : null}
+      {t.model_switches > 0 ? (
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <MetricCard label="Mid-session model switches" value={fmtNum(t.model_switches)} sub={`${fmtTokens(t.model_switch_tokens)} tokens of context sent again`} />
         </div>
       ) : null}
       {o.mtd ? (
@@ -98,6 +101,7 @@ export function Overview({ filters, compare }: { filters: Filters; compare: bool
         <Split title="By billing route" items={o.by_route} />
         <Split title="By billing mode" items={o.by_billing} />
       </div>
+      <LinesChangedNote />
     </div>
   )
 }
